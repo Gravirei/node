@@ -573,10 +573,13 @@ impl Db {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows.into_iter().map(|r| {
-            let stars: i64 = r.get("star_count");
-            (row_to_repo(r), stars)
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let stars: i64 = r.get("star_count");
+                (row_to_repo(r), stars)
+            })
+            .collect())
     }
 
     pub async fn list_all_repos_paged(
@@ -615,7 +618,10 @@ impl Db {
         .fetch_all(&self.pool)
         .await?;
 
-        let total = rows.first().map(|r| r.get::<i64, _>("total_count")).unwrap_or(0);
+        let total = rows
+            .first()
+            .map(|r| r.get::<i64, _>("total_count"))
+            .unwrap_or(0);
         let out: Vec<(RepoRecord, i64)> = rows
             .into_iter()
             .map(|r| {
@@ -1321,13 +1327,11 @@ impl Db {
     pub async fn prune_self_peers(&self, public_url: &str) -> Result<u64> {
         let trimmed = public_url.trim_end_matches('/');
         let with_slash = format!("{trimmed}/");
-        let result = sqlx::query(
-            "DELETE FROM peers WHERE http_url = $1 OR http_url = $2",
-        )
-        .bind(trimmed)
-        .bind(&with_slash)
-        .execute(&self.pool)
-        .await?;
+        let result = sqlx::query("DELETE FROM peers WHERE http_url = $1 OR http_url = $2")
+            .bind(trimmed)
+            .bind(&with_slash)
+            .execute(&self.pool)
+            .await?;
         Ok(result.rows_affected())
     }
 }
@@ -1626,19 +1630,21 @@ pub struct ArweaveAnchor {
     pub anchored_at: String,
 }
 
+/// Input parameters for recording an Arweave anchor.
+pub struct RecordAnchorInput<'a> {
+    pub repo: &'a str,
+    pub owner_did: &'a str,
+    pub ref_name: &'a str,
+    pub old_sha: &'a str,
+    pub new_sha: &'a str,
+    pub cid: Option<&'a str>,
+    pub irys_tx_id: &'a str,
+    pub arweave_url: &'a str,
+    pub node_did: &'a str,
+}
+
 impl Db {
-    pub async fn record_arweave_anchor(
-        &self,
-        repo: &str,
-        owner_did: &str,
-        ref_name: &str,
-        old_sha: &str,
-        new_sha: &str,
-        cid: Option<&str>,
-        irys_tx_id: &str,
-        arweave_url: &str,
-        node_did: &str,
-    ) -> Result<()> {
+    pub async fn record_arweave_anchor(&self, input: &RecordAnchorInput<'_>) -> Result<()> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         sqlx::query(
@@ -1646,15 +1652,15 @@ impl Db {
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
         )
         .bind(&id)
-        .bind(repo)
-        .bind(owner_did)
-        .bind(ref_name)
-        .bind(old_sha)
-        .bind(new_sha)
-        .bind(cid)
-        .bind(irys_tx_id)
-        .bind(arweave_url)
-        .bind(node_did)
+        .bind(input.repo)
+        .bind(input.owner_did)
+        .bind(input.ref_name)
+        .bind(input.old_sha)
+        .bind(input.new_sha)
+        .bind(input.cid)
+        .bind(input.irys_tx_id)
+        .bind(input.arweave_url)
+        .bind(input.node_did)
         .bind(&now)
         .execute(&self.pool)
         .await?;
