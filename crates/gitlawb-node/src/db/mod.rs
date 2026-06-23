@@ -256,6 +256,15 @@ impl Db {
         Self { pool }
     }
 
+    /// Test-only: apply the full schema to a fresh pool. `#[sqlx::test]`
+    /// provisions an empty per-test database, so DB-backed tests must run this
+    /// before seeding. Reuses the production `migrate()` path (the advisory lock
+    /// is harmless on an isolated test DB and migrations are idempotent).
+    #[cfg(test)]
+    pub(crate) async fn run_migrations(&self) -> Result<()> {
+        self.migrate().await
+    }
+
     pub async fn connect(database_url: &str) -> Result<Self> {
         let pool = PgPool::connect(database_url).await?;
         let db = Self { pool };
@@ -2005,7 +2014,7 @@ impl Db {
         let now = Utc::now().to_rfc3339();
         let row = sqlx::query(
             "UPDATE agent_tasks SET status=$2, result=$3, updated_at=$4
-             WHERE id=$1
+             WHERE id=$1 AND status='claimed'
              RETURNING id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline",
         )
         .bind(id)
@@ -2015,7 +2024,7 @@ impl Db {
         .fetch_optional(&self.pool)
         .await?;
         row.map(row_to_task)
-            .ok_or_else(|| anyhow::anyhow!("task not found"))
+            .ok_or_else(|| anyhow::anyhow!("task not found or not in claimed state"))
     }
 }
 
