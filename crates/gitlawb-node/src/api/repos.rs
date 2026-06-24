@@ -1,11 +1,11 @@
 use axum::extract::{Extension, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::Response;
 use axum::Json;
 use bytes::Bytes;
 use std::sync::Arc;
 
-use crate::auth::AuthenticatedDid;
+use crate::auth::{caller_authorized_to_push, AuthenticatedDid};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -162,8 +162,7 @@ pub async fn list_repos(
         .iter()
         .filter(|(r, _)| {
             if let Some(owner) = &query.owner {
-                let short = r.owner_did.split(':').next_back().unwrap_or(&r.owner_did);
-                short == owner.as_str() || r.owner_did == owner.as_str()
+                crate::api::did_matches(owner.as_str(), &r.owner_did)
             } else {
                 true
             }
@@ -474,11 +473,38 @@ pub async fn git_upload_pack(
     Ok(resp)
 }
 
+/// Decide whether the owner-push gate rejects a `git-receive-pack` request.
+///
+/// Returns `Some(error)` when the push must be rejected, `None` when it may
+/// proceed. Pure function so the policy is unit-testable without a database or a
+/// live git backend.
+///
+/// Fails closed: when `enforce` is on, an absent identity (`None`) or a caller
+/// that is not authorized to push is rejected. When `enforce` is off it always
+/// allows, preserving the legacy (authentication-only) behavior.
+fn owner_push_rejection(
+    enforce: bool,
+    record: &crate::db::RepoRecord,
+    caller: Option<&str>,
+) -> Option<AppError> {
+    if !enforce {
+        return None;
+    }
+    match caller {
+        Some(did) if caller_authorized_to_push(record, did) => None,
+        _ => Some(AppError::Forbidden(
+            "push rejected — only the repo owner may push to this repository \
+             (GITLAWB_ENFORCE_OWNER_PUSH is enabled)"
+                .into(),
+        )),
+    }
+}
+
 /// POST /:owner/:repo.git/git-receive-pack  (AUTH REQUIRED — enforced by middleware)
 pub async fn git_receive_pack(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
-    headers: HeaderMap,
+    Extension(auth): Extension<AuthenticatedDid>,
     body: Bytes,
 ) -> Result<Response> {
     let name = repo.trim_end_matches(".git");
@@ -496,9 +522,30 @@ pub async fn git_receive_pack(
         "parsed ref updates from pack"
     );
 
+    // ── Owner-only push enforcement (opt-in: GITLAWB_ENFORCE_OWNER_PUSH) ──
+    // Runs before branch protection on purpose: when enabled, a non-owner is
+    // rejected here regardless of whether the target branch is protected, so a
+    // single rejection never yields two different error bodies. The identity is
+    // the canonical DID injected by `require_signature`, not a re-parse of the
+    // request headers. Fails closed (see `owner_push_rejection`).
+    if let Some(err) = owner_push_rejection(
+        state.config.enforce_owner_push,
+        &record,
+        Some(auth.0.as_str()),
+    ) {
+        tracing::warn!(
+            repo = %name,
+            pusher = %auth.0,
+            owner_did = %record.owner_did,
+            "owner-push enforcement: rejecting push from non-owner"
+        );
+        return Err(err);
+    }
+
     // ── Branch protection check ──────────────────────────────────────────
-    let pusher_did_for_check = extract_did_from_auth(&headers);
-    tracing::debug!(pusher_did = ?pusher_did_for_check, "extracted pusher DID from auth headers");
+    // Uses the same verified identity as the owner-push gate above. (When that
+    // gate is enabled a non-owner never reaches here; this still applies when it
+    // is off, gating only the branches an owner has explicitly protected.)
     for update in &ref_updates {
         // Strip refs/heads/ prefix to get plain branch name
         let branch = update
@@ -510,27 +557,17 @@ pub async fn git_receive_pack(
             .is_branch_protected(&record.id, branch)
             .await
             .unwrap_or(false)
+            && !crate::api::did_matches(&auth.0, &record.owner_did)
         {
-            let owner_short = record
-                .owner_did
-                .split(':')
-                .next_back()
-                .unwrap_or(&record.owner_did);
-            let is_owner = pusher_did_for_check
-                .as_deref()
-                .map(|did| did == record.owner_did || did == owner_short)
-                .unwrap_or(false);
-            if !is_owner {
-                tracing::warn!(
-                    branch = %branch,
-                    pusher = ?pusher_did_for_check,
-                    owner_did = %record.owner_did,
-                    "branch protection: rejecting push from non-owner"
-                );
-                return Err(AppError::BadRequest(format!(
-                    "branch '{branch}' is protected — only the repo owner can push to it"
-                )));
-            }
+            tracing::warn!(
+                branch = %branch,
+                pusher = %auth.0,
+                owner_did = %record.owner_did,
+                "branch protection: rejecting push from non-owner"
+            );
+            return Err(AppError::Forbidden(format!(
+                "branch '{branch}' is protected — only the repo owner can push to it"
+            )));
         }
     }
 
@@ -566,9 +603,11 @@ pub async fn git_receive_pack(
     crate::metrics::record_push(&record.id);
     crate::metrics::observe_pack_size(body_len as f64);
 
-    // Record push event for trust score and issue a signed ref certificate
-    let pusher_did = extract_did_from_auth(&headers);
-    if let Some(ref did) = pusher_did {
+    // Record push event for trust score and issue a signed ref certificate.
+    // The route is behind `require_signature`, so the verified pusher identity is
+    // always present; use it directly rather than re-parsing the headers.
+    let did = auth.0.as_str();
+    {
         // Use the first new commit hash we parsed, fall back to timestamp
         let commit_hash = ref_updates
             .first()
@@ -626,7 +665,7 @@ pub async fn git_receive_pack(
                 "created": update.old_sha == "0000000000000000000000000000000000000000",
                 "forced": false,
                 "pusher": {
-                    "did": pusher_did.as_deref().unwrap_or("unknown"),
+                    "did": did,
                 },
                 "repository": {
                     "id": record.id,
@@ -806,7 +845,7 @@ pub async fn git_receive_pack(
             .map(|u| (u.ref_name.clone(), u.new_sha.clone()))
             .collect::<Vec<_>>();
         let p2p_handle = state.p2p.clone();
-        let pusher_did_clone = pusher_did.clone().unwrap_or_default();
+        let pusher_did_clone = did.to_string();
         let db_for_peers = state.db.clone();
         let ref_update_tx = state.ref_update_tx.clone();
         let irys_url = state.config.irys_url.clone();
@@ -1246,30 +1285,6 @@ fn parse_ref_updates(body: &[u8]) -> Vec<RefUpdate> {
     updates
 }
 
-/// Extract the DID from RFC 9421 Signature-Input header (keyid="...").
-/// Falls back to draft-cavage Authorization header for old clients.
-fn extract_did_from_auth(headers: &HeaderMap) -> Option<String> {
-    // RFC 9421: Signature-Input: sig1=(...);keyid="did:key:z6Mk...";...
-    if let Some(sig_input) = headers.get("signature-input").and_then(|v| v.to_str().ok()) {
-        if let Some(start) = sig_input.find("keyid=\"") {
-            let rest = &sig_input[start + 7..];
-            if let Some(end) = rest.find('"') {
-                return Some(rest[..end].to_string());
-            }
-        }
-    }
-    // Fallback: draft-cavage Authorization: Signature keyId="..."
-    if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
-        if let Some(start) = auth.find("keyId=\"") {
-            let rest = &auth[start + 7..];
-            if let Some(end) = rest.find('"') {
-                return Some(rest[..end].to_string());
-            }
-        }
-    }
-    None
-}
-
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 fn to_response(record: &crate::db::RepoRecord, state: &AppState, star_count: i64) -> RepoResponse {
@@ -1298,5 +1313,85 @@ fn to_response(record: &crate::db::RepoRecord, state: &AppState, star_count: i64
         created_at: record.created_at.to_rfc3339(),
         updated_at: record.updated_at.to_rfc3339(),
         forked_from: record.forked_from.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::owner_push_rejection;
+    use crate::auth::caller_authorized_to_push;
+    use crate::error::AppError;
+
+    const OWNER_DID: &str = "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
+    const OWNER_SHORT: &str = "z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
+    const STRANGER_DID: &str = "did:key:z6Mkffonly5tranger0000000000000000000000000000000";
+
+    fn repo_owned_by(owner_did: &str) -> crate::db::RepoRecord {
+        let now = chrono::Utc::now();
+        crate::db::RepoRecord {
+            id: "repo-id".into(),
+            name: "demo".into(),
+            owner_did: owner_did.into(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: now,
+            updated_at: now,
+            disk_path: "/tmp/demo".into(),
+            forked_from: None,
+            machine_id: None,
+        }
+    }
+
+    /// A rejection must be a 403 Forbidden (authenticated but not authorized),
+    /// not a 400 — some git/CI clients retry 400s.
+    fn assert_forbidden(rejection: Option<AppError>) {
+        assert!(
+            matches!(rejection, Some(AppError::Forbidden(_))),
+            "expected Some(Forbidden), got {rejection:?}"
+        );
+    }
+
+    #[test]
+    fn enforced_allows_owner_full_did() {
+        let repo = repo_owned_by(OWNER_DID);
+        assert!(owner_push_rejection(true, &repo, Some(OWNER_DID)).is_none());
+    }
+
+    #[test]
+    fn enforced_allows_owner_short_did() {
+        // Owners are accepted in bare-multibase form, matching the rest of the
+        // codebase's owner comparisons.
+        let repo = repo_owned_by(OWNER_DID);
+        assert!(owner_push_rejection(true, &repo, Some(OWNER_SHORT)).is_none());
+    }
+
+    #[test]
+    fn enforced_rejects_non_owner_with_forbidden() {
+        let repo = repo_owned_by(OWNER_DID);
+        assert_forbidden(owner_push_rejection(true, &repo, Some(STRANGER_DID)));
+    }
+
+    #[test]
+    fn enforced_rejects_missing_did_with_forbidden() {
+        // Fail closed: an absent authenticated identity is rejected, not allowed.
+        let repo = repo_owned_by(OWNER_DID);
+        assert_forbidden(owner_push_rejection(true, &repo, None));
+    }
+
+    #[test]
+    fn disabled_allows_non_owner_and_missing_did() {
+        // Flag off → legacy behavior: authentication-only, no owner gate.
+        let repo = repo_owned_by(OWNER_DID);
+        assert!(owner_push_rejection(false, &repo, Some(STRANGER_DID)).is_none());
+        assert!(owner_push_rejection(false, &repo, None).is_none());
+    }
+
+    #[test]
+    fn caller_authorized_to_push_is_owner_only_in_phase_1() {
+        let repo = repo_owned_by(OWNER_DID);
+        assert!(caller_authorized_to_push(&repo, OWNER_DID));
+        assert!(caller_authorized_to_push(&repo, OWNER_SHORT));
+        assert!(!caller_authorized_to_push(&repo, STRANGER_DID));
     }
 }
