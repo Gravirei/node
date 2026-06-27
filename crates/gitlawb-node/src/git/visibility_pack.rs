@@ -10,29 +10,203 @@ use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
-/// List every (blob_oid, "/repo/relative/path") pair reachable from any branch
-/// ref in `repo_path`. Uses `git ls-tree -r` per ref so each path a blob lives
-/// at is represented (the same blob content can appear at several paths). Paths
-/// are returned with a leading "/" to match the glob form used by visibility
-/// rules ("/secret/**").
+/// Fail closed unless every ref ultimately resolves to a commit (a ref pointing
+/// directly at a blob or tree, or an annotated tag — even a nested one — of such
+/// an object is refused). `git rev-list --all` silently *skips* such refs, but
+/// `git upload-pack` (serve) and the whole-repo pin fallback
+/// (`git cat-file --batch-all-objects`) still expose their target object, so a
+/// tolerant walk would under-withhold. Refuse rather than leak.
+///
+/// Each ref is peeled fully with `<ref>^{}` through `git cat-file --batch-check`.
+/// Full peeling is why this is not `for-each-ref %(*objecttype)`, which
+/// dereferences only one tag level and so misclassifies a tag-of-a-tag-of-a-
+/// commit as a non-commit.
+fn assert_all_refs_are_commits(repo_path: &Path) -> Result<()> {
+    let refs = std::process::Command::new("git")
+        .args(["for-each-ref", "--format=%(refname)"])
+        .current_dir(repo_path)
+        .output()
+        .context("git for-each-ref failed")?;
+    if !refs.status.success() {
+        anyhow::bail!(
+            "git for-each-ref failed: {}",
+            String::from_utf8_lossy(&refs.stderr)
+        );
+    }
+    let refs_stdout = String::from_utf8_lossy(&refs.stdout);
+    let refnames: Vec<&str> = refs_stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if refnames.is_empty() {
+        return Ok(());
+    }
+
+    // Peel every ref in one `git cat-file --batch-check` pass: one
+    // `<refname>^{}` query per line, one output line per input line, in order.
+    // The stdin write runs on a separate thread so this thread can drain stdout
+    // concurrently. cat-file echoes the full query on a `<query> missing` line,
+    // so output scales with refname length (not a fixed size per ref); writing
+    // all of stdin before reading any stdout would deadlock both pipes once the
+    // child's stdout buffer fills. Dropping `stdin` at the end of the closure
+    // sends EOF.
+    let queries = refnames
+        .iter()
+        .map(|r| format!("{r}^{{}}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    use std::io::Write;
+    let mut child = std::process::Command::new("git")
+        .args(["cat-file", "--batch-check=%(objecttype)"])
+        .current_dir(repo_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("failed to spawn git cat-file")?;
+    // Feed stdin on a writer thread so this thread can drain stdout via
+    // wait_with_output concurrently; a None handle (the pipe vanished) becomes a
+    // broken-pipe write error. wait_with_output reaps the child unconditionally
+    // before any error is surfaced, so no path drops it unwaited (#53), and the
+    // writer is joined only after the drain so the join cannot deadlock.
+    let writer = child
+        .stdin
+        .take()
+        .map(|mut stdin| std::thread::spawn(move || stdin.write_all(queries.as_bytes())));
+    let peel_result = child.wait_with_output();
+    let write_result = match writer {
+        Some(handle) => handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("git cat-file stdin writer thread panicked"))?,
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "git cat-file stdin unavailable",
+        )),
+    };
+    // Surface a write error only if the process didn't already fail with a
+    // clearer status.
+    let peel = peel_result.context("git cat-file failed")?;
+    if !peel.status.success() {
+        anyhow::bail!(
+            "git cat-file --batch-check failed: {}",
+            String::from_utf8_lossy(&peel.stderr)
+        );
+    }
+    write_result.context("failed to write to git cat-file stdin")?;
+
+    let peel_stdout = String::from_utf8_lossy(&peel.stdout);
+    let types: Vec<&str> = peel_stdout.lines().map(str::trim).collect();
+    // A short read means at least one ref went unclassified — fail closed.
+    if types.len() != refnames.len() {
+        anyhow::bail!(
+            "git cat-file returned {} lines for {} refs; \
+             refusing to produce a partial (under-withheld) set",
+            types.len(),
+            refnames.len()
+        );
+    }
+    for (refname, kind) in refnames.iter().zip(types.iter()) {
+        // git emits `<query> missing` (not the objecttype) when the peel target
+        // is absent; the status word is the last token.
+        if kind.split_ascii_whitespace().last() == Some("missing") {
+            anyhow::bail!(
+                "ref {refname} does not resolve to an object; \
+                 refusing to produce a partial (under-withheld) set"
+            );
+        }
+        if *kind != "commit" {
+            anyhow::bail!(
+                "ref {refname} resolves to a {kind}, not a commit; \
+                 refusing to produce a partial (under-withheld) set"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// List every (blob_oid, "/repo/relative/path") pair reachable from any commit in
+/// `repo_path` — every ref *and* every historical commit those refs reach, not just
+/// the ref tips. `git upload-pack` (serve) and the whole-repo pin fallback
+/// (`git cat-file --batch-all-objects`) expose the full reachable object graph,
+/// including a blob that only ever existed
+/// in an older commit (a since-deleted file, a rotated secret whose previous version
+/// is still in history). Classifying only ref-tip trees would leave those blobs
+/// unwithheld while pin/serve still hand them out in cleartext, so we enumerate all
+/// reachable commits and walk each commit's tree.
+///
+/// `--all` covers every ref namespace (a blob reachable only through `refs/notes/*`
+/// must not escape withholding); HEAD is added explicitly for the detached case,
+/// where HEAD reaches commits that no ref does. `git ls-tree -rz <commit>` per commit
+/// keeps every path a blob lives at (the same blob content can appear at several
+/// paths, and the per-path visibility check needs all of them). This is why it is
+/// not `git rev-list --objects`, which reports only one path per object. Pairs are
+/// de-duplicated across commits. Paths carry a leading "/" to match the glob form
+/// used by visibility rules ("/secret/**").
+///
+/// Fails closed: if commit enumeration or any tree walk fails, returns an error so
+/// the caller aborts the serve/pin rather than producing a partial (under-withheld)
+/// set.
 fn blob_paths(repo_path: &Path) -> Result<Vec<(String, String)>> {
-    let refs = store::list_refs(repo_path).context("list_refs failed")?;
-    let mut out = Vec::new();
-    for (refname, _oid) in refs {
-        if !refname.starts_with("refs/heads/") && !refname.starts_with("refs/tags/") {
+    assert_all_refs_are_commits(repo_path)?;
+
+    // Enumerate every reachable commit, not just ref tips. `--all` walks all refs;
+    // append HEAD so a detached HEAD (reachable by rev-list/upload-pack but in no
+    // ref) is still classified. When HEAD does not resolve (unborn branch on an
+    // empty repo) `--all` alone yields nothing, which is correct — no objects exist.
+    let head = store::head_commit(repo_path).context("resolve HEAD failed")?;
+    let mut rev_args = vec!["rev-list", "--all"];
+    if head.is_some() {
+        rev_args.push("HEAD");
+    }
+    let commits = std::process::Command::new("git")
+        .args(&rev_args)
+        .current_dir(repo_path)
+        .output()
+        .context("git rev-list --all failed")?;
+    if !commits.status.success() {
+        anyhow::bail!(
+            "git rev-list --all failed: {}",
+            String::from_utf8_lossy(&commits.stderr)
+        );
+    }
+    let commits_stdout = String::from_utf8_lossy(&commits.stdout);
+    let mut out: HashSet<(String, String)> = HashSet::new();
+    for commit in commits_stdout.lines() {
+        let commit = commit.trim();
+        if commit.is_empty() {
             continue;
         }
         let listing = std::process::Command::new("git")
-            .args(["ls-tree", "-r", &refname])
+            .args(["ls-tree", "-rz", commit])
             .current_dir(repo_path)
             .output()
-            .context("git ls-tree -r failed")?;
+            .context("git ls-tree -rz failed")?;
         if !listing.status.success() {
-            continue;
+            anyhow::bail!(
+                "git ls-tree -rz {commit} failed: {}",
+                String::from_utf8_lossy(&listing.stderr)
+            );
         }
-        for line in String::from_utf8_lossy(&listing.stdout).lines() {
+        // `-z` NUL-delimits records and emits paths raw; plain `git ls-tree -r`
+        // C-quotes any path with non-ASCII or special bytes (e.g. café.txt becomes
+        // "secret/caf\303\251.txt"), and that quoted literal would not match a
+        // visibility rule like "/secret/**", under-withholding the blob. The TAB
+        // field separator survives `-z`, so the per-record parse is unchanged.
+        //
+        // Parse strictly: a lossy decode would replace an invalid byte in a denied
+        // path (e.g. a non-UTF-8 directory name) with U+FFFD, and the mangled string
+        // would no longer match its deny rule — the same under-withholding class, one
+        // layer down. Fail closed instead so the caller aborts rather than leaks.
+        let Ok(listing_stdout) = std::str::from_utf8(&listing.stdout) else {
+            anyhow::bail!(
+                "git ls-tree -rz {commit} returned a non-UTF-8 path; \
+                 refusing to produce a partial (under-withheld) set"
+            );
+        };
+        for record in listing_stdout.split('\0') {
             // "<mode> blob <oid>\t<path>"
-            let Some((meta, path)) = line.split_once('\t') else {
+            let Some((meta, path)) = record.split_once('\t') else {
                 continue;
             };
             let mut parts = meta.split_whitespace();
@@ -41,12 +215,12 @@ fn blob_paths(repo_path: &Path) -> Result<Vec<(String, String)>> {
             let oid = parts.next();
             if kind == Some("blob") {
                 if let Some(oid) = oid {
-                    out.push((oid.to_string(), format!("/{path}")));
+                    out.insert((oid.to_string(), format!("/{path}")));
                 }
             }
         }
     }
-    Ok(out)
+    Ok(out.into_iter().collect())
 }
 
 /// Blob OIDs the caller may not read. A blob is withheld only if visibility
@@ -62,19 +236,37 @@ pub fn withheld_blob_oids(
     owner_did: &str,
     caller: Option<&str>,
 ) -> Result<HashSet<String>> {
+    let pairs = blob_paths(repo_path)?;
+    Ok(withheld_from_pairs(
+        &pairs, rules, is_public, owner_did, caller,
+    ))
+}
+
+/// Withheld set from an already-computed (oid, "/path") listing: a blob is
+/// withheld only when visibility denies the caller at *every* path it appears
+/// at. Split out so a caller that already walked `blob_paths` (e.g.
+/// `withheld_blob_recipients`) reuses the listing instead of walking history
+/// again.
+fn withheld_from_pairs(
+    pairs: &[(String, String)],
+    rules: &[VisibilityRule],
+    is_public: bool,
+    owner_did: &str,
+    caller: Option<&str>,
+) -> HashSet<String> {
     let mut denied: HashSet<String> = HashSet::new();
     let mut allowed: HashSet<String> = HashSet::new();
-    for (oid, path) in blob_paths(repo_path)? {
-        match visibility_check(rules, is_public, owner_did, caller, &path) {
+    for (oid, path) in pairs {
+        match visibility_check(rules, is_public, owner_did, caller, path) {
             Decision::Deny => {
-                denied.insert(oid);
+                denied.insert(oid.clone());
             }
             Decision::Allow => {
-                allowed.insert(oid);
+                allowed.insert(oid.clone());
             }
         }
     }
-    Ok(denied.difference(&allowed).cloned().collect())
+    denied.difference(&allowed).cloned().collect()
 }
 
 /// True if any rule scopes a sub-path of the repo (i.e. is not the whole-repo
@@ -116,7 +308,9 @@ pub fn withheld_blob_recipients(
     is_public: bool,
     owner_did: &str,
 ) -> Result<HashMap<String, BTreeSet<String>>> {
-    let withheld = withheld_blob_oids(repo_path, rules, is_public, owner_did, None)?;
+    // One history walk feeds both the withheld set and the recipient mapping.
+    let pairs = blob_paths(repo_path)?;
+    let withheld = withheld_from_pairs(&pairs, rules, is_public, owner_did, None);
     if withheld.is_empty() {
         return Ok(HashMap::new());
     }
@@ -127,14 +321,14 @@ pub fn withheld_blob_recipients(
         }
     }
     let mut out: HashMap<String, BTreeSet<String>> = HashMap::new();
-    for (oid, path) in blob_paths(repo_path)? {
-        if !withheld.contains(&oid) {
+    for (oid, path) in &pairs {
+        if !withheld.contains(oid) {
             continue;
         }
-        let entry = out.entry(oid).or_default();
+        let entry = out.entry(oid.clone()).or_default();
         entry.insert(owner_did.to_string());
         for did in &candidates {
-            if visibility_check(rules, is_public, owner_did, Some(did), &path) == Decision::Allow {
+            if visibility_check(rules, is_public, owner_did, Some(did), path) == Decision::Allow {
                 entry.insert(did.clone());
             }
         }
@@ -429,5 +623,558 @@ mod tests {
         let reader = Keypair::generate();
         let env = seal_blob(&bytes, &[reader.verifying_key()]).unwrap();
         assert_eq!(open_blob(&env, &reader).unwrap(), bytes);
+    }
+
+    #[test]
+    fn withholds_blob_reachable_only_via_nonstandard_ref() {
+        let (_td, bare, secret_oid, _public) = fixture();
+        // Move the sole ref out of refs/heads/* into a custom namespace so the
+        // secret blob is reachable only through a ref the old heads/tags filter
+        // skipped. It must still be withheld.
+        let head_ref = {
+            let out = Command::new("git")
+                .args(["symbolic-ref", "HEAD"])
+                .current_dir(&bare)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&bare)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&["update-ref", "refs/custom/snap", "HEAD"]);
+        run(&["update-ref", "-d", &head_ref]);
+
+        let rules = [rule("/secret/**", &[])];
+        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None).unwrap();
+        assert!(
+            withheld.contains(&secret_oid),
+            "blob reachable only via refs/custom/* must still be withheld"
+        );
+    }
+
+    #[test]
+    fn withholds_blob_reachable_only_via_detached_head() {
+        let (_td, bare, secret_oid, _public) = fixture();
+        // Detach HEAD onto the only commit, then delete the branch it pointed to,
+        // so the secret blob is reachable ONLY through HEAD. `for-each-ref` omits
+        // HEAD, but `rev-list --all` (pin) and upload-pack (serve) reach it, so it
+        // must still be withheld.
+        let head_ref = {
+            let out = Command::new("git")
+                .args(["symbolic-ref", "HEAD"])
+                .current_dir(&bare)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let head_oid = {
+            let out = Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&bare)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&bare)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&["update-ref", "--no-deref", "HEAD", &head_oid]);
+        run(&["update-ref", "-d", &head_ref]);
+
+        let rules = [rule("/secret/**", &[])];
+        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None).unwrap();
+        assert!(
+            withheld.contains(&secret_oid),
+            "blob reachable only via detached HEAD must still be withheld"
+        );
+    }
+
+    #[test]
+    fn withholds_secret_blob_deleted_at_tip_but_reachable_in_history() {
+        // commit 1 adds secret/b.txt; commit 2 deletes it. The secret blob is no
+        // longer in any ref-tip tree, but `rev-list --objects --all` (pin) and
+        // upload-pack (serve) still expose it from history, so it must be withheld.
+        let td = TempDir::new().unwrap();
+        let work = td.path().join("work");
+        let bare = td.path().join("bare.git");
+        std::fs::create_dir_all(work.join("secret")).unwrap();
+        std::fs::write(work.join("public.txt"), b"public\n").unwrap();
+        std::fs::write(work.join("secret/b.txt"), b"TOP SECRET\n").unwrap();
+        let run = |args: &[&str], dir: &Path| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&["init", "-q"], &work);
+        run(&["config", "user.email", "t@t"], &work);
+        run(&["config", "user.name", "t"], &work);
+        run(&["add", "."], &work);
+        run(&["commit", "-qm", "c1"], &work);
+        let secret_oid = {
+            let out = Command::new("git")
+                .args(["rev-parse", "HEAD:secret/b.txt"])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run(&["rm", "-q", "secret/b.txt"], &work);
+        run(&["commit", "-qm", "c2 delete secret"], &work);
+        run(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+
+        // Sanity: the blob is gone from the tip tree but still in the pin set.
+        let tip = Command::new("git")
+            .args(["ls-tree", "-r", "HEAD"])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&tip.stdout).contains(&secret_oid),
+            "precondition: secret blob is absent from the tip tree"
+        );
+
+        let rules = [rule("/secret/**", &[])];
+        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None).unwrap();
+        assert!(
+            withheld.contains(&secret_oid),
+            "secret blob deleted at the tip but reachable in history must be withheld"
+        );
+    }
+
+    #[test]
+    fn withholds_secret_blob_at_non_ascii_path() {
+        // A secret blob under a non-ASCII path inside a denied subtree must be
+        // withheld. Plain `git ls-tree -r` C-quotes the path (café.txt becomes
+        // "secret/caf\303\251.txt"), which would not match "/secret/**" and would
+        // leak the blob in cleartext; `-rz` emits the raw path so the rule matches.
+        let td = TempDir::new().unwrap();
+        let work = td.path().join("work");
+        let bare = td.path().join("bare.git");
+        std::fs::create_dir_all(work.join("secret")).unwrap();
+        std::fs::write(work.join("public.txt"), b"public\n").unwrap();
+        std::fs::write(work.join("secret/café.txt"), b"TOP SECRET\n").unwrap();
+        let run = |args: &[&str], dir: &Path| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&["init", "-q"], &work);
+        run(&["config", "user.email", "t@t"], &work);
+        run(&["config", "user.name", "t"], &work);
+        run(&["add", "."], &work);
+        run(&["commit", "-qm", "init"], &work);
+        let oid = |path: &str| {
+            let out = Command::new("git")
+                .args(["rev-parse", &format!("HEAD:{path}")])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let secret_oid = oid("secret/café.txt");
+        let public_oid = oid("public.txt");
+        run(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+
+        let rules = [rule("/secret/**", &[])];
+        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None).unwrap();
+        assert!(
+            withheld.contains(&secret_oid),
+            "secret blob at a non-ASCII path must be withheld"
+        );
+        // Guard against an over-withholding (deny-all) regression: the public blob
+        // must still replicate.
+        assert!(
+            !withheld.contains(&public_oid),
+            "public blob must NOT be withheld"
+        );
+    }
+
+    // TAB/newline are legal filename bytes on unix but rejected by the Windows
+    // filesystem, so building the fixture only makes sense (and only compiles the
+    // OsStr handling) under cfg(unix), matching fails_closed_on_non_utf8_path.
+    #[cfg(unix)]
+    #[test]
+    fn withholds_secret_blob_at_path_with_tab_and_newline() {
+        // A path containing literal TAB and newline bytes must still be withheld.
+        // This pins two parse choices: `-rz` emits the path raw (plain `-r` would
+        // C-quote the TAB/newline and break the "/secret/**" match), and splitting
+        // records on NUL rather than newline keeps the embedded newline from
+        // splitting one record into two and truncating the path. A revert to
+        // `git ls-tree -r` or to `.lines()` would regress this case.
+        let td = TempDir::new().unwrap();
+        let work = td.path().join("work");
+        let bare = td.path().join("bare.git");
+        std::fs::create_dir_all(work.join("secret")).unwrap();
+        std::fs::write(work.join("public.txt"), b"public\n").unwrap();
+        let weird = "secret/a\tb\nc.txt";
+        std::fs::write(work.join(weird), b"TOP SECRET\n").unwrap();
+        let run = |args: &[&str], dir: &Path| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&["init", "-q"], &work);
+        run(&["config", "user.email", "t@t"], &work);
+        run(&["config", "user.name", "t"], &work);
+        run(&["add", "."], &work);
+        run(&["commit", "-qm", "init"], &work);
+        let oid = |path: &str| {
+            let out = Command::new("git")
+                .args(["rev-parse", &format!("HEAD:{path}")])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let secret_oid = oid(weird);
+        let public_oid = oid("public.txt");
+        // Guard against a vacuous pass: if git ever failed to store the oddly-named
+        // file, rev-parse would yield an empty/garbage string and the withholding
+        // assert could trivially hold. A real blob OID is a 40-char (SHA-1) or
+        // 64-char (SHA-256) hex id.
+        assert!(
+            matches!(secret_oid.len(), 40 | 64),
+            "fixture did not store the TAB/newline path (got oid {secret_oid:?})"
+        );
+        run(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+
+        let rules = [rule("/secret/**", &[])];
+        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None).unwrap();
+        assert!(
+            withheld.contains(&secret_oid),
+            "secret blob at a path with TAB/newline must be withheld"
+        );
+        assert!(
+            !withheld.contains(&public_oid),
+            "public blob must NOT be withheld"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fails_closed_on_non_utf8_path() {
+        // A path with a non-UTF-8 byte (here an invalid 0xFF in the denied
+        // directory name) must not be lossy-decoded: U+FFFD substitution would stop
+        // the path matching its deny rule and leak the blob. blob_paths must fail
+        // closed (Err) instead. git stores raw path bytes, so we write the tree by
+        // hand via `git update-index --cacheinfo` to embed the invalid byte.
+        use std::os::unix::ffi::OsStrExt;
+        let td = TempDir::new().unwrap();
+        let work = td.path().join("work");
+        let bare = td.path().join("bare.git");
+        std::fs::create_dir_all(&work).unwrap();
+        let run = |args: &[&str], dir: &Path| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&["init", "-q"], &work);
+        run(&["config", "user.email", "t@t"], &work);
+        run(&["config", "user.name", "t"], &work);
+        // Hash a blob, then index it at a path whose directory byte is invalid UTF-8.
+        let blob_oid = {
+            let out = Command::new("git")
+                .args(["hash-object", "-w", "--stdin"])
+                .current_dir(&work)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut c| {
+                    use std::io::Write;
+                    c.stdin.take().unwrap().write_all(b"TOP SECRET\n")?;
+                    c.wait_with_output()
+                })
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let mut bad_path = std::ffi::OsString::from("s");
+        bad_path.push(std::ffi::OsStr::from_bytes(&[0xFF]));
+        bad_path.push("cret/b.txt");
+        let cacheinfo = {
+            let mut s = std::ffi::OsString::from(format!("100644,{blob_oid},"));
+            s.push(&bad_path);
+            s
+        };
+        assert!(
+            Command::new("git")
+                .arg("update-index")
+                .arg("--add")
+                .arg("--cacheinfo")
+                .arg(&cacheinfo)
+                .current_dir(&work)
+                .status()
+                .unwrap()
+                .success(),
+            "git update-index failed"
+        );
+        run(&["commit", "-qm", "init"], &work);
+        run(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+
+        let rules = [rule("/s\u{fffd}cret/**", &[])];
+        let result = withheld_blob_oids(&bare, &rules, true, OWNER, None);
+        assert!(
+            result.is_err(),
+            "a non-UTF-8 path must fail closed (Err), not be lossy-decoded and leaked"
+        );
+    }
+
+    #[test]
+    fn fails_closed_when_a_ref_cannot_be_traversed() {
+        let (_td, bare, secret, _public) = fixture();
+        // Point a ref at a blob (a valid object that is not tree-ish). `ls-tree -r`
+        // fails on it; that must propagate as Err rather than silently dropping the
+        // ref and under-withholding.
+        std::fs::write(bare.join("refs/heads/blobref"), format!("{secret}\n")).unwrap();
+        let rules = [rule("/secret/**", &[])];
+        let result = withheld_blob_oids(&bare, &rules, true, OWNER, None);
+        assert!(
+            result.is_err(),
+            "a ref that cannot be traversed must fail closed (Err)"
+        );
+    }
+
+    #[test]
+    fn annotated_tag_to_commit_does_not_fail_closed() {
+        let (_td, bare, secret_oid, _public) = fixture();
+        // An annotated tag — even one nested over another annotated tag —
+        // ultimately resolves to a commit, so it must NOT trip the non-commit
+        // fail-closed guard. A one-level `%(*objecttype)` peel would misread the
+        // nested tag as a non-commit and refuse the whole walk.
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&bare)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["tag", "-a", "-m", "inner", "v1", "HEAD"]);
+        run(&["tag", "-a", "-m", "outer", "v2", "v1"]);
+
+        let rules = [rule("/secret/**", &[])];
+        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None).unwrap();
+        assert!(
+            withheld.contains(&secret_oid),
+            "secret blob must still be withheld with annotated and nested tags present"
+        );
+    }
+
+    #[test]
+    fn fails_closed_on_annotated_tag_of_a_blob() {
+        let (_td, bare, secret, _public) = fixture();
+        // An annotated tag whose target peels to a blob is not a commit; the
+        // guard must fail closed rather than skip the ref.
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&bare)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["tag", "-a", "-m", "blobtag", "blobtag", &secret]);
+
+        let rules = [rule("/secret/**", &[])];
+        let result = withheld_blob_oids(&bare, &rules, true, OWNER, None);
+        assert!(
+            result.is_err(),
+            "an annotated tag of a blob must fail closed (Err)"
+        );
+    }
+
+    #[test]
+    fn fails_closed_when_a_ref_points_at_a_missing_object() {
+        let (_td, bare, _secret, _public) = fixture();
+        // A ref whose target object does not exist (pruned object, corrupt ref)
+        // peels to `<query> missing`. for-each-ref still lists it, so the guard
+        // must fail closed rather than skip the unclassifiable ref.
+        std::fs::write(
+            bare.join("refs/heads/dangling"),
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n",
+        )
+        .unwrap();
+        let rules = [rule("/secret/**", &[])];
+        let result = withheld_blob_oids(&bare, &rules, true, OWNER, None);
+        assert!(
+            result.is_err(),
+            "a ref pointing at a missing object must fail closed (Err)"
+        );
+    }
+
+    #[test]
+    fn many_long_named_unresolvable_refs_do_not_deadlock() {
+        // Regression guard for the cat-file stdin/stdout deadlock. cat-file
+        // echoes the full query on a `<query> missing` line, so a few hundred
+        // long-named dangling refs emit >64 KiB of stdout — enough to fill the
+        // pipe buffer and hang a write-all-before-drain implementation. The
+        // concurrent stdin writer must keep it live and fail closed. Bounded by
+        // a timeout so a regression fails the test instead of hanging the suite.
+        let (_td, bare, _secret, _public) = fixture();
+        let longname = "z".repeat(200);
+        let mut packed = String::new();
+        for i in 0..500 {
+            packed.push_str(&format!(
+                "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef refs/heads/{longname}-{i}\n"
+            ));
+        }
+        std::fs::write(bare.join("packed-refs"), packed).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rules = [rule("/secret/**", &[])];
+            let is_err = withheld_blob_oids(&bare, &rules, true, OWNER, None).is_err();
+            let _ = tx.send(is_err);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(is_err) => assert!(is_err, "refs pointing at missing objects must fail closed"),
+            Err(_) => panic!("withheld_blob_oids did not return within 10s (deadlock?)"),
+        }
+    }
+
+    #[test]
+    fn same_blob_at_allowed_and_denied_path_is_not_withheld() {
+        // Identical content at a denied and an allowed path shares one blob OID.
+        // A blob reachable through ANY allowed path must not be withheld.
+        let td = TempDir::new().unwrap();
+        let work = td.path().join("work");
+        let bare = td.path().join("bare.git");
+        let run = |args: &[&str], dir: &Path| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        std::fs::create_dir_all(work.join("secret")).unwrap();
+        std::fs::create_dir_all(work.join("public")).unwrap();
+        std::fs::write(work.join("secret/shared.txt"), b"SHARED\n").unwrap();
+        std::fs::write(work.join("public/shared.txt"), b"SHARED\n").unwrap();
+        run(&["init", "-q"], &work);
+        run(&["config", "user.email", "t@t"], &work);
+        run(&["config", "user.name", "t"], &work);
+        run(&["add", "."], &work);
+        run(&["commit", "-qm", "init"], &work);
+        let oid = |path: &str| {
+            let out = Command::new("git")
+                .args(["rev-parse", &format!("HEAD:{path}")])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let shared_oid = oid("secret/shared.txt");
+        assert_eq!(
+            shared_oid,
+            oid("public/shared.txt"),
+            "precondition: identical content shares one blob OID"
+        );
+        run(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+
+        let rules = [rule("/secret/**", &[])];
+        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None).unwrap();
+        assert!(
+            !withheld.contains(&shared_oid),
+            "a blob also reachable via an allowed path must not be withheld"
+        );
     }
 }
