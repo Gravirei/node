@@ -23,17 +23,18 @@ jobs:
           # Act on PRs only; never on issues.
           days-before-issue-stale: -1
           days-before-issue-close: -1
-          # Only PRs the triage step flagged as needing an author response.
-          only-pr-labels: "needs-issue,needs-description"
+          # Only PRs the triage step flagged as missing a real description.
+          # needs-issue is advisory-only (linking an issue is a SHOULD, and many
+          # legitimate small PRs have none) so it does not drive auto-close.
+          only-pr-labels: "needs-description"
           stale-pr-label: "stale"
           exempt-pr-labels: "workflow-change,security,pinned"
           remove-stale-when-updated: true
           stale-pr-message: >
-            This PR has been inactive for 14 days and is still missing a linked issue
-            or a description. It will be closed in 7 days if there's no update. Push a
-            change or leave a comment to keep it open — no hard feelings, you can reopen
-            anytime.
+            This PR has been inactive for 14 days and is still missing a description.
+            It will be closed in 7 days if there's no update. Push a change or leave a
+            comment to keep it open. No hard feelings, you can reopen anytime.
           close-pr-message: >
-            Closing due to inactivity. Reopen whenever you're ready to update it — see
+            Closing due to inactivity. Reopen whenever you're ready to update it. See
             CONTRIBUTING.md for what helps us review quickly.
           ascending: true
