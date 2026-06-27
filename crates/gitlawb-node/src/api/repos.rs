@@ -584,6 +584,100 @@ fn owner_push_rejection(
     }
 }
 
+/// Path of the peer sync-notify endpoint. Used both to build the target URL
+/// and as the signing path, so they can never drift apart.
+const SYNC_NOTIFY_PATH: &str = "/api/v1/sync/notify";
+
+/// Send one signed `/sync/notify` request for a single ref update.
+///
+/// The receiver is single-ref, so a multi-ref push fans out one request per
+/// ref — each signed over its own body — carrying that ref's real `old_sha`.
+#[allow(clippy::too_many_arguments)]
+async fn notify_peer_of_ref(
+    http_client: &reqwest::Client,
+    node_keypair: &gitlawb_core::identity::Keypair,
+    peer_did: &str,
+    notify_url: &str,
+    repo_slug: &str,
+    ref_name: &str,
+    old_sha: &str,
+    new_sha: &str,
+    node_did: &str,
+    pusher_did: &str,
+) {
+    let body = serde_json::json!({
+        "repo": repo_slug,
+        "ref_name": ref_name,
+        "new_sha": new_sha,
+        "node_did": node_did,
+        "pusher_did": pusher_did,
+        "old_sha": old_sha,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+    let body_bytes = match serde_json::to_vec(&body) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(peer = %peer_did, ref_name = %ref_name, err = %e, "failed to serialize peer sync notify");
+            return;
+        }
+    };
+    let signed =
+        gitlawb_core::http_sig::sign_request(node_keypair, "POST", SYNC_NOTIFY_PATH, &body_bytes);
+    match http_client
+        .post(notify_url)
+        .header("Content-Type", "application/json")
+        .header("Content-Digest", signed.content_digest)
+        .header("Signature-Input", signed.signature_input)
+        .header("Signature", signed.signature)
+        .body(body_bytes)
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => {
+            tracing::info!(peer = %peer_did, repo = %repo_slug, ref_name = %ref_name, "notified peer to sync")
+        }
+        Ok(r) => {
+            tracing::warn!(peer = %peer_did, ref_name = %ref_name, status = %r.status(), "peer sync notify returned error")
+        }
+        Err(e) => {
+            tracing::warn!(peer = %peer_did, ref_name = %ref_name, err = %e, "failed to notify peer")
+        }
+    }
+}
+
+/// Notify a single peer of every ref in a push — one request per ref.
+///
+/// Looping here (rather than sending one flattened request) is what keeps a
+/// multi-ref push from collapsing to its first ref; each ref carries its real
+/// `old_sha`.
+#[allow(clippy::too_many_arguments)]
+async fn notify_peer_of_refs(
+    http_client: &reqwest::Client,
+    node_keypair: &gitlawb_core::identity::Keypair,
+    peer_did: &str,
+    notify_url: &str,
+    repo_slug: &str,
+    ref_updates: &[(String, String, String)],
+    node_did: &str,
+    pusher_did: &str,
+) {
+    for (ref_name, old_sha, new_sha) in ref_updates {
+        notify_peer_of_ref(
+            http_client,
+            node_keypair,
+            peer_did,
+            notify_url,
+            repo_slug,
+            ref_name,
+            old_sha,
+            new_sha,
+            node_did,
+            pusher_did,
+        )
+        .await;
+    }
+}
+
 /// POST /:owner/:repo.git/git-receive-pack  (AUTH REQUIRED — enforced by middleware)
 pub async fn git_receive_pack(
     State(state): State<AppState>,
@@ -706,23 +800,27 @@ pub async fn git_receive_pack(
             let _ = state.db.update_trust_score(did, new_score).await;
         }
 
-        let ref_name = ref_updates
-            .first()
-            .map(|u| u.ref_name.as_str())
-            .unwrap_or("refs/heads/main");
-        let old_sha = ref_updates
-            .first()
-            .map(|u| u.old_sha.as_str())
-            .unwrap_or("0000000000000000000000000000000000000000");
-
-        // Issue a signed ref-update certificate
-        match cert::issue_ref_certificate(&state, &record.id, ref_name, old_sha, &commit_hash, did)
+        // Issue a signed certificate for every ref this push advanced, each
+        // carrying that ref's real old→new transition. A multi-ref push must
+        // not collapse to a single cert covering only the first ref.
+        for update in &ref_updates {
+            match cert::issue_ref_certificate(
+                &state,
+                &record.id,
+                &update.ref_name,
+                &update.old_sha,
+                &update.new_sha,
+                did,
+            )
             .await
-        {
-            Ok(c) => {
-                tracing::info!(cert_id = %c.id, repo = %record.name, pusher = %did, "issued ref certificate")
+            {
+                Ok(c) => {
+                    tracing::info!(cert_id = %c.id, repo = %record.name, ref_name = %update.ref_name, pusher = %did, "issued ref certificate")
+                }
+                Err(e) => {
+                    tracing::warn!(err = %e, ref_name = %update.ref_name, "failed to issue ref certificate")
+                }
             }
-            Err(e) => tracing::warn!(err = %e, "failed to issue ref certificate"),
         }
     }
 
@@ -746,7 +844,7 @@ pub async fn git_receive_pack(
                 "ref": update.ref_name,
                 "before": update.old_sha,
                 "after": update.new_sha,
-                "created": update.old_sha == "0000000000000000000000000000000000000000",
+                "created": update.old_sha == ZERO_SHA,
                 "forced": false,
                 "pusher": {
                     "did": did,
@@ -922,7 +1020,7 @@ pub async fn git_receive_pack(
         );
         let ref_updates_clone = ref_updates
             .iter()
-            .map(|u| (u.ref_name.clone(), u.new_sha.clone()))
+            .map(|u| (u.ref_name.clone(), u.old_sha.clone(), u.new_sha.clone()))
             .collect::<Vec<_>>();
         let p2p_handle = state.p2p.clone();
         let pusher_did_clone = did.to_string();
@@ -959,7 +1057,7 @@ pub async fn git_receive_pack(
             let cid_map: std::collections::HashMap<String, String> = pinned.into_iter().collect();
 
             // Record branch→CID for each ref update and publish gossip
-            for (ref_name, new_sha) in &ref_updates_clone {
+            for (ref_name, old_sha, new_sha) in &ref_updates_clone {
                 let cid = cid_map.get(new_sha).map(|s| s.as_str());
 
                 if let Some(cid_str) = cid {
@@ -975,7 +1073,7 @@ pub async fn git_receive_pack(
                             pusher_did: pusher_did_clone.clone(),
                             repo: repo_slug.clone(),
                             ref_name: ref_name.clone(),
-                            old_sha: "".to_string(),
+                            old_sha: old_sha.clone(),
                             new_sha: new_sha.clone(),
                             timestamp: chrono::Utc::now().to_rfc3339(),
                             cert_id: None,
@@ -986,97 +1084,30 @@ pub async fn git_receive_pack(
                 }
             }
 
-            // HTTP peer notification — notify all known peers to pull from us.
-            // This is the reliable fallback when Gossipsub p2p is not yet connected.
-            // Suppressed for repos the public cannot read.
-            if announce {
-                if let Ok(peers) = db_for_peers.list_peers().await {
-                    for peer in peers {
-                        if peer.http_url.is_empty() {
-                            continue;
-                        }
-                        let peer_url = peer.http_url.trim_end_matches('/');
-                        if let Some(self_url) = self_public_url.as_deref() {
-                            if peer_url == self_url.trim_end_matches('/') {
-                                continue;
-                            }
-                        }
-                        let path = "/api/v1/sync/notify";
-                        let notify_url = format!("{peer_url}{path}");
-                        let body = serde_json::json!({
-                            "repo": repo_slug.clone(),
-                            "ref_name": ref_updates_clone.first().map(|(r, _)| r).unwrap_or(&String::new()),
-                            "new_sha": ref_updates_clone.first().map(|(_, s)| s).unwrap_or(&String::new()),
-                            "node_did": node_did_str.clone(),
-                            "pusher_did": pusher_did_clone.clone(),
-                            "old_sha": "0000000000000000000000000000000000000000",
-                            "timestamp": chrono::Utc::now().to_rfc3339(),
-                        });
-                        let body_bytes = match serde_json::to_vec(&body) {
-                            Ok(bytes) => bytes,
-                            Err(e) => {
-                                tracing::warn!(peer = %peer.did, err = %e, "failed to serialize peer sync notify");
-                                continue;
-                            }
-                        };
-                        let signed = gitlawb_core::http_sig::sign_request(
-                            node_keypair.as_ref(),
-                            "POST",
-                            path,
-                            &body_bytes,
-                        );
-                        match http_client
-                            .post(&notify_url)
-                            .header("Content-Type", "application/json")
-                            .header("Content-Digest", signed.content_digest)
-                            .header("Signature-Input", signed.signature_input)
-                            .header("Signature", signed.signature)
-                            .body(body_bytes)
-                            .send()
-                            .await
-                        {
-                            Ok(r) if r.status().is_success() => {
-                                tracing::info!(peer = %peer.did, repo = %repo_slug, "notified peer to sync")
-                            }
-                            Ok(r) => {
-                                tracing::warn!(peer = %peer.did, status = %r.status(), "peer sync notify returned error")
-                            }
-                            Err(e) => {
-                                tracing::warn!(peer = %peer.did, err = %e, "failed to notify peer")
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Broadcast ref update to GraphQL subscription listeners
+            // Broadcast ref update to GraphQL subscription listeners — one per ref.
             let now_ts = chrono::Utc::now().to_rfc3339();
-            let _ = ref_update_tx.send(crate::state::RefUpdateBroadcast {
-                repo: repo_slug.clone(),
-                ref_name: ref_updates_clone
-                    .first()
-                    .map(|(r, _)| r.clone())
-                    .unwrap_or_default(),
-                old_sha: "0000000000000000000000000000000000000000".to_string(),
-                new_sha: ref_updates_clone
-                    .first()
-                    .map(|(_, s)| s.clone())
-                    .unwrap_or_default(),
-                pusher_did: pusher_did_clone.clone(),
-                node_did: node_did_str.clone(),
-                timestamp: now_ts.clone(),
-            });
+            for (ref_name, old_sha, new_sha) in &ref_updates_clone {
+                let _ = ref_update_tx.send(crate::state::RefUpdateBroadcast {
+                    repo: repo_slug.clone(),
+                    ref_name: ref_name.clone(),
+                    old_sha: old_sha.clone(),
+                    new_sha: new_sha.clone(),
+                    pusher_did: pusher_did_clone.clone(),
+                    node_did: node_did_str.clone(),
+                    timestamp: now_ts.clone(),
+                });
+            }
 
             // Arweave permanent anchoring — fire for each ref update.
             // Suppressed for repos the public cannot read (public permanent ledger).
             if announce && !irys_url.is_empty() {
-                for (ref_name, new_sha) in &ref_updates_clone {
+                for (ref_name, old_sha, new_sha) in &ref_updates_clone {
                     let cid = cid_map.get(new_sha).cloned();
                     let anchor = crate::arweave::RefAnchor {
                         repo: repo_slug.clone(),
                         owner_did: owner_did_for_arweave.clone(),
                         ref_name: ref_name.clone(),
-                        old_sha: "0".repeat(64),
+                        old_sha: old_sha.clone(),
                         new_sha: new_sha.clone(),
                         cid: cid.clone(),
                         timestamp: now_ts.clone(),
@@ -1091,7 +1122,7 @@ pub async fn git_receive_pack(
                                     repo: &repo_slug,
                                     owner_did: &owner_did_for_arweave,
                                     ref_name,
-                                    old_sha: "0".repeat(64).as_str(),
+                                    old_sha,
                                     new_sha,
                                     cid: cid.as_deref(),
                                     irys_tx_id: &tx_id,
@@ -1102,6 +1133,39 @@ pub async fn git_receive_pack(
                         }
                         Ok(_) => {}
                         Err(e) => tracing::warn!(repo=%repo_slug, err=%e, "Arweave anchor failed"),
+                    }
+                }
+            }
+
+            // HTTP peer notification — notify all known peers to pull from us.
+            // This is the reliable fallback when Gossipsub p2p is not yet connected.
+            // Suppressed for repos the public cannot read. Runs last so a slow or
+            // unreachable peer cannot delay the local GraphQL broadcast or Arweave
+            // anchoring above; this is the lowest-priority best-effort step.
+            if announce {
+                if let Ok(peers) = db_for_peers.list_peers().await {
+                    for peer in peers {
+                        if peer.http_url.is_empty() {
+                            continue;
+                        }
+                        let peer_url = peer.http_url.trim_end_matches('/');
+                        if let Some(self_url) = self_public_url.as_deref() {
+                            if peer_url == self_url.trim_end_matches('/') {
+                                continue;
+                            }
+                        }
+                        let notify_url = format!("{peer_url}{SYNC_NOTIFY_PATH}");
+                        notify_peer_of_refs(
+                            &http_client,
+                            node_keypair.as_ref(),
+                            &peer.did,
+                            &notify_url,
+                            &repo_slug,
+                            &ref_updates_clone,
+                            &node_did_str,
+                            &pusher_did_clone,
+                        )
+                        .await;
                     }
                 }
             }
@@ -1492,6 +1556,9 @@ fn dedupe_canonical_repos(rows: Vec<(RepoRecord, i64)>) -> Vec<(RepoRecord, i64)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::caller_authorized_to_push;
+    use crate::error::AppError;
+    use gitlawb_core::identity::Keypair;
 
     const OWNER_DID: &str = "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
     const OWNER_SHORT: &str = "z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
@@ -1880,5 +1947,118 @@ mod tests {
             out[0].0.id, "aaa",
             "id ASC breaks a full tie deterministically"
         );
+    }
+
+    // A multi-ref push must fan out one /sync/notify request per ref, each
+    // carrying that ref's real old_sha. Regression guard for the handler that
+    // used to flatten the push to ref_updates_clone.first() with a hardcoded
+    // zero old_sha (#26 / PR #72) — drops every ref after the first and the
+    // wrong previous SHA.
+    #[tokio::test]
+    async fn test_notify_peer_of_refs_sends_one_request_per_ref_with_real_old_sha() {
+        let mut server = mockito::Server::new_async().await;
+        let keypair = Keypair::generate();
+        let http_client = reqwest::Client::new();
+
+        let (ref_a, old_a, new_a) = (
+            "refs/heads/main",
+            "1111111111111111111111111111111111111111",
+            "2222222222222222222222222222222222222222",
+        );
+        let (ref_b, old_b, new_b) = (
+            "refs/heads/feature",
+            "3333333333333333333333333333333333333333",
+            "4444444444444444444444444444444444444444",
+        );
+
+        // Two distinct mocks, each requiring one ref's real per-ref values.
+        // The old flattening bug (one request, first ref, zero old_sha) would
+        // satisfy neither: ref A's request would carry zeros, ref B none at all.
+        let _mock_a = server
+            .mock("POST", SYNC_NOTIFY_PATH)
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::PartialJsonString(format!(r#"{{"ref_name":"{ref_a}"}}"#)),
+                mockito::Matcher::PartialJsonString(format!(r#"{{"old_sha":"{old_a}"}}"#)),
+                mockito::Matcher::PartialJsonString(format!(r#"{{"new_sha":"{new_a}"}}"#)),
+            ]))
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+        let _mock_b = server
+            .mock("POST", SYNC_NOTIFY_PATH)
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::PartialJsonString(format!(r#"{{"ref_name":"{ref_b}"}}"#)),
+                mockito::Matcher::PartialJsonString(format!(r#"{{"old_sha":"{old_b}"}}"#)),
+                mockito::Matcher::PartialJsonString(format!(r#"{{"new_sha":"{new_b}"}}"#)),
+            ]))
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let notify_url = format!("{}{SYNC_NOTIFY_PATH}", server.url());
+        let ref_updates = vec![
+            (ref_a.to_string(), old_a.to_string(), new_a.to_string()),
+            (ref_b.to_string(), old_b.to_string(), new_b.to_string()),
+        ];
+
+        notify_peer_of_refs(
+            &http_client,
+            &keypair,
+            "did:key:zPeer",
+            &notify_url,
+            "owner/repo",
+            &ref_updates,
+            "did:key:zNode",
+            "did:key:zPusher",
+        )
+        .await;
+
+        _mock_a.assert_async().await;
+        _mock_b.assert_async().await;
+    }
+
+    // A newly created ref carries the all-zeros hash as its real old_sha — the
+    // helper must forward it verbatim, not substitute a different placeholder.
+    #[tokio::test]
+    async fn test_notify_peer_of_refs_forwards_all_zeros_for_created_ref() {
+        let mut server = mockito::Server::new_async().await;
+        let keypair = Keypair::generate();
+        let http_client = reqwest::Client::new();
+
+        let zero = ZERO_SHA;
+        let new_sha = "5555555555555555555555555555555555555555";
+        let _mock = server
+            .mock("POST", SYNC_NOTIFY_PATH)
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::PartialJsonString(format!(r#"{{"old_sha":"{zero}"}}"#)),
+                mockito::Matcher::PartialJsonString(format!(r#"{{"new_sha":"{new_sha}"}}"#)),
+            ]))
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let notify_url = format!("{}{SYNC_NOTIFY_PATH}", server.url());
+        let ref_updates = vec![(
+            "refs/heads/new".to_string(),
+            zero.to_string(),
+            new_sha.to_string(),
+        )];
+
+        notify_peer_of_refs(
+            &http_client,
+            &keypair,
+            "did:key:zPeer",
+            &notify_url,
+            "owner/repo",
+            &ref_updates,
+            "did:key:zNode",
+            "did:key:zPusher",
+        )
+        .await;
+
+        _mock.assert_async().await;
     }
 }
