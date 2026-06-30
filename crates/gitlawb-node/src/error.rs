@@ -23,6 +23,9 @@ pub enum AppError {
     #[allow(dead_code)]
     Forbidden(String),
 
+    #[error("icaptcha proof required: {0}")]
+    IcaptchaProofRequired(String),
+
     #[error("invalid request: {0}")]
     BadRequest(String),
 
@@ -52,6 +55,15 @@ impl IntoResponse for AppError {
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, "not_found", msg.clone()),
             AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, "not_an_agent", msg.clone()),
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, "forbidden", msg.clone()),
+            // 403, not 401: the caller IS an authenticated agent (credentials are
+            // valid) but is forbidden from this action without a valid, fresh
+            // iCaptcha proof. The distinct `icaptcha_proof_required` code — which
+            // clients branch on — keeps it separable from a plain `forbidden`.
+            AppError::IcaptchaProofRequired(msg) => (
+                StatusCode::FORBIDDEN,
+                "icaptcha_proof_required",
+                msg.clone(),
+            ),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "bad_request", msg.clone()),
             AppError::Git(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "git_error", msg.clone()),
             AppError::Db(e) => (StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string()),

@@ -36,8 +36,14 @@ pub struct RegisterResponse {
 pub async fn register(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<crate::auth::AuthenticatedDid>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<RegisterRequest>,
 ) -> Result<(StatusCode, Json<RegisterResponse>)> {
+    // iCaptcha gate (inert unless ICAPTCHA_MODE is set). Verify up front; spend
+    // the proof only once the request is admissible, just before the write, so a
+    // rejected request never burns a valid proof.
+    let proof = crate::icaptcha::verify_request(&headers, &auth.0)?;
+
     // Parse and validate the DID
     let agent_did: Did = req
         .did
@@ -51,6 +57,9 @@ pub async fn register(
             "did must be the authenticated signer".into(),
         ));
     }
+
+    // Request is admissible — spend the proof now, immediately before the write.
+    proof.consume(&state.db).await?;
 
     // Store the agent in the local index
     state
