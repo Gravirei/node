@@ -668,4 +668,705 @@ mod tests {
             "stats must count logical repos (mirror+canonical collapsed)"
         );
     }
+
+    // ── #97: repo-listing surfaces are visibility-gated ──────────────────────
+
+    fn seed_private_repo(owner_did: &str, name: &str) -> RepoRecord {
+        RepoRecord {
+            is_public: false,
+            ..seed_repo(owner_did, name)
+        }
+    }
+
+    fn anon_get(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request builder")
+    }
+
+    async fn json_body(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    fn names_in(v: &serde_json::Value) -> Vec<String> {
+        v.as_array()
+            .expect("array body")
+            .iter()
+            .filter_map(|r| r["name"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    fn list_repos_router(state: AppState) -> Router {
+        Router::new()
+            .route(
+                "/api/v1/repos",
+                axum::routing::get(crate::api::repos::list_repos),
+            )
+            .with_state(state)
+    }
+
+    #[sqlx::test]
+    async fn list_repos_hides_private_repo_and_count_from_anonymous(pool: PgPool) {
+        let owner = "did:key:zLISTOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "pub-repo"))
+            .await
+            .expect("seed public");
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "priv-repo"))
+            .await
+            .expect("seed private");
+
+        let resp = list_repos_router(state)
+            .oneshot(anon_get("/api/v1/repos"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let total = resp
+            .headers()
+            .get("X-Total-Count")
+            .and_then(|h| h.to_str().ok())
+            .map(str::to_string);
+        let names = names_in(&json_body(resp).await);
+        assert!(
+            names.contains(&"pub-repo".to_string()),
+            "public repo listed"
+        );
+        assert!(
+            !names.contains(&"priv-repo".to_string()),
+            "private repo must not be enumerable anonymously (#97)"
+        );
+        assert_eq!(
+            total.as_deref(),
+            Some("1"),
+            "X-Total-Count must not leak the private repo's existence"
+        );
+    }
+
+    #[sqlx::test]
+    async fn list_repos_shows_owner_their_private_repo(pool: PgPool) {
+        let owner = "did:key:zLISTOWNER2BBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "pub-repo"))
+            .await
+            .expect("seed public");
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "priv-repo"))
+            .await
+            .expect("seed private");
+
+        let resp = list_repos_router(state)
+            .oneshot(signed_request_as(
+                owner,
+                Method::GET,
+                "/api/v1/repos",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let names = names_in(&json_body(resp).await);
+        assert!(
+            names.contains(&"priv-repo".to_string()) && names.contains(&"pub-repo".to_string()),
+            "owner sees their own private repo, got {names:?}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn list_repos_shows_private_repo_to_authorized_root_reader(pool: PgPool) {
+        // Proves the gate is visibility_check, not a bare is_public filter: an
+        // is_public=false repo with a root rule granting a reader DID is listable
+        // to that reader (and not to a stranger).
+        let owner = "did:key:zLISTOWNER3CCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+        let reader = "did:key:zLISTREADERDDDDDDDDDDDDDDDDDDDDDDDDDDDDD";
+        let stranger = "did:key:zLISTSTRANGEREEEEEEEEEEEEEEEEEEEEEEEEEE";
+        let state = test_state(pool).await;
+        let rec = seed_private_repo(owner, "priv-repo");
+        state.db.create_repo(&rec).await.expect("seed private");
+        state
+            .db
+            .set_visibility_rule(
+                &rec.id,
+                "/",
+                crate::db::VisibilityMode::A,
+                &[reader.to_string()],
+                owner,
+            )
+            .await
+            .expect("grant root reader");
+
+        let names_for = |did: &'static str, st: AppState| async move {
+            let resp = list_repos_router(st)
+                .oneshot(signed_request_as(
+                    did,
+                    Method::GET,
+                    "/api/v1/repos",
+                    Body::empty(),
+                ))
+                .await
+                .unwrap();
+            names_in(&json_body(resp).await)
+        };
+
+        assert!(
+            names_for(reader, state.clone())
+                .await
+                .contains(&"priv-repo".to_string()),
+            "authorized root reader must see the private repo"
+        );
+        assert!(
+            !names_for(stranger, state)
+                .await
+                .contains(&"priv-repo".to_string()),
+            "an unlisted stranger must not see it"
+        );
+    }
+
+    #[sqlx::test]
+    async fn list_federated_repos_hides_private_from_anonymous(pool: PgPool) {
+        let owner = "did:key:zFEDOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "pub-repo"))
+            .await
+            .expect("seed public");
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "priv-repo"))
+            .await
+            .expect("seed private");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/federated",
+                axum::routing::get(crate::api::repos::list_federated_repos),
+            )
+            .with_state(state);
+        let resp = router
+            .oneshot(anon_get("/api/v1/repos/federated"))
+            .await
+            .unwrap();
+        let body = json_body(resp).await;
+        let names = names_in(&body["repos"]);
+        assert_eq!(
+            body["count"].as_u64(),
+            Some(1),
+            "federated count must reflect only the visible repos, not the pre-filter total (#97)"
+        );
+        assert!(
+            names.contains(&"pub-repo".to_string()),
+            "public repo federated"
+        );
+        assert!(
+            !names.contains(&"priv-repo".to_string()),
+            "private repo must not be federated to anonymous callers (#97)"
+        );
+    }
+
+    #[sqlx::test]
+    async fn graphql_repos_hides_private_from_anonymous(pool: PgPool) {
+        // The GraphQL repos query is the third listing surface; an anonymous
+        // query must not enumerate a private repo (#97).
+        let owner = "did:key:zGQLOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "pub-repo"))
+            .await
+            .expect("seed public");
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "priv-repo"))
+            .await
+            .expect("seed private");
+
+        let resp = state
+            .graphql_schema
+            .execute(async_graphql::Request::new("{ repos { name } }"))
+            .await;
+        assert!(resp.errors.is_empty(), "graphql errors: {:?}", resp.errors);
+        let names = names_in(&resp.data.into_json().expect("graphql json")["repos"]);
+        assert!(
+            names.contains(&"pub-repo".to_string()),
+            "public repo listed"
+        );
+        assert!(
+            !names.contains(&"priv-repo".to_string()),
+            "private repo must not be enumerable via anonymous GraphQL (#97)"
+        );
+    }
+
+    #[sqlx::test]
+    async fn graphql_repos_shows_authorized_caller_their_private_repo(pool: PgPool) {
+        // Positive path: the resolver pulls the caller DID from GraphQL request
+        // data, so the authenticated context must still surface a private repo its
+        // owner may read. Guards an auth-context regression on the GraphQL surface
+        // that the anonymous-only test would miss (#97).
+        let owner = "did:key:zGQLAUTHOWNERAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "priv-repo"))
+            .await
+            .expect("seed private");
+
+        let resp = state
+            .graphql_schema
+            .execute(
+                async_graphql::Request::new("{ repos { name } }")
+                    .data(AuthenticatedDid(owner.to_string())),
+            )
+            .await;
+        assert!(resp.errors.is_empty(), "graphql errors: {:?}", resp.errors);
+        let names = names_in(&resp.data.into_json().expect("graphql json")["repos"]);
+        assert!(
+            names.contains(&"priv-repo".to_string()),
+            "owner must see their own private repo via authenticated GraphQL (#97)"
+        );
+    }
+
+    #[sqlx::test]
+    async fn list_repos_paged_count_excludes_private(pool: PgPool) {
+        // The paged path (limit set) is the KTD2 exploit shape: a pre-cut page +
+        // SQL total would leak the private-repo count. Assert X-Total-Count is the
+        // visible count and the page is not short (#97).
+        let owner = "did:key:zPAGEOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "pub-a"))
+            .await
+            .expect("seed public a");
+        state
+            .db
+            .create_repo(&seed_repo(owner, "pub-b"))
+            .await
+            .expect("seed public b");
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "priv-repo"))
+            .await
+            .expect("seed private");
+
+        let resp = list_repos_router(state)
+            .oneshot(anon_get("/api/v1/repos?limit=10"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let total = resp
+            .headers()
+            .get("X-Total-Count")
+            .and_then(|h| h.to_str().ok())
+            .map(str::to_string);
+        let names = names_in(&json_body(resp).await);
+        assert_eq!(
+            total.as_deref(),
+            Some("2"),
+            "paged X-Total-Count must reflect only the 2 visible repos, not leak the private count"
+        );
+        assert_eq!(
+            names.len(),
+            2,
+            "page must not be short: both public repos present"
+        );
+        assert!(!names.contains(&"priv-repo".to_string()));
+    }
+
+    #[sqlx::test]
+    async fn list_repos_hides_public_repo_under_root_deny(pool: PgPool) {
+        // Proves the gate is visibility_check, not a bare is_public filter, in the
+        // negative direction: an is_public=true repo with a root deny rule (mode B,
+        // no readers) is NOT listable to anonymous, while a plain public repo is.
+        let owner = "did:key:zDENYOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "open-repo"))
+            .await
+            .expect("seed open");
+        let denied = seed_repo(owner, "deny-repo"); // is_public = true
+        state.db.create_repo(&denied).await.expect("seed denied");
+        state
+            .db
+            .set_visibility_rule(&denied.id, "/", crate::db::VisibilityMode::B, &[], owner)
+            .await
+            .expect("root deny rule");
+
+        let resp = list_repos_router(state)
+            .oneshot(anon_get("/api/v1/repos"))
+            .await
+            .unwrap();
+        let names = names_in(&json_body(resp).await);
+        assert!(
+            names.contains(&"open-repo".to_string()),
+            "plain public repo listed"
+        );
+        assert!(
+            !names.contains(&"deny-repo".to_string()),
+            "is_public=true repo with a root deny must NOT be listed (proves visibility_check, not is_public)"
+        );
+    }
+
+    #[sqlx::test]
+    async fn list_repos_owner_filter_excludes_private_from_anonymous(pool: PgPool) {
+        // The owner-filtered path (?owner=, SQL $1 bind) must still apply the Rust
+        // "/" visibility gate: an anonymous caller filtering by an owner sees that
+        // owner's public repos but never their private ones, and the count does
+        // not leak (#97). This is a distinct SQL branch from the unfiltered path.
+        let short = "zOWNERFILTERAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let owner = format!("did:key:{short}");
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(&owner, "pub-repo"))
+            .await
+            .expect("seed public");
+        state
+            .db
+            .create_repo(&seed_private_repo(&owner, "priv-repo"))
+            .await
+            .expect("seed private");
+
+        let resp = list_repos_router(state)
+            .oneshot(anon_get(&format!("/api/v1/repos?owner={short}&limit=10")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let total = resp
+            .headers()
+            .get("X-Total-Count")
+            .and_then(|h| h.to_str().ok())
+            .map(str::to_string);
+        let names = names_in(&json_body(resp).await);
+        assert!(
+            names.contains(&"pub-repo".to_string()),
+            "owner's public repo listed"
+        );
+        assert!(
+            !names.contains(&"priv-repo".to_string()),
+            "owner's private repo hidden from anonymous even when owner-filtered (#97)"
+        );
+        assert_eq!(
+            total.as_deref(),
+            Some("1"),
+            "owner-filtered X-Total-Count must exclude the private repo"
+        );
+    }
+
+    #[sqlx::test]
+    async fn list_repos_owner_filter_full_did_matches_bare_mirror(pool: PgPool) {
+        // A mirror-only repo (known via gossip, no local canonical row) stores the
+        // bare owner key `z...`. Filtering by the full `did:key:z...` form must
+        // still return it, matching crate::api::did_matches — the behavior the
+        // no-limit `gl repo list --owner` path relied on before #97 routed owner
+        // filtering through SQL (jatmn P2 on #111). Both owner forms must match.
+        let short = "zMIRRORONLYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .upsert_mirror_repo(short, "mirror-repo", "/tmp/mirror", None)
+            .await
+            .expect("seed mirror-only row");
+
+        // full did:key: form must match the bare-owner mirror row
+        let resp = list_repos_router(state.clone())
+            .oneshot(anon_get(&format!("/api/v1/repos?owner=did:key:{short}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let names = names_in(&json_body(resp).await);
+        assert!(
+            names.contains(&"mirror-repo".to_string()),
+            "full did:key: owner filter must match a bare-owner mirror row (jatmn #111)"
+        );
+
+        // short bare form must still match
+        let resp = list_repos_router(state)
+            .oneshot(anon_get(&format!("/api/v1/repos?owner={short}")))
+            .await
+            .unwrap();
+        let names = names_in(&json_body(resp).await);
+        assert!(
+            names.contains(&"mirror-repo".to_string()),
+            "short-form owner filter must still match the mirror row"
+        );
+    }
+
+    #[sqlx::test]
+    async fn list_repos_pagination_offset_past_end_keeps_total(pool: PgPool) {
+        // Pagination edge: an offset past the visible set returns an empty page,
+        // but X-Total-Count still reflects the full visible count -- so paging can
+        // neither short the page nor leak a different total (#97). Guards against a
+        // refactor that derives the total from the cut page instead of the set.
+        let owner = "did:key:zOFFSETOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "pub-a"))
+            .await
+            .expect("seed public a");
+        state
+            .db
+            .create_repo(&seed_repo(owner, "pub-b"))
+            .await
+            .expect("seed public b");
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "priv-repo"))
+            .await
+            .expect("seed private");
+
+        let resp = list_repos_router(state)
+            .oneshot(anon_get("/api/v1/repos?limit=5&offset=100"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let total = resp
+            .headers()
+            .get("X-Total-Count")
+            .and_then(|h| h.to_str().ok())
+            .map(str::to_string);
+        let names = names_in(&json_body(resp).await);
+        assert!(names.is_empty(), "offset past the end yields an empty page");
+        assert_eq!(
+            total.as_deref(),
+            Some("2"),
+            "X-Total-Count stays the full visible total regardless of offset"
+        );
+    }
+
+    #[sqlx::test]
+    async fn list_repos_hides_canonical_under_root_deny_even_with_mirror(pool: PgPool) {
+        // Regression guard for the dedup-survivor + visibility-rule seam. A logical
+        // repo present as BOTH a canonical row (carrying a root-deny rule) and a
+        // gossip mirror row: the DEDUP_CTE must pick the canonical survivor so the
+        // batch rule lookup (keyed by the survivor's id) finds the deny and
+        // withholds it. If dedup ever picked the mirror (slash-form id, no rule),
+        // the gate would fall back to is_public=true and leak the repo. is_public
+        // is true here, so the rule is the only thing hiding it.
+        let short = "zMIRRORDENYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let owner = format!("did:key:{short}");
+        let state = test_state(pool).await;
+        let canonical = seed_repo(&owner, "secret"); // is_public = true
+        state
+            .db
+            .create_repo(&canonical)
+            .await
+            .expect("seed canonical");
+        state
+            .db
+            .set_visibility_rule(
+                &canonical.id,
+                "/",
+                crate::db::VisibilityMode::B,
+                &[],
+                &owner,
+            )
+            .await
+            .expect("root deny rule on canonical");
+        state
+            .db
+            .upsert_mirror_repo(short, "secret", "/tmp/mirror", None)
+            .await
+            .expect("seed mirror");
+        state
+            .db
+            .create_repo(&seed_repo(&owner, "open"))
+            .await
+            .expect("seed public sibling");
+
+        let resp = list_repos_router(state)
+            .oneshot(anon_get("/api/v1/repos"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let total = resp
+            .headers()
+            .get("X-Total-Count")
+            .and_then(|h| h.to_str().ok())
+            .map(str::to_string);
+        let names = names_in(&json_body(resp).await);
+        assert!(names.contains(&"open".to_string()), "public sibling listed");
+        assert!(
+            !names.contains(&"secret".to_string()),
+            "canonical repo with a root deny must stay hidden even when a mirror row exists (#97 dedup-survivor/rule seam)"
+        );
+        assert_eq!(
+            total.as_deref(),
+            Some("1"),
+            "X-Total-Count counts only the visible sibling, not the mirror+canonical pair"
+        );
+    }
+
+    // ── /api/v1/stats count oracle (#104) ──────────────────────────────────
+    // The stats endpoint lives in meta_routes (no auth layer), so the caller is
+    // always anonymous (None). Its `repos` count must withhold private/mode-A
+    // repos exactly as the listing surfaces do, or it is a count oracle.
+
+    fn stats_router(state: AppState) -> Router {
+        Router::new()
+            .route("/api/v1/stats", axum::routing::get(crate::server::stats))
+            .with_state(state)
+    }
+
+    async fn stats_repos_count(state: AppState) -> i64 {
+        let resp = stats_router(state)
+            .oneshot(anon_get("/api/v1/stats"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        json_body(resp).await["repos"]
+            .as_i64()
+            .expect("stats.repos is an integer")
+    }
+
+    #[sqlx::test]
+    async fn stats_repos_count_excludes_bare_private(pool: PgPool) {
+        // No-rule branch: an is_public=false repo with no visibility rule is
+        // denied to anonymous, so stats.repos counts only the public repo.
+        let owner = "did:key:zSTATSPRIVAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "pub-repo"))
+            .await
+            .expect("seed public");
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "priv-repo"))
+            .await
+            .expect("seed private");
+
+        assert_eq!(
+            stats_repos_count(state).await,
+            1,
+            "stats.repos must not count the private repo (#104 count oracle)"
+        );
+    }
+
+    #[sqlx::test]
+    async fn stats_repos_count_excludes_hide_existence_repo(pool: PgPool) {
+        // Some(rule) branch — the #104 subject. Both repos are is_public=true, so
+        // the only reason the second is withheld is its root rule with empty
+        // reader_dids (anonymous excluded). Proves the count goes through
+        // listable_at_root, not a bare is_public predicate.
+        let owner = "did:key:zSTATSHIDEAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "open-repo"))
+            .await
+            .expect("seed open");
+        let hidden = seed_repo(owner, "hidden-repo"); // is_public = true
+        state.db.create_repo(&hidden).await.expect("seed hidden");
+        state
+            .db
+            .set_visibility_rule(&hidden.id, "/", crate::db::VisibilityMode::A, &[], owner)
+            .await
+            .expect("root hide-existence rule");
+
+        assert_eq!(
+            stats_repos_count(state).await,
+            1,
+            "stats.repos must not count a hide-existence (mode-A, empty readers) repo (#104)"
+        );
+    }
+
+    #[sqlx::test]
+    async fn stats_repos_count_excludes_public_under_root_deny(pool: PgPool) {
+        // Inverse the seam was built for: an is_public=true repo with a root deny
+        // (mode B, no readers) must not be counted — is_public alone would count it.
+        let owner = "did:key:zSTATSDENYAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "open-repo"))
+            .await
+            .expect("seed open");
+        let denied = seed_repo(owner, "deny-repo"); // is_public = true
+        state.db.create_repo(&denied).await.expect("seed denied");
+        state
+            .db
+            .set_visibility_rule(&denied.id, "/", crate::db::VisibilityMode::B, &[], owner)
+            .await
+            .expect("root deny rule");
+
+        assert_eq!(
+            stats_repos_count(state).await,
+            1,
+            "stats.repos must not count an is_public=true repo under a root deny (#104)"
+        );
+    }
+
+    #[sqlx::test]
+    async fn stats_repos_count_matches_list_total(pool: PgPool) {
+        // R2 parity: stats.repos == anonymous GET /api/v1/repos X-Total-Count.
+        let owner = "did:key:zSTATSPARITYAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "pub-repo"))
+            .await
+            .expect("seed public");
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "priv-repo"))
+            .await
+            .expect("seed private");
+
+        let list_total = {
+            let resp = list_repos_router(state.clone())
+                .oneshot(anon_get("/api/v1/repos"))
+                .await
+                .unwrap();
+            resp.headers()
+                .get("X-Total-Count")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.parse::<i64>().ok())
+                .expect("X-Total-Count header")
+        };
+
+        assert_eq!(
+            stats_repos_count(state).await,
+            list_total,
+            "stats.repos must equal the anonymous list X-Total-Count (R2 parity)"
+        );
+        assert_eq!(list_total, 1, "sanity: only the public repo is visible");
+    }
+
+    #[sqlx::test]
+    async fn stats_preserves_sibling_fields(pool: PgPool) {
+        // R4: the rewrite must not drop agents/pushes/version.
+        let state = test_state(pool).await;
+        let resp = stats_router(state)
+            .oneshot(anon_get("/api/v1/stats"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        for key in ["repos", "agents", "pushes", "version"] {
+            assert!(body.get(key).is_some(), "stats must still carry `{key}`");
+        }
+    }
+
+    #[sqlx::test]
+    async fn stats_repos_count_empty_db_is_zero(pool: PgPool) {
+        let state = test_state(pool).await;
+        assert_eq!(
+            stats_repos_count(state).await,
+            0,
+            "empty DB yields repos == 0 without error"
+        );
+    }
 }

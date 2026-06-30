@@ -5,11 +5,23 @@
 //! `is_public` flag. It performs no I/O so it is exhaustively unit tested.
 
 use crate::db::VisibilityRule;
+use unicode_normalization::UnicodeNormalization;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Decision {
     Allow,
     Deny,
+}
+
+/// NFC-normalize a glob prefix or path so the matcher compares canonically
+/// equivalent strings byte-for-byte. Without this, a deny rule authored NFC
+/// (`é` = U+00E9) byte-compares unequal to a path committed NFD (`e` + U+0301)
+/// and the blob slips past the rule on the replication path (#101). NFC, not
+/// NFKC: compatibility folding (ligatures, full-width forms) would merge paths
+/// the filesystem treats as distinct and over-withhold. Both sides of every
+/// comparison must pass through this, or the skew just moves.
+fn nfc(s: &str) -> String {
+    s.nfc().collect()
 }
 
 /// True if `caller` is the repo owner (matches full did:key or its short form),
@@ -36,12 +48,17 @@ fn glob_matches(glob: &str, path: &str) -> bool {
     if prefix == "/" {
         return true;
     }
+    // Compare in NFC so an NFC rule matches a canonically-equivalent NFD path
+    // (and vice versa). Both sides normalized here — the single matcher seam.
+    let prefix = nfc(prefix);
+    let path = nfc(path);
     path == prefix || path.starts_with(&format!("{prefix}/"))
 }
 
-/// Specificity = length of the match prefix; longer is more specific.
+/// Specificity = length of the (normalized) match prefix; longer is more
+/// specific. Normalized so ranking stays consistent with `glob_matches`.
 fn specificity(glob: &str) -> usize {
-    glob_prefix(glob).len()
+    nfc(glob_prefix(glob)).len()
 }
 
 /// Decide whether `caller` (None = anonymous) may read `path` in a repo.
@@ -94,6 +111,20 @@ pub fn visibility_check(
             }
         }
     }
+}
+
+/// Whether `caller` (None = anonymous) may see a repo in a listing — the `"/"`
+/// visibility decision, shared by every repo-listing surface (REST list,
+/// federated list, GraphQL `repos`) so they enforce one rule, not three drifting
+/// copies. Not a bare `is_public` test: a repo can be `is_public=false` with a
+/// root rule granting readers, or `is_public=true` with a root deny (#97).
+pub fn listable_at_root(
+    rules: &[VisibilityRule],
+    is_public: bool,
+    owner_did: &str,
+    caller: Option<&str>,
+) -> bool {
+    visibility_check(rules, is_public, owner_did, caller, "/") == Decision::Allow
 }
 
 /// The subtree path globs that `caller` (None = anonymous) may NOT read, given
@@ -370,5 +401,39 @@ mod tests {
             &[rule("/secret/**", VisibilityMode::B, &[])],
             true
         ));
+    }
+
+    // #101: a deny rule must withhold a path that denotes the same characters in
+    // a different Unicode normalization form. Without NFC normalization at the
+    // matcher seam, an NFC-authored rule byte-compares unequal to an NFD-stored
+    // path and the blob leaks on the replication path.
+    #[test]
+    fn matcher_withholds_across_nfc_nfd_normalization_skew() {
+        // "é" composed (NFC, U+00E9) in the rule; decomposed (NFD, e + U+0301)
+        // in the committed path.
+        let nfc_rule = "/s\u{00e9}cret/**";
+        let nfd_path = "/se\u{0301}cret/key.pem";
+        let rules = [rule(nfc_rule, VisibilityMode::B, &["did:key:z6MkFriend"])];
+        assert_eq!(
+            visibility_check(&rules, true, OWNER, None, nfd_path),
+            Decision::Deny,
+            "NFC-authored deny rule must withhold the canonically-equivalent NFD path"
+        );
+
+        // Mirror: rule authored NFD, path committed NFC.
+        let nfd_rule = "/se\u{0301}cret/**";
+        let nfc_path = "/s\u{00e9}cret/key.pem";
+        let rules2 = [rule(nfd_rule, VisibilityMode::B, &["did:key:z6MkFriend"])];
+        assert_eq!(
+            visibility_check(&rules2, true, OWNER, None, nfc_path),
+            Decision::Deny,
+            "NFD-authored deny rule must withhold the canonically-equivalent NFC path"
+        );
+
+        // A genuinely different path is still allowed (no over-withholding).
+        assert_eq!(
+            visibility_check(&rules, true, OWNER, None, "/public/x.txt"),
+            Decision::Allow
+        );
     }
 }

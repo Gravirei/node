@@ -451,8 +451,31 @@ async fn node_info(State(state): State<AppState>) -> Json<serde_json::Value> {
     }))
 }
 
-async fn stats(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let repos = state.db.count_repos_deduped().await.unwrap_or(0);
+pub(crate) async fn stats(State(state): State<AppState>) -> Json<serde_json::Value> {
+    // Count only the repos an anonymous caller could list, so the aggregate does
+    // not leak the existence of private/mode-A repos (#104 count oracle). Mirror
+    // the listing seam (api/repos.rs): over-fetch the deduped set, batch-load the
+    // visibility rules, and keep rows that pass listable_at_root. The caller is
+    // always None — meta_routes carries no auth layer (see the route group in this
+    // file). Fail closed: any DB error collapses the whole count to 0 (an
+    // under-count never leaks existence), preserving the prior `.unwrap_or(0)`.
+    let repos = async {
+        // stats only needs the count, so use the no-stars deduped list (same
+        // DEDUP_CTE) and skip the repo_stars aggregation the listing path needs.
+        let rows = state.db.list_all_repos_deduped().await?;
+        let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+        let rules_by_repo = state.db.list_visibility_rules_for_repos(&ids).await?;
+        let count = rows
+            .iter()
+            .filter(|r| {
+                let rules = rules_by_repo.get(&r.id).map(Vec::as_slice).unwrap_or(&[]);
+                crate::visibility::listable_at_root(rules, r.is_public, &r.owner_did, None)
+            })
+            .count() as i64;
+        Ok::<i64, anyhow::Error>(count)
+    }
+    .await
+    .unwrap_or(0);
     let agents = state.db.count_agents().await.unwrap_or(0);
     let pushes = state.db.count_pushes().await.unwrap_or(0);
     Json(json!({
