@@ -27,7 +27,7 @@ use std::str::FromStr;
 use crate::auth::AuthenticatedDid;
 use crate::error::{AppError, Result};
 use crate::git::store;
-use crate::git::visibility_pack::{has_path_scoped_rule, withheld_blob_oids};
+use crate::git::visibility_pack::{allowed_blob_set_for_caller, has_path_scoped_rule};
 use crate::state::AppState;
 use crate::visibility::{visibility_check, Decision};
 
@@ -36,16 +36,22 @@ use crate::visibility::{visibility_check, Decision};
 /// Search all repos on the node for a git object whose SHA-256 hash matches
 /// the given CIDv1, returning its raw content if the caller may read it.
 ///
-/// Visibility (#110): the object is served only from a repo row the caller
-/// passes. For each iterated row we gate against that row's OWN rules
+/// Visibility (#110, #126): the object is served only from a repo row the
+/// caller passes. For each iterated row we gate against that row's OWN rules
 /// (`visibility_check` at `"/"`), never re-resolving via `authorize_repo_read`
 /// — `get_repo`'s fuzzy match could otherwise authorize a different physical
-/// row than the one read (KTD2a). When the row carries path-scoped rules, a
-/// blob withheld from the caller (`withheld_blob_oids`) is skipped. Denial and
-/// genuine not-found both fall through to an opaque 404.
+/// row than the one read (KTD2a). When the row carries path-scoped rules
+/// (KTD4) the served object must be either a non-blob (trees/commits are
+/// structural; KTD3) OR a blob in the caller's *reachable* allowed-set
+/// (`allowed_blob_set_for_caller`). The reachable allowed-set excludes
+/// dangling blobs — a blob written via `git hash-object -w` and never
+/// committed has no path to gate, so it is fail-closed 404'd under
+/// path-scoped rules (#126). Denial and genuine not-found both fall through
+/// to an opaque 404.
 ///
-/// Scope: this closes the direct unauthenticated scan. A stale-public mirror
-/// row still serves withheld content (tracked separately, #124).
+/// Scope: this closes the direct unauthenticated scan, including the dangling
+/// case. A stale-public mirror row still serves withheld content (tracked
+/// separately, #124).
 pub async fn get_by_cid(
     Path(cid_str): Path<String>,
     State(state): State<AppState>,
@@ -85,11 +91,16 @@ pub async fn get_by_cid(
         .await
         .map_err(AppError::Internal)?;
 
-    // Request-scoped memo of the per-repo withheld set (KTD1). The caller is
-    // constant for one request, so `repo.id` alone is a safe, sufficient key —
-    // never a coarse caller "class", which `visibility_check`'s exact full-DID
-    // reader match would make unsafe.
-    let mut withheld_memo: HashMap<String, HashSet<String>> = HashMap::new();
+    // Request-scoped memo of the per-repo allowed-blob set (KTD1, #126). The
+    // caller is constant for one request, so `repo.id` alone is a safe,
+    // sufficient key — never a coarse caller "class", which
+    // `visibility_check`'s exact full-DID reader match would make unsafe.
+    //
+    // We flipped from a deny-set (`withheld_blob_oids`) to an allowed-set
+    // (`allowed_blob_set_for_caller`) so dangling blobs — never enumerated by
+    // the reachable walk — fail closed instead of slipping through an empty
+    // deny entry (#126).
+    let mut allowed_memo: HashMap<String, HashSet<String>> = HashMap::new();
 
     for repo in &repos {
         // Repo-level read gate against THIS row's own rules (KTD2a).
@@ -106,45 +117,51 @@ pub async fn get_by_cid(
             Err(_) => continue,
         };
 
-        // Per-blob withholding only applies when a path-scoped rule exists (KTD4).
-        if has_path_scoped_rule(rules) {
-            if !withheld_memo.contains_key(&repo.id) {
-                let rp = repo_path.clone();
-                let r = rules.to_vec();
-                let is_public = repo.is_public;
-                let owner = repo.owner_did.clone();
-                let caller_for_walk = caller_owned.clone();
-                // Full-history walk shells out to git — keep it off the async runtime.
-                let walk = tokio::task::spawn_blocking(move || {
-                    withheld_blob_oids(&rp, &r, is_public, &owner, caller_for_walk.as_deref())
-                })
-                .await;
-                // Fail closed on EITHER a task panic (JoinError) or a walk error:
-                // we cannot prove the caller may read here, so skip this repo and
-                // let a public copy (if any) serve. Never serve on an unproven gate.
-                let set = match walk {
-                    Ok(Ok(set)) => set,
-                    Ok(Err(e)) => {
-                        tracing::warn!(repo = %repo.name, err = %e, "withheld walk failed; skipping repo");
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::warn!(repo = %repo.name, err = %e, "withheld walk task panicked; skipping repo");
-                        continue;
-                    }
-                };
-                withheld_memo.insert(repo.id.clone(), set);
-            }
-            if withheld_memo
-                .get(&repo.id)
-                .is_some_and(|set| set.contains(&sha256_hex))
-            {
-                continue;
-            }
+        // Per-blob gating only applies when a path-scoped rule exists (KTD4).
+        // Without any path-scoped rule, the "/" gate above is the whole story.
+        let path_scoped = has_path_scoped_rule(rules);
+        if path_scoped && !allowed_memo.contains_key(&repo.id) {
+            let rp = repo_path.clone();
+            let r = rules.to_vec();
+            let is_public = repo.is_public;
+            let owner = repo.owner_did.clone();
+            let caller_for_walk = caller_owned.clone();
+            // Full-history walk shells out to git — keep it off the async runtime.
+            let walk = tokio::task::spawn_blocking(move || {
+                allowed_blob_set_for_caller(&rp, &r, is_public, &owner, caller_for_walk.as_deref())
+            })
+            .await;
+            // Fail closed on EITHER a task panic (JoinError) or a walk error:
+            // we cannot prove the caller may read here, so skip this repo and
+            // let a public copy (if any) serve. Never serve on an unproven gate.
+            let set = match walk {
+                Ok(Ok(set)) => set,
+                Ok(Err(e)) => {
+                    tracing::warn!(repo = %repo.name, err = %e, "allowed-blob walk failed; skipping repo");
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(repo = %repo.name, err = %e, "allowed-blob walk task panicked; skipping repo");
+                    continue;
+                }
+            };
+            allowed_memo.insert(repo.id.clone(), set);
         }
 
         match store::read_object(&repo_path, &sha256_hex) {
-            Ok(Some((_obj_type, content))) => {
+            Ok(Some((obj_type, content))) => {
+                // Path-scoped rules: serve trees/commits unconditionally
+                // (structural; KTD3); a blob must be in the reachable
+                // allowed-set, which excludes dangling blobs (#126).
+                if path_scoped && obj_type == "blob" {
+                    let in_allowed = allowed_memo
+                        .get(&repo.id)
+                        .is_some_and(|set| set.contains(&sha256_hex));
+                    if !in_allowed {
+                        continue;
+                    }
+                }
+
                 // 3. Return the content with IPFS-style headers
                 let mut headers = HeaderMap::new();
                 headers.insert(

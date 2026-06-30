@@ -1842,4 +1842,116 @@ mod tests {
             "walk error fails closed: repo skipped, even the public blob is not served"
         );
     }
+
+    /// #126: a dangling blob (written via `git hash-object -w`, never referenced
+    /// by any commit/tree) must 404 through `GET /ipfs/{cid}` under path-scoped
+    /// rules — for anon AND the owner. The pre-#126 deny-set was fail-open by
+    /// construction: dangling oids were absent from the reachable enumeration
+    /// and thus absent from the deny-set, so the handler served 200. The
+    /// allowed-set is fail-closed: dangling oids are absent from the reachable
+    /// allowed-set, so the handler 404s (per team memory: the owner shift to
+    /// 404 is the accepted fail-closed default — owners can still
+    /// `git cat-file` directly).
+    #[sqlx::test]
+    async fn ipfs_cid_dangling_blob_fails_closed_under_path_rules(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        use gitlawb_core::identity::Keypair;
+
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        // Seed a normal repo with `secret/b.txt` reachable from HEAD, so the
+        // path-scoped rule has something to match — without this the rule has
+        // no anchor and we'd be testing nothing.
+        let _fx = seed_cid_repos(&slug, &short, &["dangling"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("dangling.git");
+
+        // Write a dangling blob: `git hash-object -w --stdin` adds it to the
+        // object DB but nothing references it, so the reachable walk never
+        // enumerates it.
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(["hash-object", "-w", "--stdin"])
+            .current_dir(&bare)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn git hash-object");
+        {
+            use std::io::Write;
+            let stdin = child.stdin.as_mut().expect("stdin");
+            stdin.write_all(b"DANGLING SECRET\n").expect("write stdin");
+        }
+        let out = child.wait_with_output().expect("hash-object output");
+        assert!(
+            out.status.success(),
+            "git hash-object: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let dangling_oid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        // Sanity: must be a 64-hex sha256 oid, since the repo is sha256-format.
+        assert_eq!(
+            dangling_oid.len(),
+            64,
+            "expected sha256 oid: {dangling_oid}"
+        );
+        let dangling_cid = cid_for_oid(&dangling_oid);
+
+        state
+            .db
+            .create_repo(&seed_repo(&owner_did, "dangling"))
+            .await
+            .expect("seed repo");
+        let rec = state
+            .db
+            .get_repo(&owner_did, "dangling")
+            .await
+            .unwrap()
+            .unwrap();
+        // Path-scoped rule triggers the per-blob allowed-set gate (KTD4).
+        state
+            .db
+            .set_visibility_rule(&rec.id, "/secret/**", VisibilityMode::B, &[], &owner_did)
+            .await
+            .expect("deny rule");
+
+        // anon: the dangling blob is absent from the reachable allowed-set →
+        // 404, no leak. Pre-#126 (deny-set) would serve 200.
+        let (st, body) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&dangling_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "dangling blob must 404 under path-scoped rules"
+        );
+        assert!(
+            !body.contains("DANGLING SECRET"),
+            "404 body must not leak the dangling content"
+        );
+
+        // owner (signed): same 404. The dangling blob has no path, so it's
+        // never visibility-checked → never in the allowed set, even for the
+        // owner. This is the accepted fail-closed shift documented in the PR.
+        let (st, body) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_signed(&owner, &dangling_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "owner also 404s on dangling blobs under path-scoped rules (fail-closed default)"
+        );
+        assert!(!body.contains("DANGLING SECRET"));
+    }
 }
