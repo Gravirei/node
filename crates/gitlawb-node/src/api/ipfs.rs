@@ -145,7 +145,13 @@ pub async fn get_by_cid(
                 let caller_for_walk = caller_owned.clone();
                 // Full-history walk shells out to git — keep it off the async runtime.
                 let walk = tokio::task::spawn_blocking(move || {
-                    allowed_blob_set_for_caller(&rp, &r, is_public, &owner, caller_for_walk.as_deref())
+                    allowed_blob_set_for_caller(
+                        &rp,
+                        &r,
+                        is_public,
+                        &owner,
+                        caller_for_walk.as_deref(),
+                    )
                 })
                 .await;
                 // Fail closed on EITHER a task panic (JoinError) or a walk error:
@@ -180,8 +186,7 @@ pub async fn get_by_cid(
         );
         headers.insert(
             HeaderName::from_static("x-content-cid"),
-            HeaderValue::from_str(&cid_str)
-                .unwrap_or_else(|_| HeaderValue::from_static("invalid")),
+            HeaderValue::from_str(&cid_str).unwrap_or_else(|_| HeaderValue::from_static("invalid")),
         );
         headers.insert(
             HeaderName::from_static("x-git-hash"),
