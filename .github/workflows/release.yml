@@ -9,6 +9,9 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+# Least privilege by default; every job opts in to exactly what it needs.
+permissions: {}
+
 jobs:
   release-please:
     if: ${{ github.repository == 'Gitlawb/node' }}
@@ -24,7 +27,7 @@ jobs:
     steps:
       - name: Run release-please
         id: release
-        uses: googleapis/release-please-action@16a9c90856f42705d54a6fda1823352bdc62cf38 # v4.3.0
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -41,6 +44,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ needs.release-please.outputs.tag_name }}
+          persist-credentials: false
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
@@ -101,6 +105,9 @@ jobs:
     needs: release-please
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
     runs-on: ${{ matrix.os }}
+    # Windows is best-effort: a failure there must not fail the job or block the
+    # downstream npm/Homebrew jobs that only consume the unix artifacts.
+    continue-on-error: ${{ startsWith(matrix.target, 'x86_64-pc-windows') }}
     permissions:
       contents: write
     strategy:
@@ -115,11 +122,14 @@ jobs:
             os: macos-13
           - target: aarch64-apple-darwin
             os: macos-14
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
     steps:
       - name: Checkout release tag
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ needs.release-please.outputs.tag_name }}
+          persist-credentials: false
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b # stable
@@ -143,8 +153,22 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # The gitlawb-node daemon is a Linux/macOS service; on Windows we ship only
+      # the two CLI binaries. A Windows-only failure must not block the release.
+      - name: Determine binaries
+        shell: bash
+        run: |
+          BINS="gl git-remote-gitlawb gitlawb-node"
+          case "${{ matrix.target }}" in *windows*) BINS="gl git-remote-gitlawb" ;; esac
+          echo "BINS=$BINS" >> "$GITHUB_ENV"
+
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} -p gl -p git-remote-gitlawb -p gitlawb-node
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=""
+          for b in $BINS; do args="$args -p $b"; done
+          cargo build --release --target ${{ matrix.target }} $args
 
       # Run each packaged binary's --version so a broken release artifact fails the
       # build instead of shipping. Skipped for cross-compiled targets that can't run
@@ -156,9 +180,11 @@ jobs:
           set -euo pipefail
           VERSION="${{ needs.release-please.outputs.version }}"
           BIN_DIR="target/${{ matrix.target }}/release"
-          for bin in gl git-remote-gitlawb gitlawb-node; do
+          EXE=""
+          case "${{ matrix.target }}" in *windows*) EXE=".exe" ;; esac
+          for bin in $BINS; do
             echo "== $bin --version =="
-            out="$("$BIN_DIR/$bin" --version)"
+            out="$("$BIN_DIR/$bin$EXE" --version)"
             echo "$out"
             # Each binary prints "<name> <version>"; assert the released version is present.
             grep -qF "$VERSION" <<<"$out" || {
@@ -168,26 +194,369 @@ jobs:
           done
 
       - name: Package
-        id: pkg
         shell: bash
         run: |
           set -euo pipefail
-          NAME="gitlawb-node-${{ needs.release-please.outputs.version }}-${{ matrix.target }}"
+          TARGET="${{ matrix.target }}"
+          NAME="gitlawb-node-${{ needs.release-please.outputs.version }}-${TARGET}"
+          BIN_DIR="target/${TARGET}/release"
+          EXE=""
+          case "$TARGET" in *windows*) EXE=".exe" ;; esac
+
+          # Portable sha256 → "<hash>  <file>" so install scripts and brew can parse it.
+          sha256_file() {
+            local f="$1"
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$f"
+            elif command -v shasum >/dev/null 2>&1; then
+              shasum -a 256 "$f"
+            else
+              local h
+              h=$(certutil -hashfile "$f" SHA256 | sed -n 2p | tr -d ' \r')
+              printf '%s  %s\n' "$h" "$f"
+            fi
+          }
+
           mkdir -p "dist/$NAME"
-          cp "target/${{ matrix.target }}/release/gl" "dist/$NAME/"
-          cp "target/${{ matrix.target }}/release/git-remote-gitlawb" "dist/$NAME/"
-          cp "target/${{ matrix.target }}/release/gitlawb-node" "dist/$NAME/"
+          for bin in $BINS; do
+            cp "$BIN_DIR/$bin$EXE" "dist/$NAME/"
+          done
           cp README.md LICENSE-MIT LICENSE-APACHE "dist/$NAME/"
+
           cd dist
-          tar czf "$NAME.tar.gz" "$NAME"
-          shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
-          echo "asset=dist/$NAME.tar.gz" >> "$GITHUB_OUTPUT"
-          echo "checksum=dist/$NAME.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+          case "$TARGET" in
+            *windows*)
+              # 7z is preinstalled on windows-latest runners.
+              7z a -tzip "$NAME.zip" "$NAME" >/dev/null
+              sha256_file "$NAME.zip" > "$NAME.zip.sha256"
+              ;;
+            *)
+              tar czf "$NAME.tar.gz" "$NAME"
+              sha256_file "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+              ;;
+          esac
 
       - name: Attach to release
         uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
         with:
           tag_name: ${{ needs.release-please.outputs.tag_name }}
           files: |
-            ${{ steps.pkg.outputs.asset }}
-            ${{ steps.pkg.outputs.checksum }}
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+
+  npm-publish:
+    name: Publish to npm
+    needs: [release-please, release-binaries]
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm provenance
+    steps:
+      - name: Guard on secret
+        id: guard
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "${NPM_TOKEN:-}" ]; then
+            echo "::warning::NPM_TOKEN is not set — skipping npm publish."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout release tag
+        if: ${{ steps.guard.outputs.enabled == 'true' }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+          persist-credentials: false
+
+      - name: Lay in release binaries
+        if: ${{ steps.guard.outputs.enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.release-please.outputs.version }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          # npm platform package -> Rust target triple (unix only; Windows is not
+          # published to npm).
+          MAP="
+          gl-darwin-arm64:aarch64-apple-darwin
+          gl-darwin-x64:x86_64-apple-darwin
+          gl-linux-arm64:aarch64-unknown-linux-musl
+          gl-linux-x64:x86_64-unknown-linux-musl
+          "
+          mkdir -p _dl
+          for entry in $MAP; do
+            pkg="${entry%%:*}"
+            target="${entry#*:}"
+            archive="gitlawb-node-${VERSION}-${target}.tar.gz"
+            echo "==> $pkg <- $archive"
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern "$archive" --dir _dl --clobber
+            tar -xzf "_dl/$archive" -C _dl
+            src="_dl/gitlawb-node-${VERSION}-${target}"
+            cp "$src/gl" "npm/packages/$pkg/gl"
+            cp "$src/git-remote-gitlawb" "npm/packages/$pkg/git-remote-gitlawb"
+            chmod +x "npm/packages/$pkg/gl" "npm/packages/$pkg/git-remote-gitlawb"
+          done
+
+      - name: Set versions
+        if: ${{ steps.guard.outputs.enabled == 'true' }}
+        env:
+          VERSION: ${{ needs.release-please.outputs.version }}
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("fs");
+            const v = process.env.VERSION;
+            for (const p of fs.readdirSync("npm/packages")) {
+              const f = `npm/packages/${p}/package.json`;
+              const pkg = JSON.parse(fs.readFileSync(f, "utf8"));
+              pkg.version = v;
+              if (pkg.optionalDependencies) {
+                for (const k of Object.keys(pkg.optionalDependencies)) {
+                  pkg.optionalDependencies[k] = v;
+                }
+              }
+              fs.writeFileSync(f, JSON.stringify(pkg, null, 2) + "\n");
+            }
+          '
+
+      - name: Publish
+        if: ${{ steps.guard.outputs.enabled == 'true' }}
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.release-please.outputs.version }}
+        run: |
+          set -euo pipefail
+          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
+          # Platform packages first, then the wrapper (so its optionalDependencies resolve).
+          # Skip versions already on the registry so a rerun after a partial publish
+          # is idempotent instead of erroring on the first existing package.
+          for pkg in gl-darwin-arm64 gl-darwin-x64 gl-linux-arm64 gl-linux-x64 gl; do
+            name="@gitlawb/$pkg"
+            if npm view "$name@$VERSION" version >/dev/null 2>&1; then
+              echo "==> $name@$VERSION already published, skipping"
+              continue
+            fi
+            echo "==> npm publish $name@$VERSION"
+            npm publish "npm/packages/$pkg" --provenance --access public
+          done
+
+  homebrew-bump:
+    name: Bump Homebrew tap
+    needs: [release-please, release-binaries]
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # GITHUB_TOKEN downloads release assets; the tap push uses HOMEBREW_TAP_PAT
+    steps:
+      - name: Guard on secret
+        id: guard
+        env:
+          HOMEBREW_TAP_PAT: ${{ secrets.HOMEBREW_TAP_PAT }}
+        run: |
+          if [ -z "${HOMEBREW_TAP_PAT:-}" ]; then
+            echo "::warning::HOMEBREW_TAP_PAT is not set — skipping Homebrew bump."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout tap repo
+        if: ${{ steps.guard.outputs.enabled == 'true' }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: Gitlawb/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_PAT }}
+          path: tap
+          persist-credentials: false
+
+      - name: Regenerate formula
+        if: ${{ steps.guard.outputs.enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.release-please.outputs.version }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          mkdir -p _sums
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.tar.gz.sha256' --dir _sums --clobber
+          sha() { awk '{print $1}' "_sums/gitlawb-node-${VERSION}-$1.tar.gz.sha256"; }
+          SHA_MAC_ARM="$(sha aarch64-apple-darwin)"
+          SHA_MAC_X64="$(sha x86_64-apple-darwin)"
+          SHA_LNX_ARM="$(sha aarch64-unknown-linux-musl)"
+          SHA_LNX_X64="$(sha x86_64-unknown-linux-musl)"
+
+          mkdir -p tap/Formula
+          cat > tap/Formula/gl.rb <<EOF
+          class Gl < Formula
+            desc "Gitlawb CLI — decentralized git for AI agents and developers"
+            homepage "https://gitlawb.com"
+            version "${VERSION}"
+            license "MIT OR Apache-2.0"
+
+            on_macos do
+              on_arm do
+                url "${base}/gitlawb-node-${VERSION}-aarch64-apple-darwin.tar.gz"
+                sha256 "${SHA_MAC_ARM}"
+              end
+              on_intel do
+                url "${base}/gitlawb-node-${VERSION}-x86_64-apple-darwin.tar.gz"
+                sha256 "${SHA_MAC_X64}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "${base}/gitlawb-node-${VERSION}-aarch64-unknown-linux-musl.tar.gz"
+                sha256 "${SHA_LNX_ARM}"
+              end
+              on_intel do
+                url "${base}/gitlawb-node-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
+                sha256 "${SHA_LNX_X64}"
+              end
+            end
+
+            def install
+              bin.install "gl"
+              bin.install "git-remote-gitlawb"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/gl --version")
+            end
+          end
+          EOF
+
+      - name: Commit and push
+        if: ${{ steps.guard.outputs.enabled == 'true' }}
+        working-directory: tap
+        env:
+          HOMEBREW_TAP_PAT: ${{ secrets.HOMEBREW_TAP_PAT }}
+          VERSION: ${{ needs.release-please.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Stage first so a brand-new (untracked) formula is detected by the no-op check.
+          git add Formula/gl.rb
+          if git diff --cached --quiet; then
+            echo "Formula already up to date."
+            exit 0
+          fi
+          git commit -m "gl ${VERSION}"
+          # Credentials are not persisted in .git/config; supply the token only for the push.
+          git push "https://x-access-token:${HOMEBREW_TAP_PAT}@github.com/Gitlawb/homebrew-tap.git" HEAD:main
+
+  web-sync:
+    name: Sync web (install scripts + version)
+    needs: [release-please, release-binaries]
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # GITHUB_TOKEN checks out node; the web PR uses WEB_SYNC_PAT
+    steps:
+      - name: Guard on secret
+        id: guard
+        env:
+          WEB_SYNC_PAT: ${{ secrets.WEB_SYNC_PAT }}
+        run: |
+          if [ -z "${WEB_SYNC_PAT:-}" ]; then
+            echo "::warning::WEB_SYNC_PAT is not set — skipping web sync."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout node (release tag)
+        if: ${{ steps.guard.outputs.enabled == 'true' }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+          path: node
+          persist-credentials: false
+
+      - name: Checkout web
+        if: ${{ steps.guard.outputs.enabled == 'true' }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: Gitlawb/web
+          token: ${{ secrets.WEB_SYNC_PAT }}
+          path: web
+          persist-credentials: false
+
+      # web-sync publishes install.ps1 + version.json, so the Windows ZIP must exist.
+      # Windows is best-effort for npm/Homebrew (continue-on-error), so verify the
+      # asset is present before advertising a release the site can't actually serve.
+      - name: Verify website release assets
+        if: ${{ steps.guard.outputs.enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.release-please.outputs.version }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[].name' > /tmp/release-assets
+          for asset in \
+            "gitlawb-node-${VERSION}-x86_64-pc-windows-msvc.zip" \
+            "gitlawb-node-${VERSION}-x86_64-pc-windows-msvc.zip.sha256"; do
+            grep -Fxq "$asset" /tmp/release-assets || {
+              echo "::error::release asset missing: $asset (Windows build likely failed); not syncing web"
+              exit 1
+            }
+          done
+
+      - name: Sync and open PR
+        if: ${{ steps.guard.outputs.enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.WEB_SYNC_PAT }}
+          VERSION: ${{ needs.release-please.outputs.version }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          # Canonical install scripts (source of truth lives in the node repo).
+          cp node/install.sh web/public/install.sh
+          cp node/install.ps1 web/public/install.ps1
+          # Single version source the site can read.
+          printf '{\n  "version": "%s",\n  "tag": "%s"\n}\n' "$VERSION" "$TAG" > web/public/version.json
+          # One-time, idempotent drift fixes: drop orphaned binaries, fix stale link.
+          rm -rf web/public/bin
+          if [ -f web/public/skill.md ]; then
+            sed -i 's#github.com/gitlawb/releases#github.com/Gitlawb/node/releases#g' web/public/skill.md
+          fi
+
+          cd web
+          # Stage first so brand-new (untracked) files are caught by the no-op check.
+          git add -A
+          if git diff --cached --quiet; then
+            echo "web already up to date."
+            exit 0
+          fi
+          branch="release-sync/${TAG}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git commit -m "chore: sync gitlawb ${TAG} (install scripts + version)"
+          # Credentials are not persisted in .git/config; supply the token only for the push.
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/Gitlawb/web.git" "HEAD:$branch"
+          gh pr create --repo Gitlawb/web --head "$branch" \
+            --title "Sync gitlawb ${TAG}" \
+            --body "Automated sync from Gitlawb/node ${TAG}: install.sh, install.ps1, public/version.json, and one-time drift fixes (removed orphaned public/bin, fixed skill.md releases link). Review and merge to deploy via Vercel." \
+            || {
+              # Only swallow the "PR already exists" case; surface auth/API failures
+              # (a failed gh pr list must not be misread as "PR exists").
+              pr_count="$(gh pr list --repo Gitlawb/web --head "$branch" --state open --json number --jq 'length')" || exit 1
+              if [ "$pr_count" != "0" ]; then
+                echo "PR for $branch already exists; branch was updated."
+              else
+                exit 1
+              fi
+            }
