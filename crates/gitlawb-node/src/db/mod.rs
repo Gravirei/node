@@ -3731,8 +3731,11 @@ mod dedup_db_tests {
             description: None,
             is_public: false,
             default_branch: "main".into(),
-            created_at: ts("2026-01-01T00:00:00Z"),
-            updated_at: ts("2026-01-01T00:00:00Z"),
+            // Date after the mirror (Utc::now()) so that created_at ASC alone
+            // would pick the mirror; the CASE WHEN position('/' in id) > 0 term
+            // is what makes the canonical row win.
+            created_at: ts("2126-01-01T00:00:00Z"),
+            updated_at: ts("2126-01-01T00:00:00Z"),
             disk_path: "/srv/secret".into(),
             forked_from: None,
             machine_id: None,
