@@ -283,7 +283,11 @@ pub fn object_type(repo_path: &Path, sha256_hex: &str) -> Result<Option<String>>
         return Ok(None);
     }
 
-    Ok(Some(String::from_utf8_lossy(&type_output.stdout).trim().to_string()))
+    Ok(Some(
+        String::from_utf8_lossy(&type_output.stdout)
+            .trim()
+            .to_string(),
+    ))
 }
 
 /// Read an object's content if its type is already known.
