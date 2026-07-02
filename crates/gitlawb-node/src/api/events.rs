@@ -326,6 +326,7 @@ mod ref_updates_feed_tests {
             cert_id: None,
             received_at: Utc::now().to_rfc3339(),
             from_peer: "peer1".into(),
+            owner_did: None,
         }
     }
 

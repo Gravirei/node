@@ -772,6 +772,7 @@ async fn notify_peer_of_ref(
     new_sha: &str,
     node_did: &str,
     pusher_did: &str,
+    owner_did: &str,
 ) {
     let body = serde_json::json!({
         "repo": repo_slug,
@@ -781,6 +782,7 @@ async fn notify_peer_of_ref(
         "pusher_did": pusher_did,
         "old_sha": old_sha,
         "timestamp": chrono::Utc::now().to_rfc3339(),
+        "owner_did": owner_did,
     });
     let body_bytes = match serde_json::to_vec(&body) {
         Ok(bytes) => bytes,
@@ -828,6 +830,7 @@ async fn notify_peer_of_refs(
     ref_updates: &[(String, String, String)],
     node_did: &str,
     pusher_did: &str,
+    owner_did: &str,
 ) {
     for (ref_name, old_sha, new_sha) in ref_updates {
         notify_peer_of_ref(
@@ -841,6 +844,7 @@ async fn notify_peer_of_refs(
             new_sha,
             node_did,
             pusher_did,
+            owner_did,
         )
         .await;
     }
@@ -1363,6 +1367,7 @@ pub async fn git_receive_pack(
                             &ref_updates_clone,
                             &node_did_str,
                             &pusher_did_clone,
+                            &record.owner_did,
                         )
                         .await;
                     }
@@ -2403,6 +2408,9 @@ mod tests {
                 mockito::Matcher::PartialJsonString(format!(r#"{{"ref_name":"{ref_a}"}}"#)),
                 mockito::Matcher::PartialJsonString(format!(r#"{{"old_sha":"{old_a}"}}"#)),
                 mockito::Matcher::PartialJsonString(format!(r#"{{"new_sha":"{new_a}"}}"#)),
+                mockito::Matcher::PartialJsonString(
+                    r#"{"owner_did":"did:key:zOwner"}"#.to_string(),
+                ),
             ]))
             .with_status(200)
             .expect(1)
@@ -2414,6 +2422,9 @@ mod tests {
                 mockito::Matcher::PartialJsonString(format!(r#"{{"ref_name":"{ref_b}"}}"#)),
                 mockito::Matcher::PartialJsonString(format!(r#"{{"old_sha":"{old_b}"}}"#)),
                 mockito::Matcher::PartialJsonString(format!(r#"{{"new_sha":"{new_b}"}}"#)),
+                mockito::Matcher::PartialJsonString(
+                    r#"{"owner_did":"did:key:zOwner"}"#.to_string(),
+                ),
             ]))
             .with_status(200)
             .expect(1)
@@ -2435,6 +2446,7 @@ mod tests {
             &ref_updates,
             "did:key:zNode",
             "did:key:zPusher",
+            "did:key:zOwner",
         )
         .await;
 
@@ -2457,6 +2469,9 @@ mod tests {
             .match_body(mockito::Matcher::AllOf(vec![
                 mockito::Matcher::PartialJsonString(format!(r#"{{"old_sha":"{zero}"}}"#)),
                 mockito::Matcher::PartialJsonString(format!(r#"{{"new_sha":"{new_sha}"}}"#)),
+                mockito::Matcher::PartialJsonString(
+                    r#"{"owner_did":"did:key:zOwner"}"#.to_string(),
+                ),
             ]))
             .with_status(200)
             .expect(1)
@@ -2479,6 +2494,7 @@ mod tests {
             &ref_updates,
             "did:key:zNode",
             "did:key:zPusher",
+            "did:key:zOwner",
         )
         .await;
 
