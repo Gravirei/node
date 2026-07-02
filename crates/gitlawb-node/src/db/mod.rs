@@ -887,11 +887,21 @@ impl Db {
     }
 
     pub async fn get_repo(&self, owner_did: &str, name: &str) -> Result<Option<RepoRecord>> {
+        // Normalize owner_did to its did:key short form, mirroring did_matches and
+        // the DEDUP_CTE's owner-key CASE: strip `did:key:` only when the remainder
+        // is a bare key id (no further `:`). This keeps `did:key:z...` and bare
+        // `z...` interchangeable while `did:gitlawb:z...` / `did:web:z...` stay
+        // distinct — the old LIKE '%:' || $1 || '%' was too broad (issue #124 P2).
+        let owner_key = match owner_did.strip_prefix("did:key:") {
+            Some(rest) if !rest.contains(':') => rest,
+            _ => owner_did,
+        };
         let row = sqlx::query(
             "SELECT id, name, owner_did, description, is_public, default_branch,
                     created_at, updated_at, disk_path, forked_from, machine_id
              FROM repos
-              WHERE (owner_did = $1 OR owner_did LIKE '%:' || $1 || '%') AND name = $2
+              WHERE (CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END) = $1
+                AND name = $2
              -- Prefer canonical rows (UUID id, no slash) over mirror rows (slash id).
              -- Mirror rows are inserted by upsert_mirror_repo with is_public=true and
              -- no visibility rules; using them for visibility checks would bypass the
@@ -899,7 +909,7 @@ impl Db {
              ORDER BY CASE WHEN position('/' in id) > 0 THEN 1 ELSE 0 END,
                       created_at ASC, id ASC",
         )
-        .bind(owner_did)
+        .bind(owner_key)
         .bind(name)
         .fetch_optional(&self.pool)
         .await?;
@@ -3780,6 +3790,66 @@ mod dedup_db_tests {
 
         assert_eq!(got.id, "z6Lonely/orphan", "mirror row is returned");
         assert!(got.is_public, "mirror row's is_public should be true");
+    }
+
+    /// get_repo must NOT match a non-key DID row (e.g. did:gitlawb:) when queried
+    /// with the bare short DID — the old LIKE '%:' || $1 || '%' was too broad and
+    /// could rank a non-key canonical row ahead of the exact mirror.
+    #[sqlx::test]
+    async fn get_repo_does_not_match_non_key_did(pool: PgPool) {
+        let db = db(pool).await;
+        let short = "z6Mkwbud";
+
+        // Mirror row for the bare short DID.
+        db.upsert_mirror_repo(short, "shared-name", "/srv/m", None, false)
+            .await
+            .unwrap();
+
+        // Non-key DID row sharing the same trailing id — must stay distinct.
+        let non_key = RepoRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "shared-name".into(),
+            owner_did: format!("did:gitlawb:{short}"),
+            description: None,
+            is_public: false,
+            default_branch: "main".into(),
+            created_at: ts("2126-01-01T00:00:00Z"),
+            updated_at: ts("2126-01-01T00:00:00Z"),
+            disk_path: "/srv/other".into(),
+            forked_from: None,
+            machine_id: None,
+        };
+        db.create_repo(&non_key).await.unwrap();
+
+        // Querying with the bare short DID must return the mirror, NOT the
+        // did:gitlawb row (different DID method, separate owner).
+        let got = db
+            .get_repo(short, "shared-name")
+            .await
+            .unwrap()
+            .expect("get_repo should find the mirror row");
+
+        assert!(
+            got.id.contains('/'),
+            "must return the mirror (slash id), not a non-key canonical row"
+        );
+        assert!(got.is_public, "mirror row's is_public should be true");
+
+        // Querying with the full non-key DID must return that exact row.
+        let got = db
+            .get_repo(&format!("did:gitlawb:{short}"), "shared-name")
+            .await
+            .unwrap()
+            .expect("get_repo should find the non-key DID row");
+
+        assert!(
+            !got.id.contains('/'),
+            "must return the non-key canonical row (UUID id)"
+        );
+        assert!(
+            !got.is_public,
+            "non-key row's is_public must be preserved"
+        );
     }
 }
 
