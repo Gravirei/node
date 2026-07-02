@@ -778,6 +778,7 @@ const MIGRATIONS: &[Migration] = &[
             // the matching expression index. The CASE must stay byte-for-byte in
             // sync with DEDUP_CTE / count_repos_deduped or Postgres won't use it.
             "DROP INDEX IF EXISTS idx_repos_owner_short_name",
+            // Keep byte-identical to OWNER_KEY_CASE_SQL so Postgres uses the index.
             "CREATE INDEX IF NOT EXISTS idx_repos_owner_key_name ON repos ((CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END), name)",
         ],
     },
@@ -830,6 +831,78 @@ pub(crate) fn normalize_owner_key(did: &str) -> &str {
     match did.strip_prefix("did:key:") {
         Some(rest) if !rest.contains(':') => rest,
         _ => did,
+    }
+}
+
+/// SQL CASE expression byte-identical to `normalize_owner_key`. All queries that
+/// filter or group by owner key use this const so the Rust and SQL sides cannot
+/// drift apart. If you change `normalize_owner_key`, update this const too.
+const OWNER_KEY_CASE_SQL: &str = "CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END";
+
+#[cfg(test)]
+mod normalize_owner_key_tests {
+    use super::normalize_owner_key;
+
+    // Boundary set matching the SQL CASE: did:key short/full, empty residual,
+    // did:key:z:extra, non-key, bare, empty, uppercase.
+    #[test]
+    fn strips_did_key_prefix() {
+        assert_eq!(normalize_owner_key("did:key:z6Mkfoo"), "z6Mkfoo");
+    }
+
+    #[test]
+    fn keeps_full_did_key_unchanged_when_not_a_prefix() {
+        assert_eq!(normalize_owner_key("z6Mkfoo"), "z6Mkfoo");
+    }
+
+    #[test]
+    fn leaves_non_key_did_intact() {
+        assert_eq!(
+            normalize_owner_key("did:gitlawb:z6Mkfoo"),
+            "did:gitlawb:z6Mkfoo"
+        );
+    }
+
+    #[test]
+    fn leaves_web_did_intact() {
+        assert_eq!(
+            normalize_owner_key("did:web:example.com:alice"),
+            "did:web:example.com:alice"
+        );
+    }
+
+    #[test]
+    fn does_not_strip_did_key_with_extra_colon() {
+        // did:key:did:gitlawb:z6... — the remainder contains ':', so it's left whole.
+        assert_eq!(
+            normalize_owner_key("did:key:did:gitlawb:z6Mkfoo"),
+            "did:key:did:gitlawb:z6Mkfoo"
+        );
+    }
+
+    #[test]
+    fn empty_string_returns_empty() {
+        assert_eq!(normalize_owner_key(""), "");
+    }
+
+    #[test]
+    fn bare_did_key_colon_becomes_empty() {
+        // did:key: with nothing after still has the prefix stripped.
+        assert_eq!(normalize_owner_key("did:key:"), "");
+    }
+
+    #[test]
+    fn uppercase_prefix_is_untouched() {
+        assert_eq!(normalize_owner_key("DID:KEY:z6Mkfoo"), "DID:KEY:z6Mkfoo");
+    }
+
+    #[test]
+    fn strips_did_key_even_with_trailing_slash() {
+        // did:key:z6Mkfoo/extra has no ':' in the remainder, so it strips.
+        assert_eq!(
+            normalize_owner_key("did:key:z6Mkfoo/extra"),
+            "z6Mkfoo/extra"
+        );
     }
 }
 
@@ -900,23 +973,26 @@ impl Db {
         // `z...` interchangeable while `did:gitlawb:z...` / `did:web:z...` stay
         // distinct — the old LIKE '%:' || $1 || '%' was too broad (issue #124 P2).
         let owner_key = normalize_owner_key(owner_did);
-        let row = sqlx::query(
+        let sql = format!(
             "SELECT id, name, owner_did, description, is_public, default_branch,
                     created_at, updated_at, disk_path, forked_from, machine_id
              FROM repos
-              WHERE (CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END) = $1
+              WHERE ({key}) = $1
                 AND name = $2
              -- Prefer canonical rows (UUID id, no slash) over mirror rows (slash id).
              -- Mirror rows are inserted by upsert_mirror_repo with is_public=true and
              -- no visibility rules; using them for visibility checks would bypass the
              -- canonical row's gate (issue #124).
              ORDER BY CASE WHEN position('/' in id) > 0 THEN 1 ELSE 0 END,
-                      created_at ASC, id ASC",
-        )
-        .bind(owner_key)
-        .bind(name)
-        .fetch_optional(&self.pool)
-        .await?;
+                      created_at ASC, id ASC
+             LIMIT 1",
+            key = OWNER_KEY_CASE_SQL
+        );
+        let row = sqlx::query(&sql)
+            .bind(owner_key)
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
 
         Ok(row.map(row_to_repo))
     }
@@ -989,15 +1065,17 @@ impl Db {
     /// full tie still picks a deterministic survivor. `list_all_repos_deduped_with_stars`,
     /// `list_all_repos_deduped`, and the marker logic in
     /// `crate::api::repos::dedupe_canonical_repos` must stay in sync.
-    const DEDUP_CTE: &'static str = "WITH deduped AS (
-                 SELECT DISTINCT ON (CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END, name)
+    fn dedup_cte() -> String {
+        format!(
+            "WITH deduped AS (
+                 SELECT DISTINCT ON ({key}, name)
                      id, name, owner_did, description, is_public, default_branch,
                      created_at,
                      -- group MAX, not the canonical row's own value: pushes that
                      -- arrive via gossip touch only the mirror row, so the
                      -- canonical updated_at goes stale
                      MAX(updated_at) OVER (
-                         PARTITION BY CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END, name
+                         PARTITION BY {key}, name
                      ) AS updated_at,
                      disk_path, forked_from, machine_id
                  FROM repos
@@ -1007,15 +1085,18 @@ impl Db {
                  -- does. Callers bind the already-normalized key ($1).
                  -- Quarantined mirrors (admitted but unvalidated by the iCaptcha
                  -- propagation gate) are withheld from every listing surface.
-                 WHERE quarantined = FALSE AND ($1::text IS NULL OR (CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END) = $1)
-                 ORDER BY CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END, name,
-                     -- mirror rows carry a slash-form id (\"{owner_short}/{name}\"),
+                 WHERE quarantined = FALSE AND ($1::text IS NULL OR ({key}) = $1)
+                 ORDER BY {key}, name,
+                     -- mirror rows carry a slash-form id (\"{{owner_short}}/{{name}}\"),
                      -- written only by upsert_mirror_repo; canonical ids are UUIDs.
                      -- Rank canonical (no slash) ahead of the mirror in each group,
                      -- keyed on the structural id, not the user-settable description.
                      CASE WHEN position('/' in id) > 0 THEN 1 ELSE 0 END,
                      created_at ASC, id ASC
-             )";
+             )",
+            key = OWNER_KEY_CASE_SQL
+        )
+    }
 
     /// All repos with star counts, mirror-deduplicated via `DEDUP_CTE` and
     /// ordered newest-first, optionally filtered to one owner. Returns the full
@@ -1048,7 +1129,7 @@ impl Db {
                  SELECT repo_id, COUNT(*) AS cnt FROM repo_stars GROUP BY repo_id
              ) s ON s.repo_id = d.id
              ORDER BY d.updated_at DESC",
-            Self::DEDUP_CTE
+            Self::dedup_cte()
         );
         let rows = sqlx::query(&sql)
             .bind(owner_key)
@@ -1066,7 +1147,7 @@ impl Db {
 
     /// Deduped repo list (no stars, no paging) for the unfiltered read surfaces
     /// (GraphQL `repos`). One logical repo per mirror+canonical group, ordered by
-    /// the group's most recent activity. Shares `DEDUP_CTE` with the paged path so
+    /// the group's most recent activity. Shares `dedup_cte()` with the paged path so
     /// the dedup rule cannot drift; binds a NULL owner filter (all rows).
     pub async fn list_all_repos_deduped(&self) -> Result<Vec<RepoRecord>> {
         let sql = format!(
@@ -1076,7 +1157,7 @@ impl Db {
                  d.forked_from, d.machine_id
              FROM deduped d
              ORDER BY d.updated_at DESC",
-            Self::DEDUP_CTE
+            Self::dedup_cte()
         );
         let rows = sqlx::query(&sql)
             .bind(None::<&str>)
@@ -1097,11 +1178,11 @@ impl Db {
     /// CASE that the live list paths depend on. Allowed dead outside tests.
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn count_repos_deduped(&self) -> Result<i64> {
-        let row = sqlx::query(
-            "SELECT COUNT(DISTINCT (CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END, name)) AS cnt FROM repos",
-        )
-        .fetch_one(&self.pool)
-        .await?;
+        let sql = format!(
+            "SELECT COUNT(DISTINCT ({key}, name)) AS cnt FROM repos",
+            key = OWNER_KEY_CASE_SQL
+        );
+        let row = sqlx::query(&sql).fetch_one(&self.pool).await?;
         Ok(row.get::<i64, _>("cnt"))
     }
 

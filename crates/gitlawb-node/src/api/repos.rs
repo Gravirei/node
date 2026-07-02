@@ -1622,6 +1622,14 @@ fn parse_ref_updates(body: &[u8]) -> Vec<RefUpdate> {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
+//
+// For a non-key DID owner, `normalize_owner_key` returns the full DID, so
+// `clone_url` becomes `/did:gitlawb:z6.../repo.git`. That resolves through
+// `get_repo`, but the colon-bearing path segment would break the `sync.rs`
+// disk-path join (`owner_slug/repo`). Not reachable today (auth is
+// did:key-only), so this is a forward constraint to handle before non-key
+// ownership lands: the owner-first disk layout must either reject colons or
+// encode them.
 
 fn to_response(record: &crate::db::RepoRecord, state: &AppState, star_count: i64) -> RepoResponse {
     let owner_short = crate::db::normalize_owner_key(&record.owner_did);
