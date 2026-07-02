@@ -826,6 +826,13 @@ const MIGRATIONS: &[Migration] = &[
 
 // ── Repos ─────────────────────────────────────────────────────────────────────
 
+fn normalize_owner_key(did: &str) -> &str {
+    match did.strip_prefix("did:key:") {
+        Some(rest) if !rest.contains(':') => rest,
+        _ => did,
+    }
+}
+
 impl Db {
     pub async fn create_repo(&self, repo: &RepoRecord) -> Result<()> {
         sqlx::query(
@@ -892,10 +899,7 @@ impl Db {
         // is a bare key id (no further `:`). This keeps `did:key:z...` and bare
         // `z...` interchangeable while `did:gitlawb:z...` / `did:web:z...` stay
         // distinct — the old LIKE '%:' || $1 || '%' was too broad (issue #124 P2).
-        let owner_key = match owner_did.strip_prefix("did:key:") {
-            Some(rest) if !rest.contains(':') => rest,
-            _ => owner_did,
-        };
+        let owner_key = normalize_owner_key(owner_did);
         let row = sqlx::query(
             "SELECT id, name, owner_did, description, is_public, default_branch,
                     created_at, updated_at, disk_path, forked_from, machine_id
@@ -1031,10 +1035,7 @@ impl Db {
         // Mirror did_matches: strip `did:key:` only when the remainder is a bare
         // key id (no further `:`). The DEDUP_CTE applies the identical CASE to
         // owner_did, so the two compare on the same normalized key.
-        let owner_key = owner_filter.map(|o| match o.strip_prefix("did:key:") {
-            Some(rest) if !rest.contains(':') => rest,
-            _ => o,
-        });
+        let owner_key = owner_filter.map(normalize_owner_key);
         let sql = format!(
             "{}
              SELECT
@@ -3846,10 +3847,7 @@ mod dedup_db_tests {
             !got.id.contains('/'),
             "must return the non-key canonical row (UUID id)"
         );
-        assert!(
-            !got.is_public,
-            "non-key row's is_public must be preserved"
-        );
+        assert!(!got.is_public, "non-key row's is_public must be preserved");
     }
 }
 
