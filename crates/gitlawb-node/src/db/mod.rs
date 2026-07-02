@@ -826,7 +826,7 @@ const MIGRATIONS: &[Migration] = &[
 
 // ── Repos ─────────────────────────────────────────────────────────────────────
 
-fn normalize_owner_key(did: &str) -> &str {
+pub(crate) fn normalize_owner_key(did: &str) -> &str {
     match did.strip_prefix("did:key:") {
         Some(rest) if !rest.contains(':') => rest,
         _ => did,
@@ -3771,6 +3771,66 @@ mod dedup_db_tests {
         assert!(
             !got.is_public,
             "canonical row's is_public must be preserved"
+        );
+
+        // Querying with full did:key: form should also return the canonical row.
+        let got_full = db
+            .get_repo(owner_did, "secret-repo")
+            .await
+            .unwrap()
+            .expect("get_repo should find the repo with full did:key");
+
+        assert_eq!(
+            got_full.owner_did, owner_did,
+            "canonical row must be found using full did:key: form"
+        );
+        assert!(
+            !got_full.id.contains('/'),
+            "canonical row id must not contain a slash"
+        );
+        assert!(
+            !got_full.is_public,
+            "canonical row's is_public must be preserved"
+        );
+    }
+
+    /// Seed a private canonical plus a public mirror twin for the same owner+name
+    /// (mirror inserted first), call authorize_repo_read with caller=None, and
+    /// assert Err(RepoNotFound). That locks the property at the gate.
+    #[sqlx::test]
+    async fn authorize_repo_read_denies_private_canonical_even_with_public_mirror(pool: PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let short = "z6Mkwbud";
+        let owner_did = "did:key:z6Mkwbud";
+
+        // Mirror row seeded FIRST — hardcoded is_public=true, no visibility rules.
+        state
+            .db
+            .upsert_mirror_repo(short, "secret-repo", "/srv/mirror", None, false)
+            .await
+            .unwrap();
+
+        // Canonical row with is_public=false.
+        let canonical = RepoRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "secret-repo".into(),
+            owner_did: owner_did.to_string(),
+            description: None,
+            is_public: false,
+            default_branch: "main".into(),
+            created_at: ts("2126-01-01T00:00:00Z"),
+            updated_at: ts("2126-01-01T00:00:00Z"),
+            disk_path: "/srv/secret".into(),
+            forked_from: None,
+            machine_id: None,
+        };
+        state.db.create_repo(&canonical).await.unwrap();
+
+        // call authorize_repo_read with caller=None, and assert Err(RepoNotFound)
+        let res = crate::api::authorize_repo_read(&state, short, "secret-repo", None, "/").await;
+        assert!(
+            matches!(res, Err(crate::error::AppError::RepoNotFound(_))),
+            "expected Err(RepoNotFound), got {res:?}"
         );
     }
 
