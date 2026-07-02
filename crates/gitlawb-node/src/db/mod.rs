@@ -175,6 +175,9 @@ pub struct ReceivedRefUpdate {
     pub cert_id: Option<String>,
     pub received_at: String,
     pub from_peer: String,
+    /// Full owner DID — populated by new peers; None for events from older
+    /// peers that predate the wire-format change (#144).
+    pub owner_did: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -566,8 +569,10 @@ const MIGRATIONS: &[Migration] = &[
                 received_at TEXT NOT NULL,
                 from_peer   TEXT NOT NULL
             )"#,
+            "ALTER TABLE received_ref_updates ADD COLUMN IF NOT EXISTS owner_did TEXT",
             "CREATE INDEX IF NOT EXISTS idx_ref_updates_repo ON received_ref_updates(repo)",
             "CREATE INDEX IF NOT EXISTS idx_ref_updates_ts  ON received_ref_updates(timestamp DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_ref_updates_owner ON received_ref_updates(owner_did)",
             r#"CREATE TABLE IF NOT EXISTS pull_requests (
                 id            TEXT NOT NULL PRIMARY KEY,
                 repo_id       TEXT NOT NULL,
@@ -2304,8 +2309,8 @@ impl Db {
         sqlx::query(
             "INSERT INTO received_ref_updates
              (id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, timestamp,
-              cert_id, received_at, from_peer)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+              cert_id, received_at, from_peer, owner_did)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
              ON CONFLICT(id) DO NOTHING",
         )
         .bind(&update.id)
@@ -2319,6 +2324,7 @@ impl Db {
         .bind(&update.cert_id)
         .bind(&update.received_at)
         .bind(&update.from_peer)
+        .bind(&update.owner_did)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -2348,7 +2354,7 @@ impl Db {
         after: Option<(&str, &str)>,
     ) -> Result<Vec<ReceivedRefUpdate>> {
         const COLS: &str = "id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, \
-                            timestamp, cert_id, received_at, from_peer";
+                            timestamp, cert_id, received_at, from_peer, owner_did";
 
         // Positional params in bind order: repo?, after_ts?, after_id?, limit.
         let mut conds: Vec<String> = Vec::new();
@@ -2686,6 +2692,7 @@ fn row_to_ref_update(r: sqlx::postgres::PgRow) -> ReceivedRefUpdate {
         cert_id: r.get("cert_id"),
         received_at: r.get("received_at"),
         from_peer: r.get("from_peer"),
+        owner_did: r.get("owner_did"),
     }
 }
 
