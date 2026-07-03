@@ -24,10 +24,14 @@ fn nfc(s: &str) -> String {
     s.nfc().collect()
 }
 
-/// True if `caller` is the repo owner (matches full did:key or its short form),
-/// mirroring the owner-match idiom in `api/protect.rs`.
+/// True if `caller` is the repo owner. Matches exactly or against the
+/// did:key short form — a non-key DID (did:gitlawb:/did:web:) in `owner_did`
+/// never matches a bare short segment, and a non-key DID in `caller` never
+/// matches a did:key owner's short form. Uses `normalize_owner_key` (not
+/// `did_matches`) so the did:key-only rule is stricter: cross-method matching
+/// would let a non-key canonical row bypass the #124 visibility gate.
 fn is_owner(owner_did: &str, caller: &str) -> bool {
-    let owner_short = owner_did.split(':').next_back().unwrap_or(owner_did);
+    let owner_short = crate::db::normalize_owner_key(owner_did);
     caller == owner_did || caller == owner_short
 }
 
@@ -296,6 +300,31 @@ mod tests {
         assert_eq!(
             visibility_check(&rules, true, OWNER, Some("z6MkOwner"), "/"),
             Decision::Allow
+        );
+    }
+
+    #[test]
+    fn non_key_owner_bare_short_does_not_match() {
+        // A non-key DID owner (did:gitlawb:z6MkFoo) probed with the bare last
+        // segment (z6MkFoo) must NOT match — the old is_owner would return true
+        // via split(':').next_back(), which this PR tightens.
+        let rules = [rule("/", VisibilityMode::A, &[])];
+        assert_eq!(
+            visibility_check(&rules, false, "did:gitlawb:z6MkFoo", Some("z6MkFoo"), "/"),
+            Decision::Deny,
+            "bare short must not match a non-key DID owner"
+        );
+        // The full non-key DID still matches itself.
+        assert_eq!(
+            visibility_check(
+                &rules,
+                false,
+                "did:gitlawb:z6MkFoo",
+                Some("did:gitlawb:z6MkFoo"),
+                "/"
+            ),
+            Decision::Allow,
+            "full non-key DID still matches itself"
         );
     }
 
