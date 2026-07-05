@@ -153,6 +153,7 @@ pub async fn list_ref_updates(
                 "cert_id":     u.cert_id,
                 "received_at": u.received_at,
                 "from_peer":   u.from_peer,
+                "owner_did":   u.owner_did,
             })
         })
         .collect();
@@ -225,6 +226,7 @@ pub async fn list_repo_events(
                 "pusher_did": c.pusher_did,
                 "node_did":   c.node_did,
                 "timestamp":  c.issued_at,
+                "owner_did":  record.owner_did,
                 "source":     "local",
             })
         })
@@ -258,6 +260,7 @@ pub async fn list_repo_events(
                     "cert_id":     u.cert_id,
                     "received_at": u.received_at,
                     "from_peer":   u.from_peer,
+                    "owner_did":   u.owner_did,
                     "source":      "gossipsub",
                 })
             })
@@ -324,6 +327,7 @@ mod ref_updates_feed_tests {
             new_sha: "a".repeat(40),
             timestamp: Utc::now().to_rfc3339(),
             cert_id: None,
+            owner_did: None,
             received_at: Utc::now().to_rfc3339(),
             from_peer: "peer1".into(),
             owner_did: None,

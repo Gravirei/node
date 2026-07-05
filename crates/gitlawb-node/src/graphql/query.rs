@@ -83,6 +83,7 @@ impl QueryRoot {
                 pusher_did: u.pusher_did,
                 node_did: u.node_did,
                 timestamp: u.timestamp,
+                owner_did: u.owner_did,
             })
             .collect())
     }
@@ -160,6 +161,7 @@ mod tests {
             new_sha: "a".repeat(40),
             timestamp: Utc::now().to_rfc3339(),
             cert_id: None,
+            owner_did: None,
             received_at: Utc::now().to_rfc3339(),
             from_peer: "peer1".into(),
             owner_did: None,

@@ -1297,6 +1297,7 @@ pub async fn git_receive_pack(
                         pusher_did: pusher_did_clone.clone(),
                         node_did: node_did_str.clone(),
                         timestamp: now_ts.clone(),
+                        owner_did: record.owner_did.clone(),
                     });
                 }
             }
