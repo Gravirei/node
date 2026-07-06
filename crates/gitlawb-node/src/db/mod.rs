@@ -1970,8 +1970,11 @@ impl Db {
 // ── Ref Certificates ──────────────────────────────────────────────────────────
 
 impl Db {
-    pub async fn insert_ref_certificate(&self, cert: &RefCertificate) -> Result<()> {
-        sqlx::query(
+    /// Insert a ref certificate, or update it if a row for `(repo_id, ref_name)`
+    /// already exists. Returns the id of the row that is now in the database
+    /// (the original id on upsert; the passed id on insert).
+    pub async fn insert_ref_certificate(&self, cert: &RefCertificate) -> Result<String> {
+        let row: (String,) = sqlx::query_as(
             "INSERT INTO ref_certificates
              (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
@@ -1981,7 +1984,8 @@ impl Db {
                 pusher_did = EXCLUDED.pusher_did,
                 node_did  = EXCLUDED.node_did,
                 signature = EXCLUDED.signature,
-                issued_at = EXCLUDED.issued_at",
+                issued_at = EXCLUDED.issued_at
+             RETURNING id",
         )
         .bind(&cert.id)
         .bind(&cert.repo_id)
@@ -1992,9 +1996,9 @@ impl Db {
         .bind(&cert.node_did)
         .bind(&cert.signature)
         .bind(&cert.issued_at)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
-        Ok(())
+        Ok(row.0)
     }
 
     pub async fn list_ref_certificates(

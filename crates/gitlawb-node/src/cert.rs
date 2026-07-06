@@ -40,7 +40,7 @@ pub async fn issue_ref_certificate(
 
     let signature = state.node_keypair.sign_b64(&payload_bytes);
 
-    let cert = RefCertificate {
+    let mut cert = RefCertificate {
         id: Uuid::new_v4().to_string(),
         repo_id: repo_id.to_string(),
         ref_name: ref_name.to_string(),
@@ -52,6 +52,7 @@ pub async fn issue_ref_certificate(
         issued_at,
     };
 
-    state.db.insert_ref_certificate(&cert).await?;
+    let persisted_id = state.db.insert_ref_certificate(&cert).await?;
+    cert.id = persisted_id;
     Ok(cert)
 }
