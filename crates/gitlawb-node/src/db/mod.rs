@@ -3428,8 +3428,13 @@ mod migration_tests {
     async fn migration_v11_creates_owner_did_column(pool: sqlx::PgPool) {
         let db = super::Db::for_testing(pool);
 
-        // Create all tables by running the full migration chain from scratch.
+        // Create all tables by running the full migration chain from scratch,
+        // then drop the owner_did column to simulate a pre-v10 schema.
         db.migrate().await.unwrap();
+        sqlx::query("ALTER TABLE received_ref_updates DROP COLUMN owner_did")
+            .execute(&db.pool)
+            .await
+            .unwrap();
 
         // Truncate schema_migrations and re-seed at v9 — simulate an existing
         // node that has run v1..v9 but not yet v10.

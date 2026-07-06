@@ -3428,6 +3428,7 @@ mod tests {
             events[0]["repo"],
             format!("{}/myrepo", owner.split(':').next_back().unwrap())
         );
+        assert_eq!(events[0]["owner_did"], owner);
     }
 
     #[sqlx::test]
