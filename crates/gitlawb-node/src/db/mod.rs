@@ -5029,28 +5029,70 @@ mod ref_certificate_tests {
         }
 
         // Repo A, ref "main": two rows with distinct timestamps.
-        insert_cert!("dup-a-old", &r1, "refs/heads/main", "0000", "1111",
-               "2026-07-01T10:00:00Z");
-        insert_cert!("dup-a-new", &r1, "refs/heads/main", "aaaa", "bbbb",
-               "2026-07-02T10:00:00Z");
+        insert_cert!(
+            "dup-a-old",
+            &r1,
+            "refs/heads/main",
+            "0000",
+            "1111",
+            "2026-07-01T10:00:00Z"
+        );
+        insert_cert!(
+            "dup-a-new",
+            &r1,
+            "refs/heads/main",
+            "aaaa",
+            "bbbb",
+            "2026-07-02T10:00:00Z"
+        );
 
         // Repo A, ref "feature": two rows with IDENTICAL timestamps — the
-        // id-DESC tiebreaker must choose the higher id.
-        insert_cert!("dup-feat-low", &r1, "refs/heads/feature", "0000", "1111",
-               "2026-07-01T10:00:00Z");
-        insert_cert!("dup-feat-high", &r1, "refs/heads/feature", "cccc", "dddd",
-               "2026-07-01T10:00:00Z");
+        // id-DESC tiebreaker must choose the higher id (alphabetical: "z" > "a").
+        insert_cert!(
+            "dup-feat-a",
+            &r1,
+            "refs/heads/feature",
+            "0000",
+            "1111",
+            "2026-07-01T10:00:00Z"
+        );
+        insert_cert!(
+            "dup-feat-z",
+            &r1,
+            "refs/heads/feature",
+            "cccc",
+            "dddd",
+            "2026-07-01T10:00:00Z"
+        );
 
         // Repo B, ref "main": two rows with distinct timestamps.
-        insert_cert!("dup-b-old", &r2, "refs/heads/main", "0000", "1111",
-               "2026-07-01T10:00:00Z");
-        insert_cert!("dup-b-new", &r2, "refs/heads/main", "eeee", "ffff",
-               "2026-07-02T10:00:00Z");
+        insert_cert!(
+            "dup-b-old",
+            &r2,
+            "refs/heads/main",
+            "0000",
+            "1111",
+            "2026-07-01T10:00:00Z"
+        );
+        insert_cert!(
+            "dup-b-new",
+            &r2,
+            "refs/heads/main",
+            "eeee",
+            "ffff",
+            "2026-07-02T10:00:00Z"
+        );
 
         // A non-duplicate singleton row (single row per ref) — must survive
         // untouched.
-        insert_cert!("singleton", &r2, "refs/heads/singleton", "0000", "1111",
-               "2026-07-01T10:00:00Z");
+        insert_cert!(
+            "singleton",
+            &r2,
+            "refs/heads/singleton",
+            "0000",
+            "1111",
+            "2026-07-01T10:00:00Z"
+        );
 
         // 4. Run migrations — the v10 dedup fires inside run_pending_migrations.
         db.run_migrations().await.unwrap();
@@ -5059,23 +5101,32 @@ mod ref_certificate_tests {
         let all_r1 = db.list_ref_certificates(&r1, 10).await.unwrap();
         assert_eq!(all_r1.len(), 2, "repo A: 2 refs, 1 survivor each");
 
-        let r1_main: Vec<_> = all_r1.iter().filter(|c| c.ref_name == "refs/heads/main").collect();
+        let r1_main: Vec<_> = all_r1
+            .iter()
+            .filter(|c| c.ref_name == "refs/heads/main")
+            .collect();
         assert_eq!(r1_main.len(), 1, "repo A main deduped to one row");
         assert_eq!(r1_main[0].id, "dup-a-new", "newer timestamp survives");
         assert_eq!(r1_main[0].old_sha, "aaaa");
         assert_eq!(r1_main[0].new_sha, "bbbb");
 
-        let r1_feat: Vec<_> = all_r1.iter().filter(|c| c.ref_name == "refs/heads/feature").collect();
+        let r1_feat: Vec<_> = all_r1
+            .iter()
+            .filter(|c| c.ref_name == "refs/heads/feature")
+            .collect();
         assert_eq!(r1_feat.len(), 1, "repo A feature deduped to one row");
         assert_eq!(
-            r1_feat[0].id, "dup-feat-high",
+            r1_feat[0].id, "dup-feat-z",
             "same-timestamp tiebreaker: higher id wins (id DESC)"
         );
 
         let all_r2 = db.list_ref_certificates(&r2, 10).await.unwrap();
         assert_eq!(all_r2.len(), 2, "repo B: 2 refs, 1 survivor each");
 
-        let r2_main: Vec<_> = all_r2.iter().filter(|c| c.ref_name == "refs/heads/main").collect();
+        let r2_main: Vec<_> = all_r2
+            .iter()
+            .filter(|c| c.ref_name == "refs/heads/main")
+            .collect();
         assert_eq!(r2_main.len(), 1, "repo B main deduped to one row");
         assert_eq!(r2_main[0].id, "dup-b-new", "newer timestamp survives");
 
@@ -5099,13 +5150,20 @@ mod ref_certificate_tests {
         .await
         .unwrap();
         let after_upsert = db.list_ref_certificates(&r1, 10).await.unwrap();
-        let r1_main_after: Vec<_> = after_upsert.iter().filter(|c| c.ref_name == "refs/heads/main").collect();
-        assert_eq!(r1_main_after.len(), 1,
-                   "upsert keeps exactly one row for main");
-        assert_eq!(r1_main_after[0].id, "dup-a-new",
-                   "upsert preserves original id");
-        assert_eq!(r1_main_after[0].old_sha, "1111",
-                   "upsert updated old_sha");
+        let r1_main_after: Vec<_> = after_upsert
+            .iter()
+            .filter(|c| c.ref_name == "refs/heads/main")
+            .collect();
+        assert_eq!(
+            r1_main_after.len(),
+            1,
+            "upsert keeps exactly one row for main"
+        );
+        assert_eq!(
+            r1_main_after[0].id, "dup-a-new",
+            "upsert preserves original id"
+        );
+        assert_eq!(r1_main_after[0].old_sha, "1111", "upsert updated old_sha");
 
         // A raw INSERT for the same (repo_id, ref_name) must now fail.
         let err = sqlx::query(
