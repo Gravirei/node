@@ -137,25 +137,43 @@ pub async fn list_repo_bounties(
 pub async fn list_all_bounties(
     State(state): State<AppState>,
     Query(q): Query<ListBountiesQuery>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
     let bounties = state
         .db
         .list_bounties(None, None, q.status.as_deref(), q.limit.unwrap_or(50))
         .await?;
 
-    Ok(Json(serde_json::json!({ "bounties": bounties })))
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let mut allowed = Vec::new();
+    for b in bounties {
+        if crate::api::authorize_repo_read(&state, &b.repo_owner, &b.repo_name, caller, "/")
+            .await
+            .is_ok()
+        {
+            allowed.push(b);
+        }
+    }
+
+    Ok(Json(serde_json::json!({ "bounties": allowed })))
 }
 
 /// GET /api/v1/bounties/{id}
 pub async fn get_bounty(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<BountyRecord>> {
     let bounty = state
         .db
         .get_bounty(&id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("bounty {id} not found")))?;
+
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    crate::api::authorize_repo_read(&state, &bounty.repo_owner, &bounty.repo_name, caller, "/")
+        .await?;
+
     Ok(Json(bounty))
 }
 
