@@ -3171,6 +3171,162 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn get_bounty_gate_denies_anon_on_private(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zGNB0UNTYANONPRIVOWNERAAAAAAAAAAAAAAAAAAA";
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "secret-repo"))
+            .await
+            .unwrap();
+        let bounty = crate::db::BountyRecord {
+            id: "anon-private-bounty".into(),
+            repo_owner: owner.into(),
+            repo_name: "secret-repo".into(),
+            issue_id: None,
+            title: "Secret Bounty".into(),
+            amount: 100,
+            creator_did: owner.into(),
+            claimant_did: None,
+            claimant_wallet: None,
+            pr_id: None,
+            status: "open".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            claimed_at: None,
+            submitted_at: None,
+            completed_at: None,
+            deadline_secs: 86400,
+            tx_hash: None,
+        };
+        state.db.create_bounty(&bounty).await.unwrap();
+
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(anon_get("/api/v1/bounties/anon-private-bounty"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    async fn get_bounty_gate_admits_owner_on_private(pool: PgPool) {
+        let state = test_state(pool).await;
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let owner = kp.did().to_string();
+        state
+            .db
+            .create_repo(&seed_private_repo(&owner, "secret-repo"))
+            .await
+            .unwrap();
+        let bounty = crate::db::BountyRecord {
+            id: "owner-private-bounty".into(),
+            repo_owner: owner.clone(),
+            repo_name: "secret-repo".into(),
+            issue_id: None,
+            title: "Owner Bounty".into(),
+            amount: 200,
+            creator_did: owner.clone(),
+            claimant_did: None,
+            claimant_wallet: None,
+            pr_id: None,
+            status: "open".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            claimed_at: None,
+            submitted_at: None,
+            completed_at: None,
+            deadline_secs: 86400,
+            tx_hash: None,
+        };
+        state.db.create_bounty(&bounty).await.unwrap();
+
+        let router = crate::server::build_router(state);
+        let uri = "/api/v1/bounties/owner-private-bounty";
+        let sig = gitlawb_core::http_sig::sign_request(&kp, "GET", uri, b"");
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("content-digest", sig.content_digest)
+            .header("signature-input", sig.signature_input)
+            .header("signature", sig.signature)
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert!(resp.status().is_success());
+    }
+
+    #[sqlx::test]
+    async fn list_all_bounties_filters_private_repos_for_anon(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zLSTALLBOUNTYOWNERAAAAAAAAAAAAAAAAAAAAAA";
+
+        // Private repo with a bounty (should be filtered out)
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "private-bounty-repo"))
+            .await
+            .unwrap();
+        let private_bounty = crate::db::BountyRecord {
+            id: "private-bounty-1".into(),
+            repo_owner: owner.into(),
+            repo_name: "private-bounty-repo".into(),
+            issue_id: None,
+            title: "Private Bounty".into(),
+            amount: 100,
+            creator_did: owner.into(),
+            claimant_did: None,
+            claimant_wallet: None,
+            pr_id: None,
+            status: "open".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            claimed_at: None,
+            submitted_at: None,
+            completed_at: None,
+            deadline_secs: 86400,
+            tx_hash: None,
+        };
+        state.db.create_bounty(&private_bounty).await.unwrap();
+
+        // Public repo with a bounty (should be visible to anon)
+        let mut public_repo = seed_private_repo(owner, "public-bounty-repo");
+        public_repo.is_public = true;
+        state.db.create_repo(&public_repo).await.unwrap();
+        let public_bounty = crate::db::BountyRecord {
+            id: "public-bounty-1".into(),
+            repo_owner: owner.into(),
+            repo_name: "public-bounty-repo".into(),
+            issue_id: None,
+            title: "Public Bounty".into(),
+            amount: 200,
+            creator_did: owner.into(),
+            claimant_did: None,
+            claimant_wallet: None,
+            pr_id: None,
+            status: "open".into(),
+            created_at: "2026-01-02T00:00:00Z".into(),
+            claimed_at: None,
+            submitted_at: None,
+            completed_at: None,
+            deadline_secs: 86400,
+            tx_hash: None,
+        };
+        state.db.create_bounty(&public_bounty).await.unwrap();
+
+        let router = crate::server::build_router(state);
+        let resp = router.oneshot(anon_get("/api/v1/bounties")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let bounties = body["bounties"].as_array().unwrap();
+        assert_eq!(bounties.len(), 1, "anon should see only the public bounty");
+        assert_eq!(bounties[0]["id"], "public-bounty-1");
+    }
+
+    #[sqlx::test]
     async fn repo_gate_owner_bare_key_vs_full_did(pool: PgPool) {
         let state = test_state(pool).await;
         let owner = "did:key:zBAREKEYFULLDIDOWNERAAAAAAAAAAAAAAAAAA";

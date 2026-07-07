@@ -200,12 +200,20 @@ pub async fn list_issue_comments(
         .acquire(&record.owner_did, &record.name)
         .await
         .map_err(|e| AppError::Git(e.to_string()))?;
-    // Confirm the issue belongs to this repo before listing comments.
-    git_issues::get_issue(&disk_path, &issue_id)
+    // Resolve the full issue ID (accepts 8-char prefix) so the DB fetch
+    // below uses the same canonical id as the git ref.
+    let full_id = match git_issues::resolve_issue_id(&disk_path, &issue_id)
         .map_err(|e| AppError::Git(e.to_string()))?
-        .ok_or_else(|| AppError::RepoNotFound(format!("issue {issue_id} not found")))?;
+    {
+        Some(id) => id,
+        None => {
+            return Err(AppError::RepoNotFound(format!(
+                "issue {issue_id} not found"
+            )))
+        }
+    };
 
-    let comments = state.db.list_issue_comments(&issue_id).await?;
+    let comments = state.db.list_issue_comments(&full_id).await?;
     Ok(Json(serde_json::json!({ "comments": comments })))
 }
 

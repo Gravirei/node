@@ -110,6 +110,8 @@ pub async fn create_bounty(
     Ok((StatusCode::CREATED, Json(bounty)))
 }
 
+const MAX_BOUNTY_LIMIT: i64 = 200;
+
 /// GET /api/v1/repos/{owner}/{repo}/bounties
 pub async fn list_repo_bounties(
     State(state): State<AppState>,
@@ -120,14 +122,10 @@ pub async fn list_repo_bounties(
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
     crate::api::authorize_repo_read(&state, &owner, &repo, caller, "/").await?;
 
+    let limit = q.limit.unwrap_or(50).clamp(1, MAX_BOUNTY_LIMIT);
     let bounties = state
         .db
-        .list_bounties(
-            Some(&owner),
-            Some(&repo),
-            q.status.as_deref(),
-            q.limit.unwrap_or(50),
-        )
+        .list_bounties(Some(&owner), Some(&repo), q.status.as_deref(), limit)
         .await?;
 
     Ok(Json(serde_json::json!({ "bounties": bounties })))
@@ -139,21 +137,35 @@ pub async fn list_all_bounties(
     Query(q): Query<ListBountiesQuery>,
     auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
+    let raw_limit = q.limit.unwrap_or(50);
+    let limit = raw_limit.clamp(1, MAX_BOUNTY_LIMIT);
+    // Over-fetch to account for filtered-out private-repo bounties so the
+    // caller gets up to `limit` readable results even when newer rows are
+    // inaccessible.
+    let fetch = (limit * 5).min(1000);
     let bounties = state
         .db
-        .list_bounties(None, None, q.status.as_deref(), q.limit.unwrap_or(50))
+        .list_bounties(None, None, q.status.as_deref(), fetch)
         .await?;
 
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let mut seen = std::collections::HashSet::new();
     let mut allowed = Vec::new();
-    for b in bounties {
+    for b in &bounties {
+        let key = format!("{}/{}", b.repo_owner, b.repo_name);
+        if seen.contains(&key) {
+            allowed.push(b.clone());
+            continue;
+        }
+        seen.insert(key.clone());
         if crate::api::authorize_repo_read(&state, &b.repo_owner, &b.repo_name, caller, "/")
             .await
             .is_ok()
         {
-            allowed.push(b);
+            allowed.push(b.clone());
         }
     }
+    allowed.truncate(limit as usize);
 
     Ok(Json(serde_json::json!({ "bounties": allowed })))
 }
@@ -164,15 +176,17 @@ pub async fn get_bounty(
     Path(id): Path<String>,
     auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<BountyRecord>> {
-    let bounty = state
-        .db
-        .get_bounty(&id)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("bounty {id} not found")))?;
+    let not_found = || AppError::NotFound(format!("bounty {id} not found"));
+
+    let bounty = state.db.get_bounty(&id).await?.ok_or_else(not_found)?;
 
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
-    crate::api::authorize_repo_read(&state, &bounty.repo_owner, &bounty.repo_name, caller, "/")
-        .await?;
+    if crate::api::authorize_repo_read(&state, &bounty.repo_owner, &bounty.repo_name, caller, "/")
+        .await
+        .is_err()
+    {
+        return Err(not_found());
+    }
 
     Ok(Json(bounty))
 }
