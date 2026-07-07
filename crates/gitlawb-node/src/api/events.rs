@@ -138,8 +138,10 @@ pub async fn list_ref_updates(
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
     let updates = collect_visible_ref_updates(&state.db, None, limit, caller).await?;
 
-    // Resolve the local owner_did for each row so locally-hosted repos
-    // display their canonical owner rather than a peer-supplied wire value.
+    // Prefer the stored wire owner_did (full DID, may differ from local
+    // record's trailing-segment match). Fall back to the local record's
+    // owner_did only for backward-compat rows (stored as None) that name a
+    // repo this node hosts, so legacy rows still display an owner.
     let deduped = state.db.list_all_repos_deduped().await?;
     let resolve_local = |slug: &str| -> Option<&str> {
         for record in &deduped {
@@ -153,9 +155,12 @@ pub async fn list_ref_updates(
     let events: Vec<serde_json::Value> = updates
         .iter()
         .map(|u| {
-            let owner_did = match resolve_local(&u.repo) {
-                Some(local) => serde_json::json!(local),
-                None => serde_json::json!(u.owner_did),
+            let owner_did = match &u.owner_did {
+                Some(wire) => serde_json::json!(wire),
+                None => match resolve_local(&u.repo) {
+                    Some(local) => serde_json::json!(local),
+                    None => serde_json::Value::Null,
+                },
             };
             serde_json::json!({
                 "id":          u.id,

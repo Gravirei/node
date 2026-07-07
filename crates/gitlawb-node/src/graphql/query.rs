@@ -73,17 +73,36 @@ impl QueryRoot {
                 .await
                 .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
+        // Match the REST feed's owner_did projection: prefer the stored wire
+        // value (full DID), fall back to the local record's owner for
+        // backward-compat rows (stored as None) that name a local repo.
+        let deduped = db
+            .list_all_repos_deduped()
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let resolve_local = |slug: &str| -> Option<String> {
+            for record in &deduped {
+                if crate::visibility::ref_update_row_names_repo(record, slug) {
+                    return Some(record.owner_did.clone());
+                }
+            }
+            None
+        };
+
         Ok(updates
             .into_iter()
-            .map(|u| RefUpdateType {
-                repo: u.repo,
-                ref_name: u.ref_name,
-                old_sha: u.old_sha,
-                new_sha: u.new_sha,
-                pusher_did: u.pusher_did,
-                node_did: u.node_did,
-                timestamp: u.timestamp,
-                owner_did: u.owner_did,
+            .map(|u| {
+                let owner_did = u.owner_did.or_else(|| resolve_local(&u.repo));
+                RefUpdateType {
+                    repo: u.repo,
+                    ref_name: u.ref_name,
+                    old_sha: u.old_sha,
+                    new_sha: u.new_sha,
+                    pusher_did: u.pusher_did,
+                    node_did: u.node_did,
+                    timestamp: u.timestamp,
+                    owner_did,
+                }
             })
             .collect())
     }
@@ -264,9 +283,10 @@ mod tests {
             row.get("repo").unwrap(),
             &async_graphql::Value::from("z6MkOwner/openrepo")
         );
-        assert!(
-            row.contains_key("ownerDid"),
-            "ownerDid must be present in the refUpdates response"
+        assert_eq!(
+            row.get("ownerDid").unwrap(),
+            &async_graphql::Value::from(OWNER),
+            "ownerDid must fall back to the local record's owner for legacy rows"
         );
     }
 
