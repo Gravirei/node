@@ -544,6 +544,119 @@ mod tests {
         );
     }
 
+    /// Claim bounty denies a non-reader from claiming a bounty on a private repo (returns 404).
+    #[sqlx::test]
+    async fn claim_bounty_denies_non_reader_on_private_repo(pool: PgPool) {
+        let owner = "did:key:zISOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let stranger = "did:key:zISSTRANGERBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let state = test_state(pool).await;
+
+        let mut repo = seed_repo(owner, "priv-bounty-repo");
+        repo.is_public = false;
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let bounty = crate::db::BountyRecord {
+            id: "bounty-123".to_string(),
+            repo_owner: owner.to_string(),
+            repo_name: "priv-bounty-repo".to_string(),
+            issue_id: None,
+            title: "Fix issue".to_string(),
+            amount: 100,
+            creator_did: owner.to_string(),
+            claimant_did: None,
+            claimant_wallet: None,
+            pr_id: None,
+            status: "open".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            claimed_at: None,
+            submitted_at: None,
+            completed_at: None,
+            deadline_secs: 604800,
+            tx_hash: None,
+        };
+        state.db.create_bounty(&bounty).await.expect("seed bounty");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/bounties/{id}/claim",
+                axum::routing::post(crate::api::bounties::claim_bounty),
+            )
+            .with_state(state);
+
+        let uri = "/api/v1/bounties/bounty-123/claim";
+        let resp = router
+            .oneshot(signed_request_as(
+                stranger,
+                Method::POST,
+                uri,
+                Body::from(r#"{}"#),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a non-reader must get a 404 NOT_FOUND on claiming private bounty"
+        );
+    }
+
+    /// Claim bounty allows the repository owner/permitted reader to claim a bounty.
+    #[sqlx::test]
+    async fn claim_bounty_allows_permitted_reader(pool: PgPool) {
+        let owner = "did:key:zISOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+
+        let mut repo = seed_repo(owner, "priv-bounty-repo");
+        repo.is_public = false;
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let bounty = crate::db::BountyRecord {
+            id: "bounty-123".to_string(),
+            repo_owner: owner.to_string(),
+            repo_name: "priv-bounty-repo".to_string(),
+            issue_id: None,
+            title: "Fix issue".to_string(),
+            amount: 100,
+            creator_did: owner.to_string(),
+            claimant_did: None,
+            claimant_wallet: None,
+            pr_id: None,
+            status: "open".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            claimed_at: None,
+            submitted_at: None,
+            completed_at: None,
+            deadline_secs: 604800,
+            tx_hash: None,
+        };
+        state.db.create_bounty(&bounty).await.expect("seed bounty");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/bounties/{id}/claim",
+                axum::routing::post(crate::api::bounties::claim_bounty),
+            )
+            .with_state(state);
+
+        let uri = "/api/v1/bounties/bounty-123/claim";
+        let resp = router
+            .oneshot(signed_request_as(
+                owner,
+                Method::POST,
+                uri,
+                Body::from(r#"{}"#),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "permitted reader must be allowed to claim bounty"
+        );
+    }
+
     /// Adversarial-review D3-1: register binds the registered DID to the signer.
     /// A caller signed as A cannot register a different DID B (no spoofed
     /// registration or trust row under a victim DID). Rejected before any write.

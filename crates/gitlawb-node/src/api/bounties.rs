@@ -162,11 +162,22 @@ pub async fn claim_bounty(
     Path(id): Path<String>,
     Json(req): Json<ClaimBountyRequest>,
 ) -> Result<Json<BountyRecord>> {
-    let bounty = state
-        .db
-        .get_bounty(&id)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("bounty {id} not found")))?;
+    let not_found = || AppError::NotFound(format!("bounty {id} not found"));
+
+    let bounty = state.db.get_bounty(&id).await?.ok_or_else(not_found)?;
+
+    if crate::api::authorize_repo_read(
+        &state,
+        &bounty.repo_owner,
+        &bounty.repo_name,
+        Some(auth.0.as_str()),
+        "/",
+    )
+    .await
+    .is_err()
+    {
+        return Err(not_found());
+    }
 
     if bounty.status != "open" {
         return Err(AppError::BadRequest(format!(
