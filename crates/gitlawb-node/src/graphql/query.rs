@@ -247,10 +247,10 @@ mod tests {
             .await
             .unwrap();
         let schema = schema(db);
-        let q = r#"{ refUpdates { repo refName } }"#;
+        let q = r#"{ refUpdates { repo refName ownerDid } }"#;
         let resp = anon(&schema, q).await;
         assert_eq!(count(&resp), 1);
-        // The one row returned must be the public repo's.
+        // The one row returned must be the public repo's with owner_did echoed.
         let async_graphql::Value::Object(obj) = &resp.data else {
             unreachable!()
         };
@@ -263,6 +263,10 @@ mod tests {
         assert_eq!(
             row.get("repo").unwrap(),
             &async_graphql::Value::from("z6MkOwner/openrepo")
+        );
+        assert!(
+            row.contains_key("ownerDid"),
+            "ownerDid must be present in the refUpdates response"
         );
     }
 

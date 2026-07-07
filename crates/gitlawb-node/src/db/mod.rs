@@ -3512,6 +3512,7 @@ mod migration_tests {
         .unwrap();
         assert_eq!(col.0, "owner_did");
         assert_eq!(col.1, "text");
+        assert_eq!(col.2, "YES", "owner_did must be nullable");
 
         // (c) Version 11 is recorded as applied.
         let v11_count: (i64,) =

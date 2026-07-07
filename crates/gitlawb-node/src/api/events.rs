@@ -138,9 +138,25 @@ pub async fn list_ref_updates(
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
     let updates = collect_visible_ref_updates(&state.db, None, limit, caller).await?;
 
+    // Resolve the local owner_did for each row so locally-hosted repos
+    // display their canonical owner rather than a peer-supplied wire value.
+    let deduped = state.db.list_all_repos_deduped().await?;
+    let resolve_local = |slug: &str| -> Option<&str> {
+        for record in &deduped {
+            if crate::visibility::ref_update_row_names_repo(record, slug) {
+                return Some(&record.owner_did);
+            }
+        }
+        None
+    };
+
     let events: Vec<serde_json::Value> = updates
         .iter()
         .map(|u| {
+            let owner_did = match resolve_local(&u.repo) {
+                Some(local) => serde_json::json!(local),
+                None => serde_json::json!(u.owner_did),
+            };
             serde_json::json!({
                 "id":          u.id,
                 "node_did":    u.node_did,
@@ -153,7 +169,7 @@ pub async fn list_ref_updates(
                 "cert_id":     u.cert_id,
                 "received_at": u.received_at,
                 "from_peer":   u.from_peer,
-                "owner_did":   u.owner_did,
+                "owner_did":   owner_did,
             })
         })
         .collect();
@@ -1109,7 +1125,14 @@ mod ref_updates_feed_tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(count(&body_json(resp).await), 2);
+        let body = body_json(resp).await;
+        assert_eq!(count(&body), 2);
+        for event in body["events"].as_array().unwrap() {
+            assert_eq!(
+                event["owner_did"], OWNER,
+                "each event must carry the local owner_did"
+            );
+        }
     }
 
     // Anon reads a quarantined mirror → 404 (withheld without disclosing existence
