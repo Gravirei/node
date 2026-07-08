@@ -129,7 +129,7 @@ pub async fn list_ref_updates(
     let limit = params
         .get("limit")
         .and_then(|v| v.parse::<i64>().ok())
-        .map(|v| v.max(1))
+        .map(|v| v.max(0))
         .unwrap_or(50)
         .clamp(0, MAX_VISIBLE_REF_UPDATES);
 
@@ -178,7 +178,7 @@ pub async fn list_repo_events(
     let limit = params
         .get("limit")
         .and_then(|v| v.parse::<i64>().ok())
-        .map(|v| v.max(1))
+        .map(|v| v.max(0))
         .unwrap_or(50)
         .clamp(0, MAX_VISIBLE_REF_UPDATES);
 

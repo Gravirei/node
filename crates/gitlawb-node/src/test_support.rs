@@ -3647,4 +3647,173 @@ mod tests {
         let resp = router.oneshot(req).await.unwrap();
         assert!(resp.status().is_success());
     }
+
+    // ── #147: list_certs respects ?limit ──────────────────────────────────────
+
+    fn seed_cert(
+        id: &str,
+        repo_id: &str,
+        ref_name: &str,
+        issued_at: &str,
+    ) -> crate::db::RefCertificate {
+        crate::db::RefCertificate {
+            id: id.to_string(),
+            repo_id: repo_id.to_string(),
+            ref_name: ref_name.to_string(),
+            old_sha: "0000".into(),
+            new_sha: "1111".into(),
+            pusher_did: "did:key:zPUSHER".into(),
+            node_did: "did:key:zNODE".into(),
+            signature: "sig".into(),
+            issued_at: issued_at.to_string(),
+        }
+    }
+
+    #[sqlx::test]
+    async fn list_certs_respects_limit_param(pool: PgPool) {
+        let owner = "did:key:zCERTOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "cert-repo"))
+            .await
+            .expect("seed repo");
+        let repo = state
+            .db
+            .get_repo(owner, "cert-repo")
+            .await
+            .unwrap()
+            .expect("repo must exist");
+
+        for i in 0..10u64 {
+            state
+                .db
+                .insert_ref_certificate(&seed_cert(
+                    &format!("cert-{i}"),
+                    &repo.id,
+                    &format!("refs/heads/feature-{i}"),
+                    &format!("2026-07-03T20:{i:02}:00Z"),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/certs",
+                    axum::routing::get(crate::api::certs::list_certs),
+                )
+                .with_state(state.clone())
+        };
+
+        // No limit param → default 50, returns all 10
+        let resp = router()
+            .oneshot(anon_get(&format!("/api/v1/repos/{owner}/cert-repo/certs")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["count"], 10, "default limit returns all rows");
+        assert_eq!(
+            body["certificates"].as_array().unwrap().len(),
+            10,
+            "all certs in response"
+        );
+
+        // limit=3 returns exactly 3
+        let resp = router()
+            .oneshot(anon_get(&format!(
+                "/api/v1/repos/{owner}/cert-repo/certs?limit=3"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["count"], 3, "limit=3 returns 3 certs");
+        let certs = body["certificates"].as_array().unwrap();
+        assert_eq!(certs.len(), 3);
+        assert_eq!(certs[0]["id"], "cert-9", "most recent cert first");
+        assert_eq!(certs[2]["id"], "cert-7", "third most recent cert");
+
+        // limit=0 is clamped to min 1, returns 1 cert
+        let resp = router()
+            .oneshot(anon_get(&format!(
+                "/api/v1/repos/{owner}/cert-repo/certs?limit=0"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["count"], 1, "limit=0 clamped to min 1");
+        assert_eq!(
+            body["certificates"].as_array().unwrap().len(),
+            1,
+            "one cert when limit=0"
+        );
+        assert_eq!(body["certificates"][0]["id"], "cert-9", "most recent");
+
+        // limit=200+ is capped at 200
+        let resp = router()
+            .oneshot(anon_get(&format!(
+                "/api/v1/repos/{owner}/cert-repo/certs?limit=300"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(
+            body["count"], 10,
+            "limit=300 capped to 200, still returns all 10"
+        );
+    }
+
+    #[sqlx::test]
+    async fn list_certs_returns_count_field(pool: PgPool) {
+        let owner = "did:key:zCERTCOUNTAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "count-repo"))
+            .await
+            .expect("seed repo");
+        let repo = state
+            .db
+            .get_repo(owner, "count-repo")
+            .await
+            .unwrap()
+            .unwrap();
+
+        state
+            .db
+            .insert_ref_certificate(&seed_cert(
+                "cnt-1",
+                &repo.id,
+                "refs/heads/main",
+                "2026-07-03T20:00:00Z",
+            ))
+            .await
+            .unwrap();
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/certs",
+                axum::routing::get(crate::api::certs::list_certs),
+            )
+            .with_state(state);
+
+        let resp = router
+            .oneshot(anon_get(&format!("/api/v1/repos/{owner}/count-repo/certs")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert!(body.get("count").is_some(), "response must include `count`");
+        assert_eq!(body["count"], 1);
+        assert_eq!(
+            body["certificates"].as_array().unwrap().len(),
+            1,
+            "certificates array length matches count"
+        );
+    }
 }
