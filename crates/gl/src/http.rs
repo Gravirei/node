@@ -431,8 +431,8 @@ mod tests {
     }
 
     /// Set up a mock iCaptcha server that responds to challenge + answer.
-    /// The caller MUST call `.assert()` on the returned mocks after the test
-    /// action to verify they were actually hit by the solve loop.
+    /// `hits` sets the expected call count for both endpoints so the test can
+    /// verify the solve loop was entered the correct number of times.
     struct MockIcaptcha {
         challenge: mockito::Mock,
         answer: mockito::Mock,
@@ -441,7 +441,7 @@ mod tests {
     }
 
     impl MockIcaptcha {
-        async fn new(server: &mut mockito::ServerGuard) -> Self {
+        async fn new(server: &mut mockito::ServerGuard, hits: usize) -> Self {
             let url = server.url();
             let guard = IcaptchaEnv::new(&url);
             let challenge = server
@@ -451,6 +451,7 @@ mod tests {
                 .with_body(
                     r#"{"challengeId":"c1","type":"arithmetic","difficulty":1,"prompt":"What is 1 + 1?","token":"tk1"}"#,
                 )
+                .expect(hits)
                 .create_async()
                 .await;
             let answer = server
@@ -458,6 +459,7 @@ mod tests {
                 .with_status(200)
                 .with_header("content-type", "application/json")
                 .with_body(r#"{"status":"passed","proof":"mock.proof"}"#)
+                .expect(hits)
                 .create_async()
                 .await;
             Self {
@@ -473,7 +475,7 @@ mod tests {
     async fn send_signed_solves_icaptcha_and_retries_to_success() {
         let mut node = Server::new_async().await;
         let mut icaptcha = Server::new_async().await;
-        let ic = MockIcaptcha::new(&mut icaptcha).await;
+        let ic = MockIcaptcha::new(&mut icaptcha, 1).await;
 
         let n1 = node
             .mock("POST", "/api/register")
@@ -511,11 +513,11 @@ mod tests {
     async fn send_signed_returns_403_after_icaptcha_retries_exhausted() {
         let mut node = Server::new_async().await;
         let mut icaptcha = Server::new_async().await;
-        let ic = MockIcaptcha::new(&mut icaptcha).await;
+        // MAX_ICAPTCHA_RETRIES = 2, so with every call returning 403 with
+        // iCaptcha headers the solve loop runs twice (2 challenge + 2 answer).
+        let ic = MockIcaptcha::new(&mut icaptcha, 2).await;
 
-        // Every call to the node returns 403 with iCaptcha headers, exhausting
-        // MAX_ICAPTCHA_RETRIES (2). The original + 2 retries → 3 node calls,
-        // each triggering a fresh challenge/answer cycle (2 cycles = 2 each).
+        // The original + 2 retries = 3 node calls before the loop gives up.
         let n = node
             .mock("POST", "/api/register")
             .with_status(403)
@@ -534,7 +536,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 403);
         n.assert();
-        ic.challenge.expect(2).assert();
-        ic.answer.expect(2).assert();
+        ic.challenge.assert();
+        ic.answer.assert();
     }
 }
