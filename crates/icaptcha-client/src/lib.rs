@@ -82,8 +82,9 @@ fn sanitize_excerpt(s: &str) -> String {
 }
 
 /// Whether `u` parses as a trusted URL (https in production; also allows
-/// localhost/127.0.0.1 in tests so the full iCaptcha retry path can be
-/// exercised against a mockito server).
+/// http://127.0.0.1 and http://localhost when `GITLAWB_ICAPTCHA_INSECURE` is
+/// set, so the full iCaptcha retry path can be exercised against a mockito
+/// server in integration tests without shipping the backdoor to production).
 fn is_https(u: &str) -> bool {
     let parsed = reqwest::Url::parse(u);
     if parsed
@@ -93,12 +94,11 @@ fn is_https(u: &str) -> bool {
     {
         return true;
     }
-    // Allow local test servers in test builds (mockito runs on 127.0.0.1:PORT).
-    #[cfg(test)]
-    if parsed
-        .as_ref()
-        .map(|p| p.host_str() == Some("127.0.0.1") || p.host_str() == Some("localhost"))
-        .unwrap_or(false)
+    if std::env::var_os("GITLAWB_ICAPTCHA_INSECURE").is_some()
+        && parsed
+            .as_ref()
+            .map(|p| p.host_str() == Some("127.0.0.1") || p.host_str() == Some("localhost"))
+            .unwrap_or(false)
     {
         return true;
     }

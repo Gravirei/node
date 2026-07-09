@@ -411,13 +411,14 @@ mod tests {
 
     // ── send_signed iCaptcha retry (full integration) ────────────────────
 
-    /// Helper: set GITLAWB_ICAPTCHA_URL so the iCaptcha client trusts the mock
-    /// server URL and clean it up on drop.
+    /// Set GITLAWB_ICAPTCHA_URL and GITLAWB_ICAPTCHA_INSECURE so the iCaptcha
+    /// client trusts a local mockito HTTP server, cleaning them up on drop.
     struct IcaptchaEnv;
 
     impl IcaptchaEnv {
         fn new(url: &str) -> Self {
             std::env::set_var("GITLAWB_ICAPTCHA_URL", url);
+            std::env::set_var("GITLAWB_ICAPTCHA_INSECURE", "1");
             IcaptchaEnv
         }
     }
@@ -425,13 +426,16 @@ mod tests {
     impl Drop for IcaptchaEnv {
         fn drop(&mut self) {
             std::env::remove_var("GITLAWB_ICAPTCHA_URL");
+            std::env::remove_var("GITLAWB_ICAPTCHA_INSECURE");
         }
     }
 
-    /// Helper: set up a mock iCaptcha server that responds to challenge + answer.
+    /// Set up a mock iCaptcha server that responds to challenge + answer.
+    /// The caller MUST call `.assert()` on the returned mocks after the test
+    /// action to verify they were actually hit by the solve loop.
     struct MockIcaptcha {
-        _c: mockito::Mock,
-        _a: mockito::Mock,
+        challenge: mockito::Mock,
+        answer: mockito::Mock,
         _guard: IcaptchaEnv,
         url: String,
     }
@@ -440,7 +444,7 @@ mod tests {
         async fn new(server: &mut mockito::ServerGuard) -> Self {
             let url = server.url();
             let guard = IcaptchaEnv::new(&url);
-            let _c = server
+            let challenge = server
                 .mock("POST", "/v1/challenge")
                 .with_status(200)
                 .with_header("content-type", "application/json")
@@ -449,7 +453,7 @@ mod tests {
                 )
                 .create_async()
                 .await;
-            let _a = server
+            let answer = server
                 .mock("POST", "/v1/answer")
                 .with_status(200)
                 .with_header("content-type", "application/json")
@@ -457,8 +461,8 @@ mod tests {
                 .create_async()
                 .await;
             Self {
-                _c,
-                _a,
+                challenge,
+                answer,
                 _guard: guard,
                 url,
             }
@@ -469,23 +473,25 @@ mod tests {
     async fn send_signed_solves_icaptcha_and_retries_to_success() {
         let mut node = Server::new_async().await;
         let mut icaptcha = Server::new_async().await;
-        let _ic = MockIcaptcha::new(&mut icaptcha).await;
+        let ic = MockIcaptcha::new(&mut icaptcha).await;
 
-        let _n1 = node
+        let n1 = node
             .mock("POST", "/api/register")
             .with_status(403)
             .with_header("content-type", "application/json")
-            .with_header("x-icaptcha-url", &_ic.url)
+            .with_header("x-icaptcha-url", &ic.url)
             .with_header("x-icaptcha-level", "3")
             .with_body(r#"{"error":"icaptcha_proof_required"}"#)
+            .expect(1)
             .create_async()
             .await;
-        let _n2 = node
+        let n2 = node
             .mock("POST", "/api/register")
             .match_header("x-icaptcha-proof", mockito::Matcher::Any)
             .with_status(201)
             .with_header("content-type", "application/json")
             .with_body(r#"{"status":"created"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -495,23 +501,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 201);
+        n1.assert();
+        n2.assert();
+        ic.challenge.assert();
+        ic.answer.assert();
     }
 
     #[tokio::test]
     async fn send_signed_returns_403_after_icaptcha_retries_exhausted() {
         let mut node = Server::new_async().await;
         let mut icaptcha = Server::new_async().await;
-        let _ic = MockIcaptcha::new(&mut icaptcha).await;
+        let ic = MockIcaptcha::new(&mut icaptcha).await;
 
         // Every call to the node returns 403 with iCaptcha headers, exhausting
-        // MAX_ICAPTCHA_RETRIES (2). The original + 2 retries = 3 node calls.
-        let _n = node
+        // MAX_ICAPTCHA_RETRIES (2). The original + 2 retries → 3 node calls,
+        // each triggering a fresh challenge/answer cycle (2 cycles = 2 each).
+        let n = node
             .mock("POST", "/api/register")
             .with_status(403)
             .with_header("content-type", "application/json")
-            .with_header("x-icaptcha-url", &_ic.url)
+            .with_header("x-icaptcha-url", &ic.url)
             .with_header("x-icaptcha-level", "3")
             .with_body(r#"{"error":"icaptcha_proof_required"}"#)
+            .expect(3)
             .create_async()
             .await;
 
@@ -521,5 +533,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 403);
+        n.assert();
+        ic.challenge.expect(2).assert();
+        ic.answer.expect(2).assert();
     }
 }
