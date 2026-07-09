@@ -191,6 +191,12 @@ mod tests {
     use super::*;
     use gitlawb_core::identity::Keypair;
     use mockito::Server;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Serializes the two integration tests that touch the process-global
+    /// `GITLAWB_ICAPTCHA_URL` / `GITLAWB_ICAPTCHA_INSECURE` env vars so they
+    /// never race.
+    static ICAPTCHA_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_keypair() -> Keypair {
         Keypair::generate()
@@ -413,13 +419,18 @@ mod tests {
 
     /// Set GITLAWB_ICAPTCHA_URL and GITLAWB_ICAPTCHA_INSECURE so the iCaptcha
     /// client trusts a local mockito HTTP server, cleaning them up on drop.
-    struct IcaptchaEnv;
+    /// Holds [`ICAPTCHA_ENV_LOCK`] for its lifetime so concurrent tests don't
+    /// race on the process-global env vars.
+    struct IcaptchaEnv {
+        _lock: MutexGuard<'static, ()>,
+    }
 
     impl IcaptchaEnv {
         fn new(url: &str) -> Self {
+            let lock = ICAPTCHA_ENV_LOCK.lock().unwrap();
             std::env::set_var("GITLAWB_ICAPTCHA_URL", url);
             std::env::set_var("GITLAWB_ICAPTCHA_INSECURE", "1");
-            IcaptchaEnv
+            IcaptchaEnv { _lock: lock }
         }
     }
 
