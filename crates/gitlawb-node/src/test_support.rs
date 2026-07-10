@@ -3816,4 +3816,81 @@ mod tests {
             "certificates array length matches count"
         );
     }
+
+    #[sqlx::test]
+    async fn list_certs_prefix_resolves_deep_cert(pool: PgPool) {
+        let owner = "did:key:zPREFIXDEEPTESTAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "deep-repo"))
+            .await
+            .expect("seed repo");
+        let repo = state
+            .db
+            .get_repo(owner, "deep-repo")
+            .await
+            .unwrap()
+            .expect("repo must exist");
+
+        // Insert 55 certs with distinct refs — only the newest 50 fit in a
+        // default list_certs response, so a short-ID for cert #0 requires the
+        // prefix query to reach it.
+        for i in 0..55u64 {
+            state
+                .db
+                .insert_ref_certificate(&seed_cert(
+                    &format!("deep-{i:04}"),
+                    &repo.id,
+                    &format!("refs/heads/feature-{i}"),
+                    &format!("2026-07-03T20:{i:02}:00Z"),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/certs",
+                    axum::routing::get(crate::api::certs::list_certs),
+                )
+                .with_state(state.clone())
+        };
+
+        // Default list (no prefix) returns only the 50 newest — cert-0000 is absent.
+        let body = json_body(
+            router()
+                .oneshot(anon_get(&format!("/api/v1/repos/{owner}/deep-repo/certs")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["count"].as_u64().unwrap(), 50, "default limit 50");
+
+        // Prefix lookup finds the deep cert by short prefix.
+        let body = json_body(
+            router()
+                .oneshot(anon_get(&format!(
+                    "/api/v1/repos/{owner}/deep-repo/certs?prefix=deep-0"
+                )))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            body["count"].as_u64().unwrap_or(0) >= 1,
+            "prefix query returns at least one result"
+        );
+        let ids: Vec<&str> = body["certificates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["id"].as_str())
+            .collect();
+        assert!(
+            ids.iter().any(|id| id.starts_with("deep-0")),
+            "result includes the deep cert matching the prefix"
+        );
+    }
 }

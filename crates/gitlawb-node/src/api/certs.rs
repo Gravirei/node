@@ -27,7 +27,18 @@ pub async fn list_certs(
     let (record, _rules) =
         crate::api::authorize_repo_read(&state, &owner, &name, caller, "/").await?;
 
-    let certs = state.db.list_ref_certificates(&record.id, limit).await?;
+    // When a prefix is given (short-ID resolution from the CLI) use a
+    // generous limit and delegate to the prefix-matched query so the
+    // caller can resolve IDs regardless of how many certs exist.
+    let prefix = params.get("prefix").filter(|p| !p.is_empty());
+    let certs = if let Some(prefix) = prefix {
+        state
+            .db
+            .list_ref_certificates_by_prefix(&record.id, prefix, 200)
+            .await?
+    } else {
+        state.db.list_ref_certificates(&record.id, limit).await?
+    };
     let certs_json: Vec<serde_json::Value> = certs
         .iter()
         .map(|c| {

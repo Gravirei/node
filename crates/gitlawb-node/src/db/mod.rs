@@ -2029,6 +2029,30 @@ impl Db {
         Ok(rows.into_iter().map(row_to_cert).collect())
     }
 
+    /// Look up ref certificates whose id starts with the given prefix.
+    /// Used by the CLI for short-ID resolution where the caller does not know
+    /// the full UUID.  Bounded by `limit` for safety — the caller should pass a
+    /// generous cap (e.g. 200) since prefix-matching narrows the result set.
+    pub async fn list_ref_certificates_by_prefix(
+        &self,
+        repo_id: &str,
+        prefix: &str,
+        limit: i64,
+    ) -> Result<Vec<RefCertificate>> {
+        let limit = limit.max(1);
+        let pattern = format!("{}%", prefix);
+        let rows = sqlx::query(
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at
+             FROM ref_certificates WHERE repo_id = $1 AND id LIKE $2 ORDER BY issued_at DESC LIMIT $3",
+        )
+        .bind(repo_id)
+        .bind(&pattern)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(row_to_cert).collect())
+    }
+
     pub async fn get_ref_certificate(&self, id: &str) -> Result<Option<RefCertificate>> {
         let row = sqlx::query(
             "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at
