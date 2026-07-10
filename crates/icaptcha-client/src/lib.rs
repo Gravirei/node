@@ -345,6 +345,37 @@ fn interactive_prompt(challenge: &Challenge) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Serializes tests that touch the process-global
+    /// `GITLAWB_ICAPTCHA_INSECURE` env var so they never race.
+    static ICAPTCHA_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Set `GITLAWB_ICAPTCHA_INSECURE` for the test lifetime, restoring any
+    /// prior value on drop.
+    struct InsecureEnv {
+        _lock: MutexGuard<'static, ()>,
+        prev: Option<OsString>,
+    }
+
+    impl InsecureEnv {
+        fn new() -> Self {
+            let lock = ICAPTCHA_ENV_LOCK.lock().unwrap();
+            let prev = std::env::var_os("GITLAWB_ICAPTCHA_INSECURE");
+            std::env::set_var("GITLAWB_ICAPTCHA_INSECURE", "1");
+            InsecureEnv { _lock: lock, prev }
+        }
+    }
+
+    impl Drop for InsecureEnv {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("GITLAWB_ICAPTCHA_INSECURE", v),
+                None => std::env::remove_var("GITLAWB_ICAPTCHA_INSECURE"),
+            }
+        }
+    }
 
     // ── P1: hostile error bodies must not reach the terminal raw ──────────
 
@@ -434,14 +465,7 @@ mod tests {
         // With GITLAWB_ICAPTCHA_INSECURE=1, two loopback URLs on different
         // ports must be treated as distinct origins so a hostile node cannot
         // redirect the bearer key to a different listener on localhost.
-        struct _EnvGuard;
-        impl Drop for _EnvGuard {
-            fn drop(&mut self) {
-                std::env::remove_var("GITLAWB_ICAPTCHA_INSECURE");
-            }
-        }
-        std::env::set_var("GITLAWB_ICAPTCHA_INSECURE", "1");
-        let _guard = _EnvGuard;
+        let _env = InsecureEnv::new();
 
         let op = "http://localhost:3000";
         let (url, key_trusted) = resolve_solver_url(Some("http://localhost:9000"), Some(op));

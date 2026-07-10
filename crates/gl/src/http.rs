@@ -191,6 +191,7 @@ mod tests {
     use super::*;
     use gitlawb_core::identity::Keypair;
     use mockito::Server;
+    use std::ffi::OsString;
     use std::sync::{Mutex, MutexGuard};
 
     /// Serializes the two integration tests that touch the process-global
@@ -418,26 +419,41 @@ mod tests {
     // ── send_signed iCaptcha retry (full integration) ────────────────────
 
     /// Set GITLAWB_ICAPTCHA_URL and GITLAWB_ICAPTCHA_INSECURE so the iCaptcha
-    /// client trusts a local mockito HTTP server, cleaning them up on drop.
+    /// client trusts a local mockito HTTP server, restoring any prior values on
+    /// drop so a test run launched with those variables keeps working.
     /// Holds [`ICAPTCHA_ENV_LOCK`] for its lifetime so concurrent tests don't
     /// race on the process-global env vars.
     struct IcaptchaEnv {
         _lock: MutexGuard<'static, ()>,
+        prev_url: Option<OsString>,
+        prev_insecure: Option<OsString>,
     }
 
     impl IcaptchaEnv {
         fn new(url: &str) -> Self {
             let lock = ICAPTCHA_ENV_LOCK.lock().unwrap();
+            let prev_url = std::env::var_os("GITLAWB_ICAPTCHA_URL");
+            let prev_insecure = std::env::var_os("GITLAWB_ICAPTCHA_INSECURE");
             std::env::set_var("GITLAWB_ICAPTCHA_URL", url);
             std::env::set_var("GITLAWB_ICAPTCHA_INSECURE", "1");
-            IcaptchaEnv { _lock: lock }
+            IcaptchaEnv {
+                _lock: lock,
+                prev_url,
+                prev_insecure,
+            }
         }
     }
 
     impl Drop for IcaptchaEnv {
         fn drop(&mut self) {
-            std::env::remove_var("GITLAWB_ICAPTCHA_URL");
-            std::env::remove_var("GITLAWB_ICAPTCHA_INSECURE");
+            match self.prev_url.take() {
+                Some(v) => std::env::set_var("GITLAWB_ICAPTCHA_URL", v),
+                None => std::env::remove_var("GITLAWB_ICAPTCHA_URL"),
+            }
+            match self.prev_insecure.take() {
+                Some(v) => std::env::set_var("GITLAWB_ICAPTCHA_INSECURE", v),
+                None => std::env::remove_var("GITLAWB_ICAPTCHA_INSECURE"),
+            }
         }
     }
 
