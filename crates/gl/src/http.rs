@@ -306,6 +306,7 @@ mod tests {
         let mut server = Server::new_async().await;
         let m = server
             .mock("POST", "/api/test")
+            .match_header("x-icaptcha-proof", mockito::Matcher::Missing)
             .with_status(200)
             .with_body("ok")
             .create_async()
@@ -345,6 +346,9 @@ mod tests {
         let mut server = Server::new_async().await;
         let m = server
             .mock("POST", "/api/test")
+            .match_header("Signature", mockito::Matcher::Missing)
+            .match_header("Signature-Input", mockito::Matcher::Missing)
+            .match_header("Content-Digest", mockito::Matcher::Missing)
             .with_status(200)
             .with_body("ok")
             .create_async()
