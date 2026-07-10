@@ -103,11 +103,20 @@ fn is_https(u: &str) -> bool {
     false
 }
 
-/// Lowercased host of a URL, if it parses and has one.
-fn host_of(u: &str) -> Option<String> {
-    reqwest::Url::parse(u)
-        .ok()
-        .and_then(|p| p.host_str().map(|h| h.to_ascii_lowercase()))
+/// Lowercased origin string (`scheme://host[:port]`) of a URL.
+///
+/// Includes the effective port so that `http://localhost:3000` and
+/// `http://localhost:9000` are treated as distinct origins — a hostile node
+/// cannot redirect the iCaptcha solve to a different loopback port.
+fn origin_key(u: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(u).ok()?;
+    let scheme = parsed.scheme();
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let port = parsed
+        .port_or_known_default()
+        .map(|p| format!(":{p}"))
+        .unwrap_or_default();
+    Some(format!("{scheme}://{host}{port}"))
 }
 
 /// Decide which iCaptcha origin to actually talk to, and whether it is trusted
@@ -124,12 +133,13 @@ fn host_of(u: &str) -> Option<String> {
 /// exfiltrated to an origin the operator did not choose.
 fn resolve_solver_url(advertised: Option<&str>, operator: Option<&str>) -> (String, bool) {
     let operator = operator.filter(|u| is_https(u));
-    let operator_host = operator.and_then(host_of);
-    let default_host = host_of(DEFAULT_URL);
+    let operator_origin = operator.as_ref().and_then(|u| origin_key(u));
+    let default_origin = origin_key(DEFAULT_URL);
 
-    let allowed = |host: &Option<String>| -> bool {
-        host.as_ref()
-            .map(|h| Some(h) == default_host.as_ref() || Some(h) == operator_host.as_ref())
+    let allowed = |origin: &Option<String>| -> bool {
+        origin
+            .as_ref()
+            .map(|o| Some(o) == default_origin.as_ref() || Some(o) == operator_origin.as_ref())
             .unwrap_or(false)
     };
 
@@ -140,7 +150,7 @@ fn resolve_solver_url(advertised: Option<&str>, operator: Option<&str>) -> (Stri
     };
 
     let chosen = match advertised {
-        Some(a) if is_https(a) && allowed(&host_of(a)) => a.to_string(),
+        Some(a) if is_https(a) && allowed(&origin_key(a)) => a.to_string(),
         Some(a) => {
             tracing::warn!(
                 advertised = %a,
@@ -152,7 +162,7 @@ fn resolve_solver_url(advertised: Option<&str>, operator: Option<&str>) -> (Stri
     };
 
     // Key goes only to the operator's own configured origin.
-    let key_trusted = operator_host.is_some() && host_of(&chosen) == operator_host;
+    let key_trusted = operator_origin.is_some() && origin_key(&chosen) == operator_origin;
     (chosen, key_trusted)
 }
 
@@ -417,5 +427,28 @@ mod tests {
         let (url, key_trusted) = resolve_solver_url(None, Some("http://icap.mynode.example"));
         assert_eq!(url, DEFAULT_URL);
         assert!(!key_trusted);
+    }
+
+    #[test]
+    fn rejects_insecure_advertised_url_on_different_port() {
+        // With GITLAWB_ICAPTCHA_INSECURE=1, two loopback URLs on different
+        // ports must be treated as distinct origins so a hostile node cannot
+        // redirect the bearer key to a different listener on localhost.
+        struct _EnvGuard;
+        impl Drop for _EnvGuard {
+            fn drop(&mut self) {
+                std::env::remove_var("GITLAWB_ICAPTCHA_INSECURE");
+            }
+        }
+        std::env::set_var("GITLAWB_ICAPTCHA_INSECURE", "1");
+        let _guard = _EnvGuard;
+
+        let op = "http://localhost:3000";
+        let (url, key_trusted) = resolve_solver_url(Some("http://localhost:9000"), Some(op));
+        assert_eq!(
+            url, op,
+            "must fall back to operator origin, not use different port"
+        );
+        assert!(key_trusted, "key stays trusted with operator origin");
     }
 }

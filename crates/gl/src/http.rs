@@ -500,7 +500,7 @@ mod tests {
             .await;
         let n2 = node
             .mock("POST", "/api/register")
-            .match_header("x-icaptcha-proof", mockito::Matcher::Any)
+            .match_header("x-icaptcha-proof", "mock.proof")
             .with_status(201)
             .with_header("content-type", "application/json")
             .with_body(r#"{"status":"created"}"#)
