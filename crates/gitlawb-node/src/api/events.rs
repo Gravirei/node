@@ -143,11 +143,11 @@ pub async fn list_ref_updates(
     // only when it matches the canonical owner of the local repo the slug
     // names (#P1); legacy None rows are attributed via an exact unique local
     // match (#P3). Both surfaces share this resolver so they cannot drift.
-    let owner_dids: Vec<serde_json::Value> = futures::future::join_all(
-        updates
-            .iter()
-            .map(|u| state.db.resolve_ref_update_owner_did(&u.repo, u.owner_did.as_deref())),
-    )
+    let owner_dids: Vec<serde_json::Value> = futures::future::join_all(updates.iter().map(|u| {
+        state
+            .db
+            .resolve_ref_update_owner_did(&u.repo, u.owner_did.as_deref())
+    }))
     .await
     .into_iter()
     .map(|r| {
@@ -264,18 +264,19 @@ pub async fn list_repo_events(
     // them.
     let gossip_updates =
         collect_visible_ref_updates(&state.db, Some(&repo_id_str), limit, caller).await?;
-    let gossip_owner_dids: Vec<serde_json::Value> = futures::future::join_all(
-        gossip_updates
-            .iter()
-            .map(|u| state.db.resolve_ref_update_owner_did(&u.repo, u.owner_did.as_deref())),
-    )
-    .await
-    .into_iter()
-    .map(|r| {
-        r.map(|o| o.map_or(serde_json::Value::Null, |s| serde_json::json!(s)))
-            .unwrap_or(serde_json::Value::Null)
-    })
-    .collect();
+    let gossip_owner_dids: Vec<serde_json::Value> =
+        futures::future::join_all(gossip_updates.iter().map(|u| {
+            state
+                .db
+                .resolve_ref_update_owner_did(&u.repo, u.owner_did.as_deref())
+        }))
+        .await
+        .into_iter()
+        .map(|r| {
+            r.map(|o| o.map_or(serde_json::Value::Null, |s| serde_json::json!(s)))
+                .unwrap_or(serde_json::Value::Null)
+        })
+        .collect();
 
     let gossip_events: Vec<serde_json::Value> = gossip_updates
         .iter()
