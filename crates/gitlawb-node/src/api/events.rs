@@ -138,37 +138,29 @@ pub async fn list_ref_updates(
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
     let updates = collect_visible_ref_updates(&state.db, None, limit, caller).await?;
 
-    // Prefer the stored wire owner_did (full DID, may differ from local
-    // record's trailing-segment match). Fall back to the local record's
-    // owner_did only for backward-compat rows (stored as None) that name a
-    // repo this node hosts, so legacy rows still display an owner.
-    // The deduped set is loaded only when a legacy None row is actually
-    // present, avoiding the scan on every global-feed read.
-    let needs_fallback = updates.iter().any(|u| u.owner_did.is_none());
-    let deduped: Vec<crate::db::RepoRecord> = if needs_fallback {
-        state.db.list_all_repos_deduped().await?
-    } else {
-        Vec::new()
-    };
-    let resolve_local = |slug: &str| -> Option<&str> {
-        for record in &deduped {
-            if crate::visibility::ref_update_row_names_repo(record, slug) {
-                return Some(&record.owner_did);
-            }
-        }
-        None
-    };
+    // Resolve the trusted display owner_did per row. The stored wire value is
+    // untrusted (arrives over gossip / unsigned peer notify), so it is echoed
+    // only when it matches the canonical owner of the local repo the slug
+    // names (#P1); legacy None rows are attributed via an exact unique local
+    // match (#P3). Both surfaces share this resolver so they cannot drift.
+    let owner_dids: Vec<serde_json::Value> = futures::future::join_all(
+        updates
+            .iter()
+            .map(|u| state.db.resolve_ref_update_owner_did(&u.repo, u.owner_did.as_deref())),
+    )
+    .await
+    .into_iter()
+    .map(|r| {
+        r.map(|o| o.map_or(serde_json::Value::Null, |s| serde_json::json!(s)))
+            .unwrap_or(serde_json::Value::Null)
+    })
+    .collect();
 
     let events: Vec<serde_json::Value> = updates
         .iter()
-        .map(|u| {
-            let owner_did = match &u.owner_did {
-                Some(wire) => serde_json::json!(wire),
-                None => match resolve_local(&u.repo) {
-                    Some(local) => serde_json::json!(local),
-                    None => serde_json::Value::Null,
-                },
-            };
+        .enumerate()
+        .map(|(i, u)| {
+            let owner_did = owner_dids[i].clone();
             serde_json::json!({
                 "id":          u.id,
                 "node_did":    u.node_did,
@@ -270,29 +262,44 @@ pub async fn list_repo_events(
     // collect_visible_ref_updates drops any row whose slug matches a local repo the
     // caller cannot read (fail-closed), and propagates DB errors instead of swallowing
     // them.
-    let gossip_events: Vec<serde_json::Value> =
-        collect_visible_ref_updates(&state.db, Some(&repo_id_str), limit, caller)
-            .await?
+    let gossip_updates =
+        collect_visible_ref_updates(&state.db, Some(&repo_id_str), limit, caller).await?;
+    let gossip_owner_dids: Vec<serde_json::Value> = futures::future::join_all(
+        gossip_updates
             .iter()
-            .map(|u| {
-                serde_json::json!({
-                    "type":        "gossipsub",
-                    "id":          u.id,
-                    "repo":        u.repo,
-                    "ref_name":    u.ref_name,
-                    "old_sha":     u.old_sha,
-                    "new_sha":     u.new_sha,
-                    "pusher_did":  u.pusher_did,
-                    "node_did":    u.node_did,
-                    "timestamp":   u.timestamp,
-                    "cert_id":     u.cert_id,
-                    "received_at": u.received_at,
-                    "from_peer":   u.from_peer,
-                    "owner_did":   u.owner_did.as_ref().map(|s| serde_json::json!(s)).unwrap_or(serde_json::json!(record.owner_did)),
-                    "source":      "gossipsub",
-                })
+            .map(|u| state.db.resolve_ref_update_owner_did(&u.repo, u.owner_did.as_deref())),
+    )
+    .await
+    .into_iter()
+    .map(|r| {
+        r.map(|o| o.map_or(serde_json::Value::Null, |s| serde_json::json!(s)))
+            .unwrap_or(serde_json::Value::Null)
+    })
+    .collect();
+
+    let gossip_events: Vec<serde_json::Value> = gossip_updates
+        .iter()
+        .enumerate()
+        .map(|(i, u)| {
+            let owner_did = gossip_owner_dids[i].clone();
+            serde_json::json!({
+                "type":        "gossipsub",
+                "id":          u.id,
+                "repo":        u.repo,
+                "ref_name":    u.ref_name,
+                "old_sha":     u.old_sha,
+                "new_sha":     u.new_sha,
+                "pusher_did":  u.pusher_did,
+                "node_did":    u.node_did,
+                "timestamp":   u.timestamp,
+                "cert_id":     u.cert_id,
+                "received_at": u.received_at,
+                "from_peer":   u.from_peer,
+                "owner_did":   owner_did,
+                "source":      "gossipsub",
             })
-            .collect();
+        })
+        .collect();
 
     // Merge both lists
     let mut all_events: Vec<serde_json::Value> = cert_events;

@@ -73,44 +73,28 @@ impl QueryRoot {
                 .await
                 .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
-        // Match the REST feed's owner_did projection: prefer the stored wire
-        // value (full DID), fall back to the local record's owner for
-        // backward-compat rows (stored as None) that name a local repo.
-        // The deduped set is loaded only when a legacy None row actually
-        // needs fallback, avoiding the scan on every query.
-        let needs_fallback = updates.iter().any(|u| u.owner_did.is_none());
-        let deduped: Vec<crate::db::RepoRecord> = if needs_fallback {
-            db.list_all_repos_deduped()
+        // Resolve the trusted display owner_did per row, identical to the REST
+        // feed: the stored wire value is untrusted, so it is echoed only when it
+        // matches the canonical owner of the local repo the slug names (#P1);
+        // legacy None rows are attributed via an exact unique local match (#P3).
+        let mut resolved = Vec::with_capacity(updates.len());
+        for u in updates {
+            let owner_did = db
+                .resolve_ref_update_owner_did(&u.repo, u.owner_did.as_deref())
                 .await
-                .map_err(|e| async_graphql::Error::new(e.to_string()))?
-        } else {
-            Vec::new()
-        };
-        let resolve_local = |slug: &str| -> Option<String> {
-            for record in &deduped {
-                if crate::visibility::ref_update_row_names_repo(record, slug) {
-                    return Some(record.owner_did.clone());
-                }
-            }
-            None
-        };
-
-        Ok(updates
-            .into_iter()
-            .map(|u| {
-                let owner_did = u.owner_did.or_else(|| resolve_local(&u.repo));
-                RefUpdateType {
-                    repo: u.repo,
-                    ref_name: u.ref_name,
-                    old_sha: u.old_sha,
-                    new_sha: u.new_sha,
-                    pusher_did: u.pusher_did,
-                    node_did: u.node_did,
-                    timestamp: u.timestamp,
-                    owner_did,
-                }
-            })
-            .collect())
+                .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+            resolved.push(RefUpdateType {
+                repo: u.repo,
+                ref_name: u.ref_name,
+                old_sha: u.old_sha,
+                new_sha: u.new_sha,
+                pusher_did: u.pusher_did,
+                node_did: u.node_did,
+                timestamp: u.timestamp,
+                owner_did,
+            });
+        }
+        Ok(resolved)
     }
 
     async fn tasks(

@@ -2336,6 +2336,56 @@ impl Db {
         Ok(())
     }
 
+    /// Resolve the trusted display `owner_did` for a ref-update row, guarding
+    /// against a forged peer-supplied wire value.
+    ///
+    /// The stored `owner_did` (and the `repo` slug) arrive over gossipsub or the
+    /// unsigned peer-notify HTTP path, so neither is trusted. This method binds
+    /// the wire `owner_did` to the local repo the slug names before it is ever
+    /// surfaced:
+    ///
+    /// * **P1 (untrusted wire value):** a peer-supplied `owner_did` is only
+    ///   echoed when it normalizes equal to the canonical owner of the *actual
+    ///   local repo* at that slug. A caller asserting `did:key:zVictim` on a
+    ///   `zAlice/widget` row is dropped, because `zVictim` does not own the
+    ///   local `zAlice/widget` repo. The canonical DID is returned (not the raw
+    ///   wire bytes), so the projection is always the local source of truth.
+    /// * **P3 (legacy fallback):** a row stored with `owner_did = None` is
+    ///   attributed only via an *exact, normalized, unique* local match —
+    ///   `get_repo` matches the slug's owner key and name exactly (`LIMIT 1`,
+    ///   preferring canonical rows). The loose prefix-tolerant drop gate
+    ///   (`ref_update_row_names_repo`) is never used for attribution, so a
+    ///   cross-method slug collision cannot synthesize the wrong owner. When no
+    ///   unique local repo proves the owner, `None` is returned.
+    ///
+    /// The slug must be `"{owner}/{name}"`; a slug without a `/` cannot be
+    /// attributed and yields `None`.
+    pub async fn resolve_ref_update_owner_did(
+        &self,
+        slug: &str,
+        wire_owner_did: Option<&str>,
+    ) -> Result<Option<String>> {
+        let Some((owner_part, name)) = slug.rsplit_once('/') else {
+            return Ok(None);
+        };
+
+        let repo = self.get_repo(owner_part, name).await?;
+
+        match (wire_owner_did, repo) {
+            // P1: trusted only when the wire DID matches the canonical owner of
+            // the local repo the slug names.
+            (Some(wire), Some(repo))
+                if normalize_owner_key(wire) == normalize_owner_key(&repo.owner_did) =>
+            {
+                Ok(Some(repo.owner_did))
+            }
+            // P3: legacy None row, attributed via an exact unique local match.
+            (None, Some(repo)) => Ok(Some(repo.owner_did)),
+            // Anything else (mismatch, or no proven local owner) is untrusted.
+            _ => Ok(None),
+        }
+    }
+
     /// One page of ref updates (newest first), optionally scoped to one repo.
     /// The `(timestamp DESC, id DESC)` order gives a stable tiebreak so offset
     /// paging does not skip or duplicate rows when timestamps collide. Used by
