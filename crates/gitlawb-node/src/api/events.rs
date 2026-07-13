@@ -142,7 +142,14 @@ pub async fn list_ref_updates(
     // record's trailing-segment match). Fall back to the local record's
     // owner_did only for backward-compat rows (stored as None) that name a
     // repo this node hosts, so legacy rows still display an owner.
-    let deduped = state.db.list_all_repos_deduped().await?;
+    // The deduped set is loaded only when a legacy None row is actually
+    // present, avoiding the scan on every global-feed read.
+    let needs_fallback = updates.iter().any(|u| u.owner_did.is_none());
+    let deduped: Vec<crate::db::RepoRecord> = if needs_fallback {
+        state.db.list_all_repos_deduped().await?
+    } else {
+        Vec::new()
+    };
     let resolve_local = |slug: &str| -> Option<&str> {
         for record in &deduped {
             if crate::visibility::ref_update_row_names_repo(record, slug) {
@@ -281,7 +288,7 @@ pub async fn list_repo_events(
                     "cert_id":     u.cert_id,
                     "received_at": u.received_at,
                     "from_peer":   u.from_peer,
-                    "owner_did":   serde_json::json!(record.owner_did),
+                    "owner_did":   u.owner_did.as_ref().map(|s| serde_json::json!(s)).unwrap_or(serde_json::json!(record.owner_did)),
                     "source":      "gossipsub",
                 })
             })

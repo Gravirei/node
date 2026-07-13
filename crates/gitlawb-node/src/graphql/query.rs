@@ -76,10 +76,16 @@ impl QueryRoot {
         // Match the REST feed's owner_did projection: prefer the stored wire
         // value (full DID), fall back to the local record's owner for
         // backward-compat rows (stored as None) that name a local repo.
-        let deduped = db
-            .list_all_repos_deduped()
-            .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        // The deduped set is loaded only when a legacy None row actually
+        // needs fallback, avoiding the scan on every query.
+        let needs_fallback = updates.iter().any(|u| u.owner_did.is_none());
+        let deduped: Vec<crate::db::RepoRecord> = if needs_fallback {
+            db.list_all_repos_deduped()
+                .await
+                .map_err(|e| async_graphql::Error::new(e.to_string()))?
+        } else {
+            Vec::new()
+        };
         let resolve_local = |slug: &str| -> Option<String> {
             for record in &deduped {
                 if crate::visibility::ref_update_row_names_repo(record, slug) {
