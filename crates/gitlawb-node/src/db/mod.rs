@@ -2395,17 +2395,42 @@ impl Db {
             }
         }
 
-        // ── 2.  Fetch all matching repos (one query per unique key) ──────
-        // The keys are typically few (1–20 for a 200-row page), so per-key
-        // queries are far cheaper than one per event row.
+        // ── 2.  Fetch all matching repos in one set-based query ──────────
+        // Build a single SQL with one OR condition per unique key so every
+        // distinct slug is resolved in one round-trip regardless of how many
+        // unique repos the page names.
         let mut repo_map: std::collections::HashMap<String, RepoRecord> =
             std::collections::HashMap::new();
-        for key in &unique_keys {
-            let Some((owner_part, name)) = key.split_once('\0') else {
-                continue;
-            };
-            if let Some(repo) = self.get_repo(owner_part, name).await? {
-                repo_map.insert(key.clone(), repo);
+
+        if !unique_keys.is_empty() {
+            let mut sql = String::from(
+                "SELECT id, name, owner_did, description, is_public, default_branch,
+                        created_at, updated_at, disk_path, forked_from, machine_id
+                 FROM repos WHERE (",
+            );
+            let mut conds: Vec<String> = Vec::with_capacity(unique_keys.len());
+            for i in 0..unique_keys.len() {
+                let p = (2 * i + 1) as i64;
+                let q = (2 * i + 2) as i64;
+                conds.push(format!("({}) = ${p} AND name = ${q}", OWNER_KEY_CASE_SQL));
+            }
+            sql.push_str(&conds.join(" OR "));
+            sql.push_str(
+                ") ORDER BY CASE WHEN position('/' in id) > 0 THEN 1 ELSE 0 END, \
+                 created_at ASC, id ASC",
+            );
+
+            let mut q = sqlx::query(&sql);
+            for key in &unique_keys {
+                if let Some((owner_part, name)) = key.split_once('\0') {
+                    q = q.bind(owner_part).bind(name);
+                }
+            }
+
+            for row in q.fetch_all(&self.pool).await? {
+                let repo = row_to_repo(row);
+                let key = format!("{}\0{}", normalize_owner_key(&repo.owner_did), repo.name);
+                repo_map.entry(key).or_insert(repo);
             }
         }
 
