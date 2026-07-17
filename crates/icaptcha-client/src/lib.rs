@@ -504,4 +504,65 @@ mod tests {
         );
         assert!(key_trusted, "key stays trusted with operator origin");
     }
+
+    #[test]
+    fn new_withholds_key_from_untrusted_origin_but_attaches_for_operator() {
+        let guard = ICAPTCHA_ENV_LOCK.lock().unwrap();
+        let prev_key = std::env::var_os("GITLAWB_ICAPTCHA_API_KEY");
+        let prev_op = std::env::var_os("GITLAWB_ICAPTCHA_URL");
+        std::env::set_var("GITLAWB_ICAPTCHA_API_KEY", "secret-bearer");
+
+        // Arm 1: No operator configured, node advertises an attacker origin.
+        // The key has no trusted destination; the advert is rejected.
+        std::env::remove_var("GITLAWB_ICAPTCHA_URL");
+        let untrusted =
+            IcaptchaCfg::new("did:key:zTEST", Some("https://evil.example".into()), None);
+
+        // Arm 2: Operator origin configured and advertised — key attached.
+        std::env::set_var("GITLAWB_ICAPTCHA_URL", "https://icap.mynode.example");
+        let operator_match = IcaptchaCfg::new(
+            "did:key:zTEST",
+            Some("https://icap.mynode.example/v1".into()),
+            None,
+        );
+
+        // Arm 3: Operator configured, default host advertised. The default host
+        // is allowlisted and selected, but its origin differs from the
+        // operator's, so key must not ride.
+        let default_advert = IcaptchaCfg::new(
+            "did:key:zTEST",
+            Some("https://icaptcha.gitlawb.com/v2".into()),
+            None,
+        );
+
+        // Restore env and release the lock BEFORE asserting, so a failing
+        // assertion can't poison the shared lock or cascade into a sibling.
+        match prev_key {
+            Some(v) => std::env::set_var("GITLAWB_ICAPTCHA_API_KEY", v),
+            None => std::env::remove_var("GITLAWB_ICAPTCHA_API_KEY"),
+        }
+        match prev_op {
+            Some(v) => std::env::set_var("GITLAWB_ICAPTCHA_URL", v),
+            None => std::env::remove_var("GITLAWB_ICAPTCHA_URL"),
+        }
+        drop(guard);
+
+        assert_eq!(
+            untrusted.api_key, None,
+            "key must not ride to an attacker origin"
+        );
+        assert_eq!(
+            untrusted.url, DEFAULT_URL,
+            "attacker advert must fall back to default URL"
+        );
+
+        assert_eq!(operator_match.api_key.as_deref(), Some("secret-bearer"));
+        assert_eq!(operator_match.url, "https://icap.mynode.example/v1");
+
+        assert_eq!(
+            default_advert.api_key, None,
+            "key must not ride to default origin when operator is configured"
+        );
+        assert_eq!(default_advert.url, "https://icaptcha.gitlawb.com/v2");
+    }
 }
