@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use sqlx::pool::PoolConnection;
 use sqlx::PgPool;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -159,17 +160,60 @@ impl RepoStore {
     /// deployment model), this lock prevents concurrent writes to the same repo
     /// across machines. The lock has no effect across separate Postgres instances
     /// (federated per-node-DB topology).
+    ///
+    /// # Session affinity
+    ///
+    /// PostgreSQL advisory locks are session-scoped: the lock is released by the
+    /// *same* backend connection that acquired it. If the acquiring connection
+    /// were returned to the pool, a later writer could be handed it and
+    /// reentrantly acquire the same lock, while `pg_advisory_unlock` issued on
+    /// a different session would silently no-op. We therefore hold the
+    /// `PoolConnection<Postgres>` returned by the acquiring query inside
+    /// `RepoWriteGuard` and release the lock through that exact connection before
+    /// returning it to the pool on drop.
+    ///
+    /// # Rolling upgrade caveat (SHA-256 re-keying)
+    ///
+    /// This function hashes `(owner_slug, repo_name)` with SHA-256 to produce a
+    /// stable `i64` key. Earlier builds used `std::collections::DefaultHasher`,
+    /// whose algorithm is not frozen by the Rust standard and has already
+    /// shifted across toolchain versions. The SHA-256 swap re-keys *every*
+    /// repo: an old-binary node holding the legacy `DefaultHasher` key and a
+    /// new-binary node holding the SHA-256 key for the same repo compute
+    /// *different* i64 keys, so PostgreSQL treats them as independent locks and
+    /// the cross-machine write-exclusion this lock provides is lost for the
+    /// duration of a rolling upgrade.
+    ///
+    /// The accepted remediation (see issue #210) is operational: during a
+    /// shared-Postgres rolling upgrade, **drain in-flight writes or cut over
+    /// through a single node** (e.g. stop receive-pack / issue / pull / archive
+    /// writers on the old version) before bringing new-binary nodes online. The
+    /// window is bounded by the operator's rollout cadence. A future
+    /// transition release could acquire both legacy and new keys for one cycle
+    /// and drop the legacy one a release later; that's optional given the
+    /// accepted-window path.
     pub async fn acquire_write(&self, owner_did: &str, repo_name: &str) -> Result<RepoWriteGuard> {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
         let lock_key = advisory_lock_key(&owner_slug, repo_name);
 
         // Acquire Postgres advisory lock with retry using pg_try_advisory_lock
         // to avoid blocking indefinitely on stale locks from crashed connections.
+        //
+        // We hold onto the connection that won the lock for the lifetime of the
+        // guard — see the method docstring on session affinity. A subsequent
+        // writer cannot be handed this connection and reentrantly grab the
+        // same lock, and the unlock on release() is guaranteed to run on the
+        // owning session.
+        let mut conn: PoolConnection<sqlx::Postgres> = self
+            .pool
+            .acquire()
+            .await
+            .context("acquiring connection for advisory lock")?;
         let mut acquired = false;
         for attempt in 0..60 {
             let row: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
                 .bind(lock_key)
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *conn)
                 .await
                 .context("trying advisory lock")?;
             if row.0 {
@@ -197,6 +241,14 @@ impl RepoStore {
                         warn!(repo = %repo_name, err = %e,
                             "write acquire: tigris download failed — falling back to local copy");
                     } else {
+                        // Drop the lock on the error path before returning; the
+                        // connection is released to the pool by Drop on
+                        // PoolConnection, but the lock must be released explicitly
+                        // so a subsequent writer isn't blocked until idle timeout.
+                        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+                            .bind(lock_key)
+                            .execute(&mut *conn)
+                            .await;
                         return Err(e).context("downloading repo from tigris for write");
                     }
                 }
@@ -208,7 +260,7 @@ impl RepoStore {
             repo_name: repo_name.to_string(),
             local_path,
             lock_key,
-            pool: self.pool.clone(),
+            conn,
             tigris: self.tigris.clone(),
         })
     }
@@ -355,12 +407,16 @@ fn validate_repo_name(repo_name: &str) -> Result<()> {
 
 /// Guard returned by `acquire_write()`. Holds the Postgres advisory lock and
 /// uploads to Tigris + releases the lock on `release()`.
+///
+/// Holds the owning `PoolConnection<Postgres>` so the lock is released on
+/// the same session that acquired it — see `acquire_write` for the session
+/// affinity rationale.
 pub struct RepoWriteGuard {
     owner_slug: String,
     repo_name: String,
     pub local_path: PathBuf,
     lock_key: i64,
-    pool: PgPool,
+    conn: PoolConnection<sqlx::Postgres>,
     tigris: Option<TigrisClient>,
 }
 
@@ -375,7 +431,7 @@ impl RepoWriteGuard {
     /// half-applied or otherwise inconsistent repo would propagate corruption to
     /// Tigris (and to every node that later downloads it). The lock is always
     /// released regardless, to avoid stale locks blocking future writes.
-    pub async fn release(self, success: bool) {
+    pub async fn release(mut self, success: bool) {
         // Upload to Tigris only on success.
         if success {
             if let Some(ref tigris) = self.tigris {
@@ -390,10 +446,12 @@ impl RepoWriteGuard {
             warn!(repo = %self.repo_name, "write failed — skipping tigris upload to avoid propagating an inconsistent repo");
         }
 
-        // Release advisory lock
+        // Release advisory lock on the owning session. The connection is then
+        // returned to the pool by `PoolConnection::Drop` when `self` drops at
+        // the end of this function.
         let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
             .bind(self.lock_key)
-            .execute(&self.pool)
+            .execute(&mut *self.conn)
             .await;
     }
 }
@@ -592,8 +650,29 @@ mod tests {
 
     #[test]
     fn advisory_lock_key_differs_for_different_inputs() {
-        let a = advisory_lock_key("owner_a", "repo_a");
-        let b = advisory_lock_key("owner_b", "repo_b");
-        assert_ne!(a, b);
+        // Vary one axis at a time so a regression that drops either parameter
+        // from the hash is caught, not just one that drops both. The golden
+        // test above backstops a total algorithm swap.
+        let base = advisory_lock_key("owner_a", "repo_a");
+
+        // Same owner, different repo: a regression that hashes only owner_slug
+        // would make these collide.
+        let same_owner_diff_repo = advisory_lock_key("owner_a", "repo_b");
+        assert_ne!(
+            base, same_owner_diff_repo,
+            "key must depend on repo_name, not just owner_slug"
+        );
+
+        // Same repo, different owner: a regression that hashes only repo_name
+        // would make these collide.
+        let diff_owner_same_repo = advisory_lock_key("owner_b", "repo_a");
+        assert_ne!(
+            base, diff_owner_same_repo,
+            "key must depend on owner_slug, not just repo_name"
+        );
+
+        // Sanity: both axes varying at once still differs (the original shape).
+        let both_differ = advisory_lock_key("owner_b", "repo_b");
+        assert_ne!(base, both_differ);
     }
 }
