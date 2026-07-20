@@ -518,6 +518,11 @@ mod tests {
         let untrusted =
             IcaptchaCfg::new("did:key:zTEST", Some("https://evil.example".into()), None);
 
+        // Arm 1b: No operator configured, no URL advertised. The fallback goes
+        // to the default public origin, and with no operator to trust, the key
+        // must not ride.
+        let no_operator_no_advert = IcaptchaCfg::new("did:key:zTEST", None, None);
+
         // Arm 2: Operator origin configured and advertised — key attached.
         std::env::set_var("GITLAWB_ICAPTCHA_URL", "https://icap.mynode.example");
         let operator_match = IcaptchaCfg::new(
@@ -544,6 +549,14 @@ mod tests {
         // and fail against the protected operator service.
         let operator_fallback = IcaptchaCfg::new("did:key:zTEST", None, Some(3));
 
+        // Arm 5: Operator configured, node advertises an attacker origin.
+        // The advert is rejected and the solver falls back to the operator's
+        // own origin, which keeps the key trusted — this is the exfiltration
+        // scenario the test name describes (withhold key from *untrusted*
+        // origin, not from the operator's fallback).
+        let operator_hostile_advert =
+            IcaptchaCfg::new("did:key:zTEST", Some("https://evil.example".into()), None);
+
         // Restore env and release the lock BEFORE asserting, so a failing
         // assertion can't poison the shared lock or cascade into a sibling.
         match prev_key {
@@ -565,6 +578,15 @@ mod tests {
             "attacker advert must fall back to default URL"
         );
 
+        assert_eq!(
+            no_operator_no_advert.api_key, None,
+            "key must not ride with no operator and no advert"
+        );
+        assert_eq!(
+            no_operator_no_advert.url, DEFAULT_URL,
+            "no-advert path without operator must resolve to default URL"
+        );
+
         assert_eq!(operator_match.api_key.as_deref(), Some("secret-bearer"));
         assert_eq!(operator_match.url, "https://icap.mynode.example/v1");
 
@@ -582,6 +604,16 @@ mod tests {
         assert_eq!(
             operator_fallback.url, "https://icap.mynode.example",
             "no-advert path must resolve to operator URL"
+        );
+
+        assert_eq!(
+            operator_hostile_advert.api_key.as_deref(),
+            Some("secret-bearer"),
+            "key stays with operator origin when attacker advert is rejected"
+        );
+        assert_eq!(
+            operator_hostile_advert.url, "https://icap.mynode.example",
+            "hostile advert must fall back to operator URL"
         );
     }
 }
