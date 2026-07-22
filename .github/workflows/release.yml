@@ -24,7 +24,10 @@ permissions: {}
 
 jobs:
   release-please:
-    if: ${{ github.repository == 'Gitlawb/node' }}
+    # Skipped on manual dispatch: a backfill must never create or advance a
+    # release PR as a side effect (npm-publish tolerates the skipped need via
+    # !cancelled(), and every other job gates on release_created == 'true').
+    if: ${{ github.repository == 'Gitlawb/node' && github.event_name != 'workflow_dispatch' }}
     name: Release Please
     runs-on: ubuntu-latest
     permissions:
