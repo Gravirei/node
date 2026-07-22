@@ -557,6 +557,16 @@ mod tests {
         let operator_hostile_advert =
             IcaptchaCfg::new("did:key:zTEST", Some("https://evil.example".into()), None);
 
+        // Arm 6: Operator configured, same host but different port.
+        // origin_key includes the port, so :8443 must not match the
+        // operator origin at the default :443 — the advert is rejected
+        // and the solver falls back to the operator origin.
+        let operator_diff_port = IcaptchaCfg::new(
+            "did:key:zTEST",
+            Some("https://icap.mynode.example:8443/evil".into()),
+            None,
+        );
+
         // Restore env and release the lock BEFORE asserting, so a failing
         // assertion can't poison the shared lock or cascade into a sibling.
         match prev_key {
@@ -569,51 +579,99 @@ mod tests {
         }
         drop(guard);
 
-        assert_eq!(
-            untrusted.api_key, None,
-            "key must not ride to an attacker origin"
-        );
-        assert_eq!(
-            untrusted.url, DEFAULT_URL,
-            "attacker advert must fall back to default URL"
-        );
+        let mut failures: Vec<String> = Vec::new();
 
-        assert_eq!(
-            no_operator_no_advert.api_key, None,
-            "key must not ride with no operator and no advert"
-        );
-        assert_eq!(
-            no_operator_no_advert.url, DEFAULT_URL,
-            "no-advert path without operator must resolve to default URL"
-        );
+        if untrusted.api_key != None {
+            failures.push(format!(
+                "arm 1 (no operator, attacker advert): expected api_key=None, got {:?}",
+                untrusted.api_key
+            ));
+        }
+        if untrusted.url != DEFAULT_URL {
+            failures.push(format!(
+                "arm 1 (no operator, attacker advert): expected url={DEFAULT_URL}, got {}",
+                untrusted.url
+            ));
+        }
 
-        assert_eq!(operator_match.api_key.as_deref(), Some("secret-bearer"));
-        assert_eq!(operator_match.url, "https://icap.mynode.example/v1");
+        if no_operator_no_advert.api_key != None {
+            failures.push(format!(
+                "arm 1b (no operator, no advert): expected api_key=None, got {:?}",
+                no_operator_no_advert.api_key
+            ));
+        }
+        if no_operator_no_advert.url != DEFAULT_URL {
+            failures.push(format!(
+                "arm 1b (no operator, no advert): expected url={DEFAULT_URL}, got {}",
+                no_operator_no_advert.url
+            ));
+        }
 
-        assert_eq!(
-            default_advert.api_key, None,
-            "key must not ride to default origin when operator is configured"
-        );
-        assert_eq!(default_advert.url, "https://icaptcha.gitlawb.com/v2");
+        if operator_match.api_key.as_deref() != Some("secret-bearer") {
+            failures.push(format!(
+                "arm 2 (operator match): expected api_key=Some(\"secret-bearer\"), got {:?}",
+                operator_match.api_key
+            ));
+        }
+        if operator_match.url != "https://icap.mynode.example/v1" {
+            failures.push(format!(
+                "arm 2 (operator match): expected url=https://icap.mynode.example/v1, got {}",
+                operator_match.url
+            ));
+        }
 
-        assert_eq!(
-            operator_fallback.api_key.as_deref(),
-            Some("secret-bearer"),
-            "fallback to operator origin with no advert must still attach key"
-        );
-        assert_eq!(
-            operator_fallback.url, "https://icap.mynode.example",
-            "no-advert path must resolve to operator URL"
-        );
+        if default_advert.api_key != None {
+            failures.push(format!(
+                "arm 3 (operator + default advert): expected api_key=None, got {:?}",
+                default_advert.api_key
+            ));
+        }
+        if default_advert.url != "https://icaptcha.gitlawb.com/v2" {
+            failures.push(format!(
+                "arm 3 (operator + default advert): expected url=https://icaptcha.gitlawb.com/v2, got {}",
+                default_advert.url
+            ));
+        }
 
-        assert_eq!(
-            operator_hostile_advert.api_key.as_deref(),
-            Some("secret-bearer"),
-            "key stays with operator origin when attacker advert is rejected"
-        );
-        assert_eq!(
-            operator_hostile_advert.url, "https://icap.mynode.example",
-            "hostile advert must fall back to operator URL"
-        );
+        if operator_fallback.api_key.as_deref() != Some("secret-bearer") {
+            failures.push(format!(
+                "arm 4 (operator fallback, no advert): expected api_key=Some(\"secret-bearer\"), got {:?}",
+                operator_fallback.api_key
+            ));
+        }
+        if operator_fallback.url != "https://icap.mynode.example" {
+            failures.push(format!(
+                "arm 4 (operator fallback, no advert): expected url=https://icap.mynode.example, got {}",
+                operator_fallback.url
+            ));
+        }
+
+        if operator_hostile_advert.api_key.as_deref() != Some("secret-bearer") {
+            failures.push(format!(
+                "arm 5 (operator + hostile advert): expected api_key=Some(\"secret-bearer\"), got {:?}",
+                operator_hostile_advert.api_key
+            ));
+        }
+        if operator_hostile_advert.url != "https://icap.mynode.example" {
+            failures.push(format!(
+                "arm 5 (operator + hostile advert): expected url=https://icap.mynode.example, got {}",
+                operator_hostile_advert.url
+            ));
+        }
+
+        if operator_diff_port.api_key.as_deref() != Some("secret-bearer") {
+            failures.push(format!(
+                "arm 6 (operator + different port advert): expected api_key=Some(\"secret-bearer\"), got {:?}",
+                operator_diff_port.api_key
+            ));
+        }
+        if operator_diff_port.url != "https://icap.mynode.example" {
+            failures.push(format!(
+                "arm 6 (operator + different port advert): expected url=https://icap.mynode.example, got {}",
+                operator_diff_port.url
+            ));
+        }
+
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
     }
 }
