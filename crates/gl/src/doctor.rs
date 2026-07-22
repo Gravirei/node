@@ -390,7 +390,7 @@ fn check_shell_alias_shadowing(home: Option<PathBuf>) -> Option<Check> {
                 "{source} — interactive shells run that instead of this binary \
                  (symptom: `gl` prints \"fatal: not a git repository\")"
             ),
-            "add `unalias gl` at the end of ~/.zshrc (after oh-my-zsh loads)",
+            "echo 'unalias gl 2>/dev/null' >> ~/.zshrc && source ~/.zshrc  (must come after oh-my-zsh loads)",
         ))
     } else {
         None

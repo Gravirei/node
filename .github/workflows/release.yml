@@ -596,7 +596,7 @@ jobs:
                 oh-my-zsh's git plugin aliases gl='git pull', which shadows this
                 binary in interactive shells. If \`gl\` prints "fatal: not a git
                 repository", run:
-                  echo 'unalias gl' >> ~/.zshrc && source ~/.zshrc
+                  echo 'unalias gl 2>/dev/null' >> ~/.zshrc && source ~/.zshrc
               CAVEATS
             end
 

@@ -204,7 +204,7 @@ if [ -f "$HOME/.zshrc" ] && [ -d "$HOME/.oh-my-zsh/plugins/git" ] \
   echo "NOTE: oh-my-zsh's git plugin aliases gl='git pull', which will shadow"
   echo "the gl command in interactive shells. To use gl by name, run:"
   echo ""
-  echo "  echo 'unalias gl' >> ~/.zshrc && source ~/.zshrc"
+  echo "  echo 'unalias gl 2>/dev/null' >> ~/.zshrc && source ~/.zshrc"
 fi
 
 echo ""

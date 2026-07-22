@@ -41,9 +41,16 @@ pub enum CertCmd {
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
-        /// Exit non-zero unless the Ed25519 signature verifies
+        /// Exit non-zero unless the Ed25519 signature verifies AND the
+        /// issuing node matches the queried node (or --expect-node)
         #[arg(long)]
         verify: bool,
+        /// Expected issuing node DID for --verify. A valid signature alone
+        /// only proves the cert is internally consistent — signed by whatever
+        /// key it names — so --verify also anchors the issuer to a DID you
+        /// trust: this value when given, else the queried node's DID.
+        #[arg(long, requires = "verify")]
+        expect_node: Option<String>,
     },
 }
 
@@ -56,7 +63,8 @@ pub async fn run(args: CertArgs) -> Result<()> {
             node,
             dir,
             verify,
-        } => cmd_show(repo, id, node, dir, verify).await,
+            expect_node,
+        } => cmd_show(repo, id, node, dir, verify, expect_node).await,
     }
 }
 
@@ -124,6 +132,7 @@ async fn cmd_show(
     node: String,
     dir: Option<PathBuf>,
     require_valid: bool,
+    expect_node: Option<String>,
 ) -> Result<()> {
     let (owner, name) = resolve_repo(&repo, &node, dir.as_deref()).await?;
 
@@ -171,7 +180,9 @@ async fn cmd_show(
     println!("Signature verification:");
     match &verdict {
         Ok(()) => {
-            println!("  VALID — Ed25519 signature verified against the key in {node_did}");
+            println!(
+                "  VALID — Ed25519 signature verified against the key the certificate names ({node_did})"
+            );
         }
         Err(reason) => {
             println!("  INVALID — {reason}");
@@ -206,6 +217,22 @@ async fn cmd_show(
     if require_valid {
         if let Err(reason) = verdict {
             anyhow::bail!("certificate signature did not verify: {reason}");
+        }
+        // A valid signature proves internal consistency only: the payload was
+        // signed by whatever key the certificate itself names. A hostile
+        // source can mint a keypair, put its DID in node_did, and self-sign.
+        // --verify therefore also anchors the issuer to a trusted DID:
+        // --expect-node when given, else the DID of the node being queried.
+        let expected = expect_node.as_deref().or(current_node_did.as_deref());
+        match expected {
+            Some(expected) if expected == node_did => {}
+            Some(expected) => anyhow::bail!(
+                "certificate is signed by {node_did}, but the expected issuer is {expected} — \
+                 a valid signature alone proves internal consistency, not a trusted issuer"
+            ),
+            None => anyhow::bail!(
+                "cannot anchor the issuer: node info is unreachable and no --expect-node was given"
+            ),
         }
     }
 
@@ -290,6 +317,31 @@ async fn resolve_cert_id(client: &NodeClient, owner: &str, name: &str, id: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins gl's payload reconstruction to the frozen canonical byte form the
+    /// node signs (default serde_json maps = alphabetically ordered keys). If
+    /// serialization drifts — a field added, or a preserve_order feature
+    /// landing anywhere in the workspace (feature unification flips every
+    /// crate at once) — this literal stops matching and the test fails,
+    /// instead of every real certificate silently rendering INVALID.
+    #[test]
+    fn payload_serialization_matches_frozen_canonical_form() {
+        let payload = serde_json::json!({
+            "repo_id": "repo-1",
+            "ref":     "refs/heads/main",
+            "old":     "oldsha",
+            "new":     "newsha",
+            "pusher":  "did:key:z6MkPusher",
+            "node":    "did:key:z6MkNode",
+            "ts":      "2026-07-22T00:00:00+00:00",
+        });
+        let frozen = concat!(
+            r#"{"new":"newsha","node":"did:key:z6MkNode","old":"oldsha","#,
+            r#""pusher":"did:key:z6MkPusher","ref":"refs/heads/main","#,
+            r#""repo_id":"repo-1","ts":"2026-07-22T00:00:00+00:00"}"#,
+        );
+        assert_eq!(serde_json::to_string(&payload).unwrap(), frozen);
+    }
 
     /// Signing exactly as the node does must round-trip through
     /// verify_signature; any field tampering must fail it.
