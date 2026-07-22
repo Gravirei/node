@@ -4465,6 +4465,172 @@ mod tests {
         );
     }
 
+    // ── Ref-update events (issue #144: owner_did wire format) ─────────────────
+
+    fn events_router(state: AppState) -> Router {
+        Router::new()
+            .route(
+                "/api/v1/events/ref-updates",
+                axum::routing::get(crate::api::events::list_ref_updates),
+            )
+            .with_state(state)
+    }
+
+    #[sqlx::test]
+    async fn events_returns_inserted_ref_updates(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zEVENTSOWNERAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+        // Seed a local repo the wire owner_did is bound to. The stored wire
+        // owner_did is untrusted; it is only surfaced when it matches the
+        // canonical owner of the local repo the slug names.
+        state
+            .db
+            .create_repo(&seed_repo(owner, "myrepo"))
+            .await
+            .unwrap();
+
+        // Insert a gossip event with owner_did set
+        state
+            .db
+            .insert_ref_update(&crate::db::ReceivedRefUpdate {
+                id: uuid::Uuid::new_v4().to_string(),
+                node_did: "did:key:zNode".into(),
+                pusher_did: "did:key:zPusher".into(),
+                repo: format!("{}/myrepo", owner.split(':').next_back().unwrap()),
+                owner_did: Some(owner.into()),
+                ref_name: "refs/heads/main".into(),
+                old_sha: "0000000000000000000000000000000000000000".into(),
+                new_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                timestamp: "2026-07-02T12:00:00Z".into(),
+                cert_id: None,
+                received_at: "2026-07-02T12:00:01Z".into(),
+                from_peer: "12D3KooWTest".into(),
+            })
+            .await
+            .unwrap();
+
+        let resp = events_router(state)
+            .oneshot(anon_get("/api/v1/events/ref-updates"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = json_body(resp).await;
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]["repo"],
+            format!("{}/myrepo", owner.split(':').next_back().unwrap())
+        );
+        assert_eq!(events[0]["owner_did"], owner);
+    }
+
+    // P1: a peer-supplied owner_did that does NOT match the canonical owner of
+    // the local repo the slug names must NOT be surfaced. Here zVictim asserts
+    // ownership of alice's widget repo; the projection must drop it to null
+    // rather than poisoning persisted event ownership.
+    #[sqlx::test]
+    async fn events_drop_forged_peer_owner_did(pool: PgPool) {
+        let state = test_state(pool).await;
+        let alice = "did:key:zALICEOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let victim = "did:key:zVICTIMOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+        state
+            .db
+            .create_repo(&seed_repo(alice, "widget"))
+            .await
+            .unwrap();
+
+        state
+            .db
+            .insert_ref_update(&crate::db::ReceivedRefUpdate {
+                id: uuid::Uuid::new_v4().to_string(),
+                node_did: "did:key:zNode".into(),
+                pusher_did: "did:key:zPusher".into(),
+                repo: format!("{}/widget", alice.split(':').next_back().unwrap()),
+                owner_did: Some(victim.into()),
+                ref_name: "refs/heads/main".into(),
+                old_sha: "0000000000000000000000000000000000000000".into(),
+                new_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                timestamp: "2026-07-02T12:00:00Z".into(),
+                cert_id: None,
+                received_at: "2026-07-02T12:00:01Z".into(),
+                from_peer: "12D3KooWTest".into(),
+            })
+            .await
+            .unwrap();
+
+        let resp = events_router(state)
+            .oneshot(anon_get("/api/v1/events/ref-updates"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        // Forged value dropped: owner_did is null, NOT zVictim.
+        assert_eq!(events[0]["owner_did"], serde_json::Value::Null);
+    }
+
+    // P3: a legacy row stored with owner_did = None must be attributed only via
+    // an exact, unique local match — never a loose prefix-tolerant collision.
+    // alice/widget is owned by alice; a stray None row on a different repo whose
+    // owner key shares a segment must not inherit alice's full DID.
+    #[sqlx::test]
+    async fn events_legacy_none_owner_uses_exact_local_match(pool: PgPool) {
+        let state = test_state(pool).await;
+        let alice = "did:key:zALICEOWNER2AAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let bob = "did:key:zBOBOWNER2AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+        // Alice owns "widget".
+        state
+            .db
+            .create_repo(&seed_repo(alice, "widget"))
+            .await
+            .unwrap();
+        // Bob owns a distinct "gadget" repo.
+        state
+            .db
+            .create_repo(&seed_repo(bob, "gadget"))
+            .await
+            .unwrap();
+
+        // Legacy None row claiming slug "bob/gadget" (matches bob exactly).
+        state
+            .db
+            .insert_ref_update(&crate::db::ReceivedRefUpdate {
+                id: uuid::Uuid::new_v4().to_string(),
+                node_did: "did:key:zNode".into(),
+                pusher_did: "did:key:zPusher".into(),
+                repo: format!("{}/gadget", bob.split(':').next_back().unwrap()),
+                owner_did: None,
+                ref_name: "refs/heads/main".into(),
+                old_sha: "0000000000000000000000000000000000000000".into(),
+                new_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                timestamp: "2026-07-02T12:00:00Z".into(),
+                cert_id: None,
+                received_at: "2026-07-02T12:00:01Z".into(),
+                from_peer: "12D3KooWTest".into(),
+            })
+            .await
+            .unwrap();
+
+        let resp = events_router(state)
+            .oneshot(anon_get("/api/v1/events/ref-updates"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        // Attributed to the exact local owner (bob), not alice via collision.
+        assert_eq!(
+            events[0]["owner_did"],
+            serde_json::Value::String(bob.to_string())
+        );
+    }
+
     #[sqlx::test]
     async fn list_all_bounties_past_private_window_finds_public(pool: PgPool) {
         let state = test_state(pool).await;
@@ -4633,6 +4799,42 @@ mod tests {
             .await
             .unwrap();
         assert!(resp.status().is_success());
+    }
+
+    #[sqlx::test]
+    async fn events_limit_respects_limit_param(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zEVENTLIMITAAAAAAAAAAAAAAAAAAAAAAAA";
+
+        for i in 0..5 {
+            state
+                .db
+                .insert_ref_update(&crate::db::ReceivedRefUpdate {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    node_did: "did:key:zNode".into(),
+                    pusher_did: "did:key:zPusher".into(),
+                    repo: format!("{}/r{i}", owner.split(':').next_back().unwrap()),
+                    owner_did: Some(owner.into()),
+                    ref_name: "refs/heads/main".into(),
+                    old_sha: "0000000000000000000000000000000000000000".into(),
+                    new_sha: format!("{i:040x}"),
+                    timestamp: format!("2026-07-02T12:00:{i:02}Z"),
+                    cert_id: None,
+                    received_at: format!("2026-07-02T12:00:{i:02}Z"),
+                    from_peer: "12D3KooWTest".into(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let resp = events_router(state)
+            .oneshot(anon_get("/api/v1/events/ref-updates?limit=2"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["count"].as_i64(), Some(2));
+        assert_eq!(body["events"].as_array().unwrap().len(), 2);
     }
 
     #[sqlx::test]
