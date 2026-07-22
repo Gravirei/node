@@ -581,7 +581,7 @@ mod tests {
 
         let mut failures: Vec<String> = Vec::new();
 
-        if untrusted.api_key != None {
+        if untrusted.api_key.is_some() {
             failures.push(format!(
                 "arm 1 (no operator, attacker advert): expected api_key=None, got {:?}",
                 untrusted.api_key
@@ -594,7 +594,7 @@ mod tests {
             ));
         }
 
-        if no_operator_no_advert.api_key != None {
+        if no_operator_no_advert.api_key.is_some() {
             failures.push(format!(
                 "arm 1b (no operator, no advert): expected api_key=None, got {:?}",
                 no_operator_no_advert.api_key
@@ -620,7 +620,7 @@ mod tests {
             ));
         }
 
-        if default_advert.api_key != None {
+        if default_advert.api_key.is_some() {
             failures.push(format!(
                 "arm 3 (operator + default advert): expected api_key=None, got {:?}",
                 default_advert.api_key
