@@ -41,6 +41,9 @@ pub enum CertCmd {
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
+        /// Exit non-zero unless the Ed25519 signature verifies
+        #[arg(long)]
+        verify: bool,
     },
 }
 
@@ -52,7 +55,8 @@ pub async fn run(args: CertArgs) -> Result<()> {
             id,
             node,
             dir,
-        } => cmd_show(repo, id, node, dir).await,
+            verify,
+        } => cmd_show(repo, id, node, dir, verify).await,
     }
 }
 
@@ -114,7 +118,13 @@ async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
     Ok(())
 }
 
-async fn cmd_show(repo: String, id: String, node: String, dir: Option<PathBuf>) -> Result<()> {
+async fn cmd_show(
+    repo: String,
+    id: String,
+    node: String,
+    dir: Option<PathBuf>,
+    require_valid: bool,
+) -> Result<()> {
     let (owner, name) = resolve_repo(&repo, &node, dir.as_deref()).await?;
 
     let client = signed_client(&node, dir.as_deref());
@@ -148,8 +158,26 @@ async fn cmd_show(repo: String, id: String, node: String, dir: Option<PathBuf>) 
     println!("  Signature: {signature}");
     println!();
 
-    // Reconstruct the signing payload and verify
-    // Fetch the node's current public key to verify
+    // Verify the Ed25519 signature: rebuild the exact canonical payload the
+    // node signed (see gitlawb-node/src/cert.rs::issue_ref_certificate) and
+    // check it against the public key embedded in the certificate's node DID.
+    // This proves the cert is internally authentic — signed by the key it
+    // names; the node-DID comparison below covers *which* node that is.
+    let repo_id = cert["repo_id"].as_str().unwrap_or("");
+    let verdict = verify_signature(
+        repo_id, ref_name, old_sha, new_sha, pusher, node_did, issued_at, signature,
+    );
+
+    println!("Signature verification:");
+    match &verdict {
+        Ok(()) => {
+            println!("  VALID — Ed25519 signature verified against the key in {node_did}");
+        }
+        Err(reason) => {
+            println!("  INVALID — {reason}");
+        }
+    }
+
     let info: Value = client
         .get("/")
         .await?
@@ -157,28 +185,67 @@ async fn cmd_show(repo: String, id: String, node: String, dir: Option<PathBuf>) 
         .await
         .context("failed to fetch node info")?;
     let current_node_did = info["did"].as_str().unwrap_or("");
-
-    println!("Signature verification:");
-    println!("  Signing payload would be:");
-    println!("    {{\"repo_id\": ..., \"ref\": \"{ref_name}\", \"old\": \"{old_sha}\",");
-    println!("      \"new\": \"{new_sha}\", \"pusher\": \"{pusher}\",");
-    println!("      \"node\": \"{node_did}\", \"ts\": \"{issued_at}\"}}");
-    println!();
-
     if current_node_did == node_did {
-        println!("  Node DID matches current node. Signature is an Ed25519/base64url value.");
-        println!("  To verify offline, use the node's Ed25519 public key derived from:");
-        println!("    did:key → {node_did}");
+        println!("  Issuing node DID matches the node being queried.");
     } else {
         println!("  WARNING: Certificate node DID ({node_did}) does not match");
         println!("           current node DID ({current_node_did}).");
         println!("           This certificate was issued by a different node.");
     }
 
-    println!();
-    println!("  Signature (base64url): {signature}");
+    if require_valid {
+        if let Err(reason) = verdict {
+            anyhow::bail!("certificate signature did not verify: {reason}");
+        }
+    }
 
     Ok(())
+}
+
+/// Rebuild the node's canonical signing payload (field order must match
+/// gitlawb-node/src/cert.rs::issue_ref_certificate exactly) and verify the
+/// certificate's Ed25519 signature against the key embedded in `node_did`.
+#[allow(clippy::too_many_arguments)]
+fn verify_signature(
+    repo_id: &str,
+    ref_name: &str,
+    old_sha: &str,
+    new_sha: &str,
+    pusher: &str,
+    node_did: &str,
+    issued_at: &str,
+    signature_b64: &str,
+) -> std::result::Result<(), String> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use std::str::FromStr;
+
+    let payload = serde_json::json!({
+        "repo_id": repo_id,
+        "ref":     ref_name,
+        "old":     old_sha,
+        "new":     new_sha,
+        "pusher":  pusher,
+        "node":    node_did,
+        "ts":      issued_at,
+    });
+    let payload_bytes =
+        serde_json::to_vec(&payload).map_err(|e| format!("could not serialize payload: {e}"))?;
+
+    let did =
+        gitlawb_core::did::Did::from_str(node_did).map_err(|e| format!("bad node DID: {e}"))?;
+    let verifying_key = did
+        .to_verifying_key()
+        .map_err(|e| format!("cannot derive a public key from {node_did}: {e}"))?;
+
+    let sig_vec = URL_SAFE_NO_PAD
+        .decode(signature_b64)
+        .map_err(|e| format!("signature is not valid base64url: {e}"))?;
+    let sig_bytes: [u8; 64] = sig_vec
+        .try_into()
+        .map_err(|_| "signature is not 64 bytes".to_string())?;
+
+    gitlawb_core::identity::verify(&verifying_key, &payload_bytes, &sig_bytes)
+        .map_err(|_| "Ed25519 signature does not match the signed payload".to_string())
 }
 
 async fn resolve_cert_id(client: &NodeClient, owner: &str, name: &str, id: &str) -> Result<String> {
@@ -207,5 +274,65 @@ async fn resolve_cert_id(client: &NodeClient, owner: &str, name: &str, id: &str)
         [full_id] => Ok(full_id.to_string()),
         [] => Ok(id.to_string()),
         _ => anyhow::bail!("certificate prefix {id} matches multiple certificates"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Signing exactly as the node does must round-trip through
+    /// verify_signature; any field tampering must fail it.
+    #[test]
+    fn verify_signature_round_trip_and_tamper() {
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did().as_str().to_string();
+
+        let payload = serde_json::json!({
+            "repo_id": "repo-1",
+            "ref":     "refs/heads/main",
+            "old":     "0".repeat(40),
+            "new":     "a".repeat(40),
+            "pusher":  "did:key:z6MkPusher",
+            "node":    node_did,
+            "ts":      "2026-07-22T00:00:00+00:00",
+        });
+        let sig = kp.sign_b64(&serde_json::to_vec(&payload).unwrap());
+
+        let ok = verify_signature(
+            "repo-1",
+            "refs/heads/main",
+            &"0".repeat(40),
+            &"a".repeat(40),
+            "did:key:z6MkPusher",
+            &node_did,
+            "2026-07-22T00:00:00+00:00",
+            &sig,
+        );
+        assert!(ok.is_ok(), "expected valid signature, got: {ok:?}");
+
+        let tampered = verify_signature(
+            "repo-1",
+            "refs/heads/main",
+            &"0".repeat(40),
+            &"b".repeat(40), // new_sha changed after signing
+            "did:key:z6MkPusher",
+            &node_did,
+            "2026-07-22T00:00:00+00:00",
+            &sig,
+        );
+        assert!(tampered.is_err(), "tampered payload must not verify");
+
+        let garbage = verify_signature(
+            "repo-1",
+            "refs/heads/main",
+            &"0".repeat(40),
+            &"a".repeat(40),
+            "did:key:z6MkPusher",
+            &node_did,
+            "2026-07-22T00:00:00+00:00",
+            "not-base64url!!!",
+        );
+        assert!(garbage.is_err(), "malformed signature must not verify");
     }
 }
