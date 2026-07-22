@@ -142,6 +142,14 @@ pub struct RefCertificate {
     pub prev: String,
     /// RFC 9421 HTTP Signature from the pusher, proving they authorized this push
     pub pusher_sig: Option<String>,
+    /// RFC 9421 Signature-Input header value, needed to reconstruct the signing
+    /// string for pusher authorization verification.
+    pub signature_input: Option<String>,
+    /// Content-Digest header value covering the request body (RFC 9421).
+    pub content_digest: Option<String>,
+    /// The HTTP request path (e.g. /owner/repo.git/git-receive-pack) for RFC 9421
+    /// signing-string reconstruction.
+    pub request_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -252,7 +260,7 @@ pub struct ProfileRecord {
 
 #[derive(Clone)]
 pub struct Db {
-    pool: PgPool,
+    pub(crate) pool: PgPool,
 }
 
 impl Db {
@@ -910,6 +918,22 @@ const MIGRATIONS: &[Migration] = &[
             // (fresh databases created by v1 already use arweave_tx_id).
             "DO $$ BEGIN IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='arweave_anchors' AND column_name='irys_tx_id') THEN ALTER TABLE arweave_anchors RENAME COLUMN irys_tx_id TO arweave_tx_id; END IF; END $$",
             "ALTER TABLE arweave_anchors DROP COLUMN IF EXISTS arweave_url",
+        ],
+    },
+    Migration {
+        version: 13,
+        name: "append_only_certs_and_pusher_proof",
+        stmts: &[
+            // Make cert chain append-only: drop the (repo_id, ref_name) unique index
+            // and add a unique constraint on (repo_id, seq) so concurrent pushes
+            // cannot collide on the same sequence number.
+            "DROP INDEX IF EXISTS idx_ref_certs_repo_ref",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_ref_certs_repo_seq ON ref_certificates(repo_id, seq)",
+            // Store the full HTTP Signature context so a third party can verify
+            // the pusher authorization proof (RFC 9421).
+            "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS signature_input TEXT",
+            "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS content_digest TEXT",
+            "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS request_path TEXT",
         ],
     },
 ];
@@ -2010,37 +2034,15 @@ impl Db {
 // ── Ref Certificates ──────────────────────────────────────────────────────────
 
 impl Db {
-    /// Insert a ref certificate, or update it if a row for `(repo_id, ref_name)`
-    /// already exists.  The update only applies when the incoming row is newer
-    /// (compared by `issued_at`, which assumes a monotonic wall clock), so a
-    /// late-landing older cert cannot regress a ref's persisted state.  Returns
-    /// the full row as it now exists in the database (the original row on a
-    /// rejected upsert; the passed row on insert).
+    /// Insert a ref certificate (append-only). The unique constraint on
+    /// `(repo_id, seq)` prevents duplicate sequence numbers; callers must
+    /// handle retry on collision.
     pub async fn insert_ref_certificate(&self, cert: &RefCertificate) -> Result<RefCertificate> {
         let row = sqlx::query(
             "INSERT INTO ref_certificates
-             (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-             ON CONFLICT (repo_id, ref_name) DO UPDATE SET
-                old_sha   = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
-                                 THEN EXCLUDED.old_sha   ELSE ref_certificates.old_sha   END,
-                new_sha   = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
-                                 THEN EXCLUDED.new_sha   ELSE ref_certificates.new_sha   END,
-                pusher_did = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
-                                  THEN EXCLUDED.pusher_did ELSE ref_certificates.pusher_did END,
-                node_did  = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
-                                 THEN EXCLUDED.node_did  ELSE ref_certificates.node_did  END,
-                signature = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
-                                 THEN EXCLUDED.signature ELSE ref_certificates.signature END,
-                seq       = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
-                                 THEN EXCLUDED.seq       ELSE ref_certificates.seq       END,
-                prev      = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
-                                 THEN EXCLUDED.prev      ELSE ref_certificates.prev      END,
-                pusher_sig = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
-                                  THEN EXCLUDED.pusher_sig ELSE ref_certificates.pusher_sig END,
-                issued_at = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
-                                 THEN EXCLUDED.issued_at ELSE ref_certificates.issued_at END
-             RETURNING id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig",
+             (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig, signature_input, content_digest, request_path)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+             RETURNING id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig, signature_input, content_digest, request_path",
         )
         .bind(&cert.id)
         .bind(&cert.repo_id)
@@ -2054,6 +2056,9 @@ impl Db {
         .bind(cert.seq)
         .bind(&cert.prev)
         .bind(&cert.pusher_sig)
+        .bind(&cert.signature_input)
+        .bind(&cert.content_digest)
+        .bind(&cert.request_path)
         .fetch_one(&self.pool)
         .await?;
         Ok(row_to_cert(row))
@@ -2068,7 +2073,7 @@ impl Db {
         // bounded even if a raw/negative value slips through the handler layer.
         let limit = limit.max(1);
         let rows = sqlx::query(
-            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig, signature_input, content_digest, request_path
               FROM ref_certificates WHERE repo_id = $1 ORDER BY seq DESC, issued_at DESC LIMIT $2",
         )
         .bind(repo_id)
@@ -2091,7 +2096,7 @@ impl Db {
         let limit = limit.max(1);
         let pattern = format!("{}%", prefix);
         let rows = sqlx::query(
-            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig, signature_input, content_digest, request_path
               FROM ref_certificates WHERE repo_id = $1 AND id LIKE $2 ORDER BY seq DESC, issued_at DESC LIMIT $3",
         )
         .bind(repo_id)
@@ -2104,7 +2109,7 @@ impl Db {
 
     pub async fn get_ref_certificate(&self, id: &str) -> Result<Option<RefCertificate>> {
         let row = sqlx::query(
-            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig, signature_input, content_digest, request_path
              FROM ref_certificates WHERE id = $1",
         )
         .bind(id)
@@ -2116,7 +2121,7 @@ impl Db {
     /// Retrieve the most recent certificate for a repo (highest seq).
     pub async fn get_cert_by_seq(&self, repo_id: &str, seq: i64) -> Result<Option<RefCertificate>> {
         let row = sqlx::query(
-            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig, signature_input, content_digest, request_path
              FROM ref_certificates WHERE repo_id = $1 AND seq = $2",
         )
         .bind(repo_id)
@@ -2128,13 +2133,35 @@ impl Db {
 
     pub async fn get_most_recent_cert(&self, repo_id: &str) -> Result<Option<RefCertificate>> {
         let row = sqlx::query(
-            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig, signature_input, content_digest, request_path
              FROM ref_certificates WHERE repo_id = $1 ORDER BY seq DESC LIMIT 1",
         )
         .bind(repo_id)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(row_to_cert))
+    }
+
+    /// Acquire a per-repo advisory lock to serialize certificate issuance.
+    /// This prevents two concurrent pushes to the same repo from racing on
+    /// the sequence number allocation.
+    pub async fn lock_repo_cert_issuance(&self, repo_id: &str) -> Result<()> {
+        // Use a hash of repo_id as the advisory lock key so we get a stable
+        // i64 value. FNV-1a 64-bit is sufficient — collision risk is negligible
+        // and a false collision would only serialize unrelated repos.
+        // Use the std DefaultHasher (SipHash-2-4) for a stable hash.
+        // Collision risk is negligible and would only serialize unrelated repos.
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            repo_id.hash(&mut h);
+            h.finish() as i64
+        };
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(hash)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }
 
@@ -2939,6 +2966,9 @@ fn row_to_cert(r: sqlx::postgres::PgRow) -> RefCertificate {
         seq: r.try_get("seq").unwrap_or(0),
         prev: r.try_get("prev").unwrap_or_default(),
         pusher_sig: r.try_get("pusher_sig").unwrap_or(None),
+        signature_input: r.try_get("signature_input").unwrap_or(None),
+        content_digest: r.try_get("content_digest").unwrap_or(None),
+        request_path: r.try_get("request_path").unwrap_or(None),
     }
 }
 
@@ -5127,6 +5157,9 @@ mod ref_certificate_tests {
             seq: 1,
             prev: "0".repeat(64),
             pusher_sig: None,
+            signature_input: None,
+            content_digest: None,
+            request_path: None,
         }
     }
 
@@ -5178,20 +5211,20 @@ mod ref_certificate_tests {
     }
 
     #[sqlx::test]
-    async fn insert_ref_certificate_upserts_on_repo_ref(pool: PgPool) {
+    async fn insert_ref_certificate_append_only(pool: PgPool) {
         let db = db(pool).await;
         let repo_id = uuid::Uuid::new_v4().to_string();
 
         db.create_repo(&RepoRecord {
             id: repo_id.clone(),
-            name: "upsert-test".into(),
+            name: "append-test".into(),
             owner_did: "did:key:zOWNER".into(),
             description: None,
             is_public: true,
             default_branch: "main".into(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            disk_path: "/tmp/upsert-test".into(),
+            disk_path: "/tmp/append-test".into(),
             forked_from: None,
             machine_id: None,
         })
@@ -5200,7 +5233,7 @@ mod ref_certificate_tests {
 
         // First insert
         db.insert_ref_certificate(&make_cert(
-            "cert-original",
+            "cert-first",
             &repo_id,
             "refs/heads/main",
             "0000",
@@ -5210,9 +5243,9 @@ mod ref_certificate_tests {
         .await
         .unwrap();
 
-        // Upsert same ref with new values
+        // Second insert for the same ref — append-only means both rows exist
         db.insert_ref_certificate(&make_cert(
-            "cert-upserted",
+            "cert-second",
             &repo_id,
             "refs/heads/main",
             "aaaa",
@@ -5222,49 +5255,11 @@ mod ref_certificate_tests {
         .await
         .unwrap();
 
-        // Only one row exists for this ref
+        // Two rows now exist for this ref (append-only)
         let certs = db.list_ref_certificates(&repo_id, 10).await.unwrap();
-        assert_eq!(certs.len(), 1, "upsert must not create a duplicate row");
-        assert_eq!(
-            certs[0].id, "cert-original",
-            "upsert must preserve the original ID across re-pushes"
-        );
-        assert_eq!(certs[0].old_sha, "aaaa", "old_sha updated");
-        assert_eq!(certs[0].new_sha, "bbbb", "new_sha updated");
-        assert_eq!(
-            certs[0].issued_at, "2026-07-03T21:00:00Z",
-            "newer issued_at overwrites older"
-        );
-
-        // Now try to overwrite with an OLDER cert — the guard must reject it.
-        db.insert_ref_certificate(&make_cert(
-            "stale-id",
-            &repo_id,
-            "refs/heads/main",
-            "stale",
-            "stale",
-            "2026-07-03T19:00:00Z",
-        ))
-        .await
-        .unwrap();
-        let certs = db.list_ref_certificates(&repo_id, 10).await.unwrap();
-        assert_eq!(certs.len(), 1, "no extra row from stale cert");
-        assert_eq!(
-            certs[0].id, "cert-original",
-            "stale cert does not change the original id"
-        );
-        assert_eq!(
-            certs[0].old_sha, "aaaa",
-            "stale cert does not regress old_sha"
-        );
-        assert_eq!(
-            certs[0].new_sha, "bbbb",
-            "stale cert does not regress new_sha"
-        );
-        assert_eq!(
-            certs[0].issued_at, "2026-07-03T21:00:00Z",
-            "stale cert does not regress issued_at"
-        );
+        assert_eq!(certs.len(), 2, "append-only must keep both rows");
+        assert_eq!(certs[0].id, "cert-second", "most recent first");
+        assert_eq!(certs[1].id, "cert-first", "second most recent");
     }
 
     #[sqlx::test]
