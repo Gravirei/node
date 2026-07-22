@@ -245,6 +245,15 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
         ));
     }
 
+    // ── 5b. shell alias shadowing ─────────────────────────────────────────
+    // oh-my-zsh's default `git` plugin aliases gl='git pull', which silently
+    // shadows this binary in every interactive zsh — the classic symptom is
+    // `gl` printing "fatal: not a git repository". Aliases beat PATH, so no
+    // install method can fix it; the user's rc file has to unalias.
+    if let Some(check) = check_shell_alias_shadowing(dirs::home_dir()) {
+        checks.push(check);
+    }
+
     // ── 6. git ────────────────────────────────────────────────────────────
     match std::process::Command::new("git")
         .arg("--version")
@@ -311,6 +320,51 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
 }
 
 /// Check if a binary name exists anywhere on PATH.
+/// Detect interactive-shell setups where an alias shadows `gl` (aliases beat
+/// PATH, so no install method can fix this). Best-effort heuristic over
+/// ~/.zshrc: an explicit `alias gl=`, or oh-my-zsh's `git` plugin (which
+/// ships gl='git pull'). Returns None when nothing suspicious is found or the
+/// rc file already contains an `unalias gl`.
+fn check_shell_alias_shadowing(home: Option<PathBuf>) -> Option<Check> {
+    let home = home?;
+    let rc = std::fs::read_to_string(home.join(".zshrc")).ok()?;
+    if rc.contains("unalias gl") {
+        return None;
+    }
+
+    let explicit_alias = rc.lines().any(|l| l.trim_start().starts_with("alias gl="));
+    // Single-line `plugins=(git ...)` is the overwhelmingly common form; a
+    // multi-line plugins array slips past this heuristic, which is acceptable
+    // for a warning-level check.
+    let omz_git_plugin = home.join(".oh-my-zsh/plugins/git").exists()
+        && rc.lines().any(|l| {
+            let l = l.trim_start();
+            l.starts_with("plugins=")
+                && l.trim_start_matches("plugins=(")
+                    .trim_end_matches(')')
+                    .split_whitespace()
+                    .any(|p| p == "git")
+        });
+
+    if explicit_alias || omz_git_plugin {
+        let source = if explicit_alias {
+            "~/.zshrc defines `alias gl=`"
+        } else {
+            "oh-my-zsh's git plugin aliases gl='git pull'"
+        };
+        Some(Check::warn(
+            "shell alias",
+            format!(
+                "{source} — interactive shells run that instead of this binary \
+                 (symptom: `gl` prints \"fatal: not a git repository\")"
+            ),
+            "add `unalias gl` at the end of ~/.zshrc (after oh-my-zsh loads)",
+        ))
+    } else {
+        None
+    }
+}
+
 fn which_in_path(name: &str) -> bool {
     std::env::var_os("PATH")
         .map(|paths| {
@@ -394,6 +448,48 @@ fn is_newer(latest: &str, current: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fake_home(zshrc: Option<&str>, with_omz_git: bool) -> tempfile::TempDir {
+        let home = tempfile::TempDir::new().unwrap();
+        if let Some(rc) = zshrc {
+            std::fs::write(home.path().join(".zshrc"), rc).unwrap();
+        }
+        if with_omz_git {
+            std::fs::create_dir_all(home.path().join(".oh-my-zsh/plugins/git")).unwrap();
+        }
+        home
+    }
+
+    #[test]
+    fn alias_shadowing_flags_omz_git_plugin() {
+        let home = fake_home(Some("plugins=(git z)\nsource $ZSH/oh-my-zsh.sh\n"), true);
+        let check = check_shell_alias_shadowing(Some(home.path().to_path_buf()));
+        assert!(check.is_some(), "omz git plugin without unalias must warn");
+    }
+
+    #[test]
+    fn alias_shadowing_flags_explicit_alias() {
+        let home = fake_home(Some("alias gl='git pull'\n"), false);
+        assert!(check_shell_alias_shadowing(Some(home.path().to_path_buf())).is_some());
+    }
+
+    #[test]
+    fn alias_shadowing_silent_when_unaliased() {
+        let home = fake_home(
+            Some("plugins=(git z)\nsource $ZSH/oh-my-zsh.sh\nunalias gl 2>/dev/null\n"),
+            true,
+        );
+        assert!(check_shell_alias_shadowing(Some(home.path().to_path_buf())).is_none());
+    }
+
+    #[test]
+    fn alias_shadowing_silent_without_signals() {
+        let home = fake_home(Some("plugins=(z)\nexport EDITOR=vim\n"), false);
+        assert!(check_shell_alias_shadowing(Some(home.path().to_path_buf())).is_none());
+        let no_rc = fake_home(None, false);
+        assert!(check_shell_alias_shadowing(Some(no_rc.path().to_path_buf())).is_none());
+        assert!(check_shell_alias_shadowing(None).is_none());
+    }
 
     #[test]
     fn test_is_newer_minor_bump() {
