@@ -16,6 +16,14 @@ on:
 permissions:
   issues: write
 
+# Serialize alert runs: two near-simultaneous red-main events would otherwise
+# race the label/issue lookups and open duplicate ci-main-red issues (or 422
+# on createLabel). Never cancel a running alert; a superseded pending run is
+# fine — the newest event still lands its comment.
+concurrency:
+  group: main-red-alert
+  cancel-in-progress: false
+
 jobs:
   alert:
     name: Open issue on red main
