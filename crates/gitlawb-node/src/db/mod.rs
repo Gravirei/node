@@ -2267,7 +2267,7 @@ impl Db {
             .collect())
     }
 
-    /// Returns true if this object has a real local IPFS CID (not a legacy
+    /// Returns true when this object has a real local IPFS CID (not a legacy
     /// Pinata fallback where cid was set to pinata_cid for new rows).
     pub async fn has_ipfs_cid(&self, sha256_hex: &str) -> Result<bool> {
         let row = sqlx::query(
