@@ -152,11 +152,94 @@ pub fn ensure_marker_hidden_checked(repo_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Bounded variant of [`verify_recovery_prereqs`] for the push path: the
+/// same `core.logAllRefUpdates=always` plus hideRefs enablement, but
+/// through the configured git binary with a timeout so a hung config
+/// call cannot pin admission permits, the lease, and the repo write
+/// lock. Failures are surfaced; the caller treats them as
+/// warn-and-proceed (reconcile quarantines on a missing marker).
+pub async fn verify_recovery_prereqs_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    use tokio::process::Command as AsyncCommand;
+    async fn run_git(
+        git_bin: &str,
+        repo_path: &Path,
+        args: &[&str],
+        timeout: std::time::Duration,
+    ) -> Result<std::process::Output> {
+        let fut = async {
+            let mut cmd = AsyncCommand::new(git_bin);
+            cmd.kill_on_drop(true);
+            cmd.args(args).current_dir(repo_path).output().await
+        };
+        tokio::time::timeout(timeout, fut)
+            .await
+            .map_err(|_| anyhow::anyhow!("git {} timed out", args.join(" ")))?
+            .map_err(|e| anyhow::anyhow!("git {} spawn failed: {e:#}", args.join(" ")))
+    }
+    let get = run_git(
+        git_bin,
+        repo_path,
+        &["config", "--get", "core.logAllRefUpdates"],
+        timeout,
+    )
+    .await?;
+    let cur = String::from_utf8_lossy(&get.stdout).trim().to_string();
+    if cur != "always" {
+        let out = run_git(
+            git_bin,
+            repo_path,
+            &["config", "core.logAllRefUpdates", "always"],
+            timeout,
+        )
+        .await?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "enabling core.logAllRefUpdates=always failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+    for (key, value) in [
+        ("uploadpack.hideRefs", "refs/gitlawb/requests/"),
+        ("transfer.hideRefs", "refs/gitlawb/requests/"),
+    ] {
+        let current = run_git(git_bin, repo_path, &["config", "--get-all", key], timeout).await?;
+        let already = String::from_utf8_lossy(&current.stdout)
+            .lines()
+            .any(|l| l.trim() == value);
+        if !already {
+            let out = run_git(
+                git_bin,
+                repo_path,
+                &["config", "--add", key, value],
+                timeout,
+            )
+            .await?;
+            if !out.status.success() {
+                anyhow::bail!(
+                    "git config --add {key} failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Verify recovery prerequisites before the first durable intent or
 /// marker relies on them: `core.logAllRefUpdates=always` plus both
 /// hideRefs. Idempotently enables missing config; failures are
 /// surfaced so the handler refuses the push rather than discovering
 /// the gap only after an interrupted push.
+///
+/// Kept for tests/harnesses; the push path uses
+/// [`verify_recovery_prereqs_bounded`] so a hung config call cannot pin
+/// admission permits, the lease, and the write lock.
+#[allow(dead_code)]
 pub fn verify_recovery_prereqs(repo_path: &Path) -> Result<()> {
     let get = Command::new("git")
         .args(["config", "--get", "core.logAllRefUpdates"])
@@ -241,17 +324,6 @@ pub async fn delete_marker_bounded(
         Err(_) => return Ok(false),
     };
     Ok(out.status.success())
-}
-
-/// Delete a per-request marker ref. Best-effort; called on terminal
-/// retirement so SQL and Git-side retention cannot diverge.
-#[allow(dead_code)]
-pub fn delete_marker(repo_path: &Path, request_id: &str) {
-    let ref_name = format!("refs/gitlawb/requests/{request_id}");
-    let _ = Command::new("git")
-        .args(["update-ref", "-d", &ref_name, "--no-deref"])
-        .current_dir(repo_path)
-        .output();
 }
 
 /// One parsed reflog entry: the `<old> <new>` pair a single ref update recorded,

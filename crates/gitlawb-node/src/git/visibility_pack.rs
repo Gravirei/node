@@ -332,9 +332,16 @@ pub(crate) fn run_bounded_git(
 /// dereferences only one tag level and so misclassifies a tag-of-a-tag-of-a-
 /// commit as a non-commit.
 ///
-/// Internal metadata refs (refs/gitlawb/requests/*) are exempt from this check
-/// since they point to blobs for request marker purposes, not repository content.
-/// The visibility logic only cares about content refs, not internal metadata.
+/// Internal node-managed refs are exempt from this check since they point
+/// to blobs by design, not repository content: request markers
+/// (`refs/gitlawb/requests/*`, per-push marker blobs) and issue records
+/// (`refs/gitlawb/issues/*`, JSON blobs). The exemption lists exactly
+/// those two namespaces: any other `refs/gitlawb/*` ref or non-commit
+/// content ref still fails closed. Pushes into `refs/gitlawb/*` are
+/// refused at the push edge, so no new bypass ref can appear; the
+/// visibility logic only cares about content refs, not these two
+/// internal metadata namespaces whose binding and advertisement hiding
+/// are verified on the push path.
 fn assert_all_refs_are_commits(repo_path: &Path, git_bin: &str, deadline: Instant) -> Result<()> {
     let refs_out = run_bounded_git(
         git_bin,
@@ -353,10 +360,16 @@ fn assert_all_refs_are_commits(repo_path: &Path, git_bin: &str, deadline: Instan
         return Ok(());
     }
 
-    // Filter out internal metadata refs before checking object types
+    // Filter out only the two node-managed blob namespaces before checking
+    // object types. Scoped to `refs/gitlawb/requests/` and
+    // `refs/gitlawb/issues/` — not all of `refs/gitlawb/*` — so any
+    // other internal or content ref pointing at a non-commit still
+    // fails closed.
     let content_refs: Vec<&str> = refnames
         .iter()
-        .filter(|r| !r.starts_with("refs/gitlawb/"))
+        .filter(|r| {
+            !r.starts_with("refs/gitlawb/requests/") && !r.starts_with("refs/gitlawb/issues/")
+        })
         .copied()
         .collect();
 

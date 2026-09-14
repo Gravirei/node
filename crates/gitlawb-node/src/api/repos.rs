@@ -2123,6 +2123,125 @@ pub async fn git_receive_pack(
         }
     }
 
+    // ── Internal-namespace push gate ────────────────────────────────
+    // `refs/gitlawb/*` carries node-managed metadata (request markers as
+    // blobs under `requests/`, issue JSON blobs under `issues/`). A pusher
+    // must never write there: an attacker-controlled ref pointing at a blob
+    // or tree is skipped by `rev-list --all` yet still served, bypassing
+    // the fail-closed under-withhold check. Refuse before intent is
+    // written so a denied push leaves no rows behind.
+    if let Some(bad) = ref_updates
+        .iter()
+        .map(|u| u.ref_name.as_str())
+        .find(|r| r.starts_with("refs/gitlawb/"))
+    {
+        tracing::warn!(
+            repo = %name,
+            ref_name = %bad,
+            "refusing push into internal refs/gitlawb/ namespace"
+        );
+        return Err(AppError::Forbidden(
+            "pushing to refs/gitlawb/* is not allowed".into(),
+        ));
+    }
+
+    // #26 Split PR 1: durable intent for this push, written BEFORE the
+    // per-repo lease, admission permits, and the receive_pack call. Holding
+    // no lease and no admission permit across the DB transaction means a
+    // stalled statement cannot exhaust the push admission pool while the git
+    // resource the permit meters is idle. Bounded by a 30s timeout that
+    // refuses the push without running Git on incomplete intent; atomic
+    // parent+children so a refused pre-Git request cannot strand a
+    // payload-only parent.
+    let signature_header = headers
+        .get("signature")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let signature_input = headers
+        .get("signature-input")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let content_digest = headers
+        .get("content-digest")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    let request_bytes_hash = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&body);
+        h.finalize().to_vec()
+    };
+    let req_row = crate::db::ReceivePackRequest {
+        id: request_id.clone(),
+        repo_id: record.id.clone(),
+        pusher_did: auth.0.to_string(),
+        node_did: state.node_did.to_string(),
+        request_bytes: Vec::new(),
+        request_bytes_hash,
+        state: crate::db::request_state::RECEIVED.to_string(),
+        git_exit_ok: None,
+        parsed_report: None,
+        accepted_ordinal: None,
+        attempt_count: 0,
+        last_error: None,
+        next_attempt_at: None,
+        created_at: now.clone(),
+        completed_at: None,
+        signature_header: Some(signature_header.clone()),
+        signature_input: Some(signature_input.clone()),
+        content_digest: Some(content_digest.clone()),
+    };
+    let db_timeout = std::time::Duration::from_secs(30);
+    let db_result = tokio::time::timeout(
+        db_timeout,
+        state.db.insert_receive_pack_request_with_children(
+            &req_row,
+            &record.id,
+            &state.node_did.to_string(),
+            auth.0.as_str(),
+            &ref_updates,
+            &signature_header,
+            &signature_input,
+            &content_digest,
+        ),
+    )
+    .await;
+    // Both timeout expiry and DB error refuse the push before any lease or
+    // permit is held, so admission capacity is never pinned by this write.
+    // The insert is one transaction: timeout cancellation rolls back rather
+    // than leaving a partially committed intent. `db_result` is
+    // `Result<Result<..>, Elapsed>`: the outer `Err` is the timeout, the
+    // inner `Err` is a real insert failure — both must refuse without
+    // running git, or refs land with no request rows and nothing to
+    // reconcile them.
+    match db_result {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            tracing::error!(
+                err = %e,
+                repo = %name,
+                "failed to persist durable post-receive intent; refusing push"
+            );
+            return Err(AppError::Overloaded(
+                "durable intent write failed, retry shortly".into(),
+            ));
+        }
+        Err(_) => {
+            tracing::error!(
+                repo = %name,
+                "durable intent write timed out; refusing push"
+            );
+            return Err(AppError::Overloaded(
+                "durable intent write failed, retry shortly".into(),
+            ));
+        }
+    }
+
     // Per-repo in-process write lease (#174 U2/F3): SUPPLEMENTS the cluster-wide pg
     // advisory lock. Acquire it BEFORE acquire_write (one consistent order everywhere,
     // so the two serializers can never invert into a self-hang) so a second SAME-NODE
@@ -2172,17 +2291,34 @@ pub async fn git_receive_pack(
     // delete+recreate under the same slug while the bare repo on disk is reused,
     // and an id-keyed lease stops serializing exactly across that rotation.
     let repo_key = crate::state::repo_identity_key(&record.owner_did, &record.name);
-    let lease = state
+    // Intent is already durable at this point: every refusal below must
+    // terminalize it via `refuse_receive_pack_before_git` so no
+    // `received` + `prepared` aggregate strands (never purged, never
+    // promotable without git evidence, and poisoning its tuple via
+    // `has_competing_claimant`).
+    let lease = match state
         .repo_write_leases
         .acquire(&repo_key, lease_steal_after)
         .await
-        .ok_or_else(|| {
+    {
+        Some(l) => l,
+        None => {
             tracing::warn!(
                 repo = %name,
                 "repo write-lease waiter cap reached; shedding with 503"
             );
-            AppError::Overloaded("repo is busy with another push, retry shortly".into())
-        })?;
+            if let Err(e) = state
+                .db
+                .refuse_receive_pack_before_git(&request_id, "repo write-lease waiter cap reached")
+                .await
+            {
+                tracing::warn!(err = %e, request_id = %request_id, "pre-git refusal cleanup failed");
+            }
+            return Err(AppError::Overloaded(
+                "repo is busy with another push, retry shortly".into(),
+            ));
+        }
+    };
 
     // Admission permits are taken HERE, AFTER the per-repo lease and BEFORE acquire_write.
     // Ordering is the fix (#174 P2 DoS): the lease is a block-and-wait serializer, so a
@@ -2207,119 +2343,42 @@ pub async fn git_receive_pack(
     // pushes draw from the dedicated WRITE pool, separate from reads, and it is held for the
     // whole op (moved into the AdmissionGuard below).
     let caller_key = read_caller_key(&headers, peer, state.push_limiter_trust);
-    let _caller_permit = acquire_read_caller_permit(
+    let _caller_permit = match acquire_read_caller_permit(
         &state.git_write_per_caller,
         caller_key.as_deref(),
         name,
         "receive-pack",
-    )?;
-    let _permit = git_permit(&state.git_write_semaphore)?;
-
-    // #26 Split PR 1: durable intent for this push, written BEFORE
-    // the receive_pack call. Every ref update the pusher intends to
-    // land gets a `prepared` row carrying the verified pusher DID,
-    // the raw RFC 9421 signature header, signature-input, and
-    // content-digest that authorized the push, plus the request id.
-    //
-    // The state is flipped to `applied` (Ok) or `cancelled` (Err)
-    // AFTER receive_pack returns. The drain reads only `applied`
-    // rows, so a row that never gets the post-Ok flip stays in
-    // `prepared` (handler crash / dropped future) or `cancelled`
-    // (receive_pack Err) and is never promoted to a push event, a
-    // certificate, or an anchor.
-    //
-    // Moved BEFORE admission guard creation to prevent unbounded DB
-    // writes from exhausting the admission pool. The write is bounded
-    // by a timeout that releases permits on expiry.
-    let signature_header = headers
-        .get("signature")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let signature_input = headers
-        .get("signature-input")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let content_digest = headers
-        .get("content-digest")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    // #26 Split PR 1 — request-level intent row. Written BEFORE
-    // `smart_http::receive_pack` runs, in state `received`, carrying
-    // the raw HTTP body the handler will hand to git and the SHA-256
-    // of it. The recovery drain (step 3) and the on-disk reconcile
-    // (already on this branch) both key off this row; a node crash
-    // between this write and the outcomes commit leaves the row in
-    // `received` and its children in `prepared`, which is the
-    // recoverable state.
-    let request_id = uuid::Uuid::new_v4().to_string();
-    let now = Utc::now().to_rfc3339();
-    let request_bytes_hash = {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        h.update(&body);
-        h.finalize().to_vec()
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            if let Err(ce) = state
+                .db
+                .refuse_receive_pack_before_git(&request_id, "admission per-source cap reached")
+                .await
+            {
+                tracing::warn!(err = %ce, request_id = %request_id, "pre-git refusal cleanup failed");
+            }
+            return Err(e);
+        }
     };
-    // Durable intent is minimal: only the digest is consumed by
-    // recovery (marker correlation). The raw pack is never replayed
-    // by this split, so it is not copied into the shared database —
-    // every request lookup would otherwise re-materialize up to the
-    // route's 2 GiB body as BYTEA/WAL/backup amplification.
-    let req_row = crate::db::ReceivePackRequest {
-        id: request_id.clone(),
-        repo_id: record.id.clone(),
-        pusher_did: auth.0.to_string(),
-        node_did: state.node_did.to_string(),
-        request_bytes: Vec::new(),
-        request_bytes_hash,
-        state: crate::db::request_state::RECEIVED.to_string(),
-        git_exit_ok: None,
-        parsed_report: None,
-        accepted_ordinal: None,
-        attempt_count: 0,
-        last_error: None,
-        next_attempt_at: None,
-        created_at: now.clone(),
-        completed_at: None,
-        signature_header: Some(signature_header.clone()),
-        signature_input: Some(signature_input.clone()),
-        content_digest: Some(content_digest.clone()),
+    let _permit = match git_permit(&state.git_write_semaphore) {
+        Ok(p) => p,
+        Err(e) => {
+            if let Err(ce) = state
+                .db
+                .refuse_receive_pack_before_git(&request_id, "git write pool saturated")
+                .await
+            {
+                tracing::warn!(err = %ce, request_id = %request_id, "pre-git refusal cleanup failed");
+            }
+            return Err(e);
+        }
     };
-    // Atomic parent+children: either the full intent exists or none
-    // of it does, so a refused pre-Git request cannot strand a
-    // payload-only parent. Bounded by timeout to prevent admission
-    // pool exhaustion on slow DB operations.
-    let db_timeout = std::time::Duration::from_secs(30);
-    let db_result = tokio::time::timeout(
-        db_timeout,
-        state.db.insert_receive_pack_request_with_children(
-            &req_row,
-            &record.id,
-            &state.node_did.to_string(),
-            auth.0.as_str(),
-            &ref_updates,
-            &signature_header,
-            &signature_input,
-            &content_digest,
-        ),
-    )
-    .await;
 
-    if let Err(e) = db_result {
-        // Log the error and refuse push - timeout vs other errors doesn't matter
-        // for admission capacity preservation, both release the permit
-        tracing::error!(
-            err = %e,
-            repo = %name,
-            "failed to persist durable post-receive intent; refusing push"
-        );
-        return Err(AppError::Overloaded(
-            "durable intent write failed, retry shortly".into(),
-        ));
-    }
-
+    // Intent row and its digest comment live above (pre-lease): durable intent
+    // is minimal — only the digest is consumed by recovery (marker
+    // correlation). The raw pack is never replayed by this split, so it is
+    // not copied into the shared database.
     tracing::debug!(repo = %name, "acquiring write lock");
     // Bound the write acquire under `git_acquire_timeout_secs`. acquire_write's
     // advisory-lock loop already caps at ~60s, but its per-iteration
@@ -2334,18 +2393,39 @@ pub async fn git_receive_pack(
     // permit is a handler local here (moved into the AdmissionGuard only after this),
     // so the early return on timeout drops it and frees the slot; shed a bounded 503.
     let acquire_deadline = std::time::Duration::from_secs(state.config.git_acquire_timeout_secs);
-    let guard = tokio::time::timeout(
+    let acquire_raw = tokio::time::timeout(
         acquire_deadline,
         state
             .repo_store
             .acquire_write(&record.owner_did, &record.name),
     )
-    .await
-    .map_err(|_elapsed| {
-        tracing::warn!(repo = %name, "acquire_write timed out; shedding with 503");
-        AppError::Overloaded("git service acquisition timed out, retry shortly".into())
-    })?
-    .map_err(|e| acquire_write_app_error(&e, name))?;
+    .await;
+    let guard = match acquire_raw {
+        Err(_) => {
+            tracing::warn!(repo = %name, "acquire_write timed out; shedding with 503");
+            if let Err(e) = state
+                .db
+                .refuse_receive_pack_before_git(&request_id, "acquire_write timed out")
+                .await
+            {
+                tracing::warn!(err = %e, request_id = %request_id, "pre-git refusal cleanup failed");
+            }
+            return Err(AppError::Overloaded(
+                "git service acquisition timed out, retry shortly".into(),
+            ));
+        }
+        Ok(Err(e)) => {
+            if let Err(ce) = state
+                .db
+                .refuse_receive_pack_before_git(&request_id, "acquire_write failed")
+                .await
+            {
+                tracing::warn!(err = %ce, request_id = %request_id, "pre-git refusal cleanup failed");
+            }
+            return Err(acquire_write_app_error(&e, name));
+        }
+        Ok(Ok(g)) => g,
+    };
     let disk_path = guard.path().to_path_buf();
     tracing::debug!(repo = %name, path = %disk_path.display(), "running git receive-pack");
     let body_len = body.len();
@@ -2358,7 +2438,17 @@ pub async fn git_receive_pack(
     // reconcile already fails closed (leaves rows prepared for
     // attended recovery) when a reflog is missing. A failed upgrade
     // only degrades automatic recovery to attended recovery.
-    if let Err(e) = crate::git::store::verify_recovery_prereqs(&disk_path) {
+    // Bounded through the configured git binary: the unbounded
+    // synchronous variant would run several `git config` children with
+    // no timeout while holding both admission permits, the lease, and
+    // the repo write lock.
+    if let Err(e) = crate::git::store::verify_recovery_prereqs_bounded(
+        &state.git_bin,
+        &disk_path,
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    {
         tracing::warn!(err = %e, repo = %name, "recovery prereqs unavailable; proceeding with degraded automatic recovery");
     }
     // Move both admission permits into the guard so they release only after the spawned

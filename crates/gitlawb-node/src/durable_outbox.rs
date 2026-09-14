@@ -545,9 +545,11 @@ async fn reconcile_prepared_page(
 /// `outcomes_committed`.
 ///
 /// Idempotent: if the parent is already `outcomes_committed` (because
-/// children spanned multiple pages), updates the parsed_report with the
-/// superset of all applied children to ensure no applied child is left
-/// without certificate/anchor handoff.
+/// children spanned multiple pages), merges the newly applied children into
+/// the stored `parsed_report` so no applied child is left without
+/// certificate/anchor handoff. The stored `accepted_ordinal` (the request's
+/// event key) is never rewritten by a later page; explicit Git rejections
+/// stay cancelled and unproved siblings stay unresolved.
 async fn promote_request_aggregate_if_proved(
     state: &AppState,
     request_id: &str,
@@ -556,12 +558,17 @@ async fn promote_request_aggregate_if_proved(
         Some(r) => r,
         None => return Ok(false),
     };
-    // Allow updating if already outcomes_committed to handle page-crossing children
+    // Allow updating if already outcomes_committed OR effects_pending to
+    // handle page-crossing children: the due worker may have claimed the
+    // parent (effects_pending) while a later reconcile page still holds an
+    // applied child. Excluding effects_pending here would leave that child
+    // `applied` forever — never in the report, pinning Retry.
     if !matches!(
         req.state.as_str(),
         crate::db::request_state::RECEIVED
             | crate::db::request_state::REJECTED_AT_GIT
             | crate::db::request_state::OUTCOMES_COMMITTED
+            | crate::db::request_state::EFFECTS_PENDING
     ) {
         return Ok(false);
     }
@@ -979,20 +986,11 @@ pub async fn purge_request_queue(
         .purge_terminal_batch(&older_than_iso, per_pass_limit)
         .await?;
     let requests_deleted = purged.len() as u64;
-    // Queue marker deletions through the bounded tombstone worker.
-    // The synchronous delete_marker call is removed from production
-    // to prevent unblocking Git operations from blocking the daily
-    // lifecycle task. Failures retain the tombstone for the next tick.
-    for (request_id, repo_id) in &purged {
-        if let Err(e) = db.enqueue_marker_cleanup(request_id, repo_id).await {
-            tracing::warn!(
-                err = %e,
-                request_id = %request_id,
-                repo_id = %repo_id,
-                "queue lifecycle: failed to queue marker cleanup; will retry on next tick"
-            );
-        }
-    }
+    // Marker tombstones are enqueued atomically inside `purge_terminal_batch`
+    // (same txn as SQL retirement) and drained by the bounded
+    // `drain_marker_cleanup_queue` worker. No synchronous `git update-ref -d`
+    // runs on this path, so a stalled Git process cannot block the daily
+    // lifecycle task; failures retain the tombstone for the next tick.
 
     if requests_deleted > 0 || children_deleted > 0 {
         tracing::info!(
@@ -1279,8 +1277,11 @@ async fn run_effect_bundle(
         let owner_short = crate::db::normalize_owner_key(&repo.owner_did);
         let clone_url = format!("{}/{}/{}.git", base_url, owner_short, repo.name);
         for child in accepted_children {
-            // Claim webhook delivery synchronously before spawning HTTP POST
-            let claimed_hook_ids = crate::webhooks::claim_webhook_delivery_before_spawn(
+            // Claim webhook delivery synchronously before spawning HTTP POST.
+            // `None` means the hook list itself was unreadable (transient
+            // DB error): fall back to legacy best-effort send rather than
+            // dropping the delivery while children are still deleted.
+            let claimed_opt = crate::webhooks::claim_webhook_delivery_before_spawn(
                 state.db.clone(),
                 &repo.id,
                 "push",
@@ -1288,6 +1289,38 @@ async fn run_effect_bundle(
                 Some(&child.ref_name),
             )
             .await;
+
+            let claimed_hook_ids = match claimed_opt {
+                Some(ids) => ids,
+                None => {
+                    let payload = serde_json::json!({
+                        "ref": child.ref_name,
+                        "before": child.old_sha,
+                        "after": child.new_sha,
+                        "created": child.old_sha == "0000000000000000000000000000000000000000",
+                        "forced": false,
+                        "pusher": {
+                            "did": req.pusher_did,
+                        },
+                        "repository": {
+                            "id": repo.id,
+                            "name": repo.name,
+                            "owner_did": repo.owner_did,
+                            "clone_url": clone_url,
+                        },
+                    });
+                    crate::webhooks::fire_event_occurrence(
+                        state.db.clone(),
+                        state.http_client.clone(),
+                        &repo.id,
+                        "push",
+                        payload,
+                        Some(&req.id),
+                        Some(&child.ref_name),
+                    );
+                    continue;
+                }
+            };
 
             if !claimed_hook_ids.is_empty() {
                 let payload = serde_json::json!({
@@ -4851,6 +4884,232 @@ mod drain_tests {
             still_prepared[0].state,
             pending_state::PREPARED,
             "no parent → no quarantine; the child waits for human-attended recovery"
+        );
+    }
+
+    /// Pre-git refusal terminalizes the intent aggregate. Models the
+    /// `[intent written … receive_pack)` seam: intent is durable, then
+    /// admission (lease / permits / acquire_write) sheds the push before
+    /// git ever runs. The aggregate must be terminal and purge-eligible —
+    /// never stranded `received` + `prepared` (never purged, never
+    /// promotable, poisoning its tuple via `has_competing_claimant`).
+    #[sqlx::test]
+    async fn pre_git_refusal_terminalizes_intent_aggregate(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let now = chrono::Utc::now().to_rfc3339();
+        let req = crate::db::ReceivePackRequest {
+            id: "req-pre-git-refusal".to_string(),
+            repo_id: "repo-pre-git".to_string(),
+            pusher_did: "did:key:z6pusher".to_string(),
+            node_did: state.node_did.to_string(),
+            request_bytes: Vec::new(),
+            request_bytes_hash: vec![7u8; 32],
+            state: request_state::RECEIVED.to_string(),
+            git_exit_ok: None,
+            parsed_report: None,
+            accepted_ordinal: None,
+            attempt_count: 0,
+            last_error: None,
+            next_attempt_at: None,
+            created_at: now.clone(),
+            completed_at: None,
+            signature_header: Some("sig".to_string()),
+            signature_input: Some("sig-input".to_string()),
+            content_digest: Some("digest".to_string()),
+        };
+        let updates = vec![
+            crate::api::repos::RefUpdate {
+                old_sha: "0".repeat(40),
+                new_sha: "1".repeat(40),
+                ref_name: "refs/heads/main".to_string(),
+            },
+            crate::api::repos::RefUpdate {
+                old_sha: "0".repeat(40),
+                new_sha: "2".repeat(40),
+                ref_name: "refs/heads/feat".to_string(),
+            },
+        ];
+        state
+            .db
+            .insert_receive_pack_request_with_children(
+                &req,
+                "repo-pre-git",
+                &state.node_did.to_string(),
+                "did:key:z6pusher",
+                &updates,
+                "sig",
+                "sig-input",
+                "digest",
+            )
+            .await
+            .unwrap();
+
+        // The shed: git never ran.
+        state
+            .db
+            .refuse_receive_pack_before_git("req-pre-git-refusal", "acquire_write timed out")
+            .await
+            .unwrap();
+
+        let parent = state
+            .db
+            .get_receive_pack_request("req-pre-git-refusal")
+            .await
+            .unwrap()
+            .expect("parent exists");
+        assert_eq!(
+            parent.state,
+            request_state::REJECTED_AT_GIT,
+            "refused parent is terminal"
+        );
+        assert!(
+            parent.completed_at.is_some(),
+            "refused parent carries completed_at so retention can purge it"
+        );
+        let children = state
+            .db
+            .list_pending_ref_transitions_for_request("req-pre-git-refusal")
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 2, "both children exist");
+        for c in &children {
+            assert_eq!(
+                c.state,
+                pending_state::CANCELLED,
+                "refused child {} is cancelled, never prepared",
+                c.ref_name
+            );
+        }
+        let proof = state
+            .db
+            .get_request_proof("req-pre-git-refusal")
+            .await
+            .unwrap()
+            .expect("proof row exists");
+        assert!(
+            proof.acked_at.is_some(),
+            "refused proof is acked so purge is not blocked"
+        );
+    }
+
+    /// Re-promotion merges later-page children without rewriting the
+    /// consumed event key. A mid-bundle crash deletes children once
+    /// their effects land, so recomputing the ordinal as min-over-survivors
+    /// would shift `push_event_id_for(request_id, ordinal)` and double-count
+    /// the push. The stored `accepted_ordinal` is preserved; the report
+    /// widens to the superset.
+    #[sqlx::test]
+    async fn repromotion_preserves_accepted_ordinal_and_unions_report(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let now = chrono::Utc::now().to_rfc3339();
+        let req = crate::db::ReceivePackRequest {
+            id: "req-repromote".to_string(),
+            repo_id: "repo-repromote".to_string(),
+            pusher_did: "did:key:z6pusher".to_string(),
+            node_did: state.node_did.to_string(),
+            request_bytes: Vec::new(),
+            request_bytes_hash: vec![9u8; 32],
+            state: request_state::RECEIVED.to_string(),
+            git_exit_ok: None,
+            parsed_report: None,
+            accepted_ordinal: None,
+            attempt_count: 0,
+            last_error: None,
+            next_attempt_at: None,
+            created_at: now.clone(),
+            completed_at: None,
+            signature_header: Some("sig".to_string()),
+            signature_input: Some("sig-input".to_string()),
+            content_digest: Some("digest".to_string()),
+        };
+        let updates = vec![
+            crate::api::repos::RefUpdate {
+                old_sha: "0".repeat(40),
+                new_sha: "1".repeat(40),
+                ref_name: "refs/heads/a".to_string(),
+            },
+            crate::api::repos::RefUpdate {
+                old_sha: "0".repeat(40),
+                new_sha: "2".repeat(40),
+                ref_name: "refs/heads/b".to_string(),
+            },
+        ];
+        state
+            .db
+            .insert_receive_pack_request_with_children(
+                &req,
+                "repo-repromote",
+                &state.node_did.to_string(),
+                "did:key:z6pusher",
+                &updates,
+                "sig",
+                "sig-input",
+                "digest",
+            )
+            .await
+            .unwrap();
+        // First page promotes child A only (as if B sits on a later page).
+        let first = serde_json::json!({
+            "unpack_ok": true,
+            "ref_results": [{"ref_name": "refs/heads/a", "ok": true}],
+            "synthetic": "reconciled",
+        });
+        let n = state
+            .db
+            .promote_reconciled_request_outcomes_idempotent("req-repromote", true, &first, Some(0))
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "first promotion flips received → outcomes_committed");
+        // Due worker claims the parent between pages.
+        let next = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+        state
+            .db
+            .mark_request_effects_pending("req-repromote", &next, "claimed")
+            .await
+            .unwrap();
+        // Later page merges child B into the claimed parent.
+        let second = serde_json::json!({
+            "unpack_ok": true,
+            "ref_results": [{"ref_name": "refs/heads/b", "ok": true}],
+            "synthetic": "reconciled",
+        });
+        let m = state
+            .db
+            .promote_reconciled_request_outcomes_idempotent("req-repromote", true, &second, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(m, 1, "later page merges into effects_pending parent");
+        let after = state
+            .db
+            .get_receive_pack_request("req-repromote")
+            .await
+            .unwrap()
+            .expect("parent exists");
+        assert_eq!(
+            after.state,
+            request_state::EFFECTS_PENDING,
+            "merge never moves state; the claim survives"
+        );
+        assert_eq!(
+            after.accepted_ordinal,
+            Some(0),
+            "stored ordinal is preserved so the event id never rewrites"
+        );
+        let report = after.parsed_report.expect("report stored");
+        let names: std::collections::HashSet<String> = report
+            .get("ref_results")
+            .and_then(|v| v.as_array())
+            .expect("ref_results array")
+            .iter()
+            .filter_map(|e| {
+                e.get("ref_name")
+                    .and_then(|n| n.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        assert!(
+            names.contains("refs/heads/a") && names.contains("refs/heads/b"),
+            "report is the superset of both pages, got {names:?}"
         );
     }
 }

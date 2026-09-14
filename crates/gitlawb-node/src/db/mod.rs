@@ -3411,6 +3411,54 @@ impl Db {
         Ok(res.rows_affected())
     }
 
+    /// Pre-git refusal after durable intent was written: atomically move the
+    /// parent `received` → `rejected_at_git` (terminal, purge-eligible),
+    /// cancel all `prepared` children, and ack the proof row. Every early
+    /// return between intent insert and `receive_pack` must call this so a
+    /// shed push never strands `received` + `prepared` rows the purge path
+    /// never touches and reconcile can never promote (no git evidence).
+    pub async fn refuse_receive_pack_before_git(
+        &self,
+        request_id: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"UPDATE receive_pack_requests
+               SET state = $2, git_exit_ok = FALSE, last_error = $3,
+                   completed_at = $4
+               WHERE id = $1 AND state = $5"#,
+        )
+        .bind(request_id)
+        .bind(request_state::REJECTED_AT_GIT)
+        .bind(reason)
+        .bind(&now)
+        .bind(request_state::RECEIVED)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"UPDATE pending_ref_transitions
+               SET state = $2, cancelled_at = $3
+               WHERE request_id = $1 AND state = $4"#,
+        )
+        .bind(request_id)
+        .bind(pending_state::CANCELLED)
+        .bind(&now)
+        .bind(pending_state::PREPARED)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"UPDATE request_proofs SET acked_at = $2 WHERE request_id = $1 AND acked_at IS NULL"#,
+        )
+        .bind(request_id)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// #26 Split PR 1 step 5 — flip any non-terminal state to
     /// `quarantined`. The reconcile calls this when the marker
     /// ref is missing or hash-mismatched; the drain's
@@ -3753,11 +3801,13 @@ impl Db {
         Ok(res.rows_affected())
     }
 
-    /// Idempotent version of promote_reconciled_request_outcomes that updates
-    /// the parsed_report even if the parent is already outcomes_committed.
-    /// This handles the case where children span multiple reconciliation pages:
-    /// the first page promotes with a partial set, later pages update with the
-    /// full superset to ensure all applied children get certificate/anchor handoff.
+    /// Idempotent version of promote_reconciled_request_outcomes that merges
+    /// later-page children into an already-executable parent without changing
+    /// the request's event identity. The first promotion sets both the report
+    /// and `accepted_ordinal` (min applied ordinal → push event id). Later
+    /// pages only widen `parsed_report.ref_results` to the superset; the
+    /// stored `accepted_ordinal` is preserved so the `(request_id,
+    /// accepted_ordinal)` event key never rewrites after effects have used it.
     pub async fn promote_reconciled_request_outcomes_idempotent(
         &self,
         request_id: &str,
@@ -3782,23 +3832,82 @@ impl Db {
         .execute(&self.pool)
         .await?;
 
-        // If no rows affected, parent is already outcomes_committed - update the report
+        // Parent already executable: merge new refs into the stored report,
+        // preserving the stored accepted_ordinal that existing effects key on.
+        // Covers both `outcomes_committed` and `effects_pending`: the due
+        // worker may claim the parent between reconcile pages, and a
+        // later-page child must still join the report rather than strand
+        // as `applied` outside it. State is never moved here — only the
+        // report widens.
         if res.rows_affected() == 0 {
-            let update_res = sqlx::query(
-                r#"UPDATE receive_pack_requests
-                   SET parsed_report = $3, accepted_ordinal = $4
-                   WHERE id = $1 AND state = $2"#,
+            let existing: Option<(serde_json::Value, Option<i32>, String)> = sqlx::query_as(
+                r#"SELECT parsed_report, accepted_ordinal, state FROM receive_pack_requests
+                   WHERE id = $1 AND state IN ($2, $3)"#,
             )
             .bind(request_id)
             .bind(request_state::OUTCOMES_COMMITTED)
-            .bind(parsed_report)
-            .bind(accepted_ordinal)
+            .bind(request_state::EFFECTS_PENDING)
+            .fetch_optional(&self.pool)
+            .await?;
+            let Some((stored_report, stored_ordinal, stored_state)) = existing else {
+                return Ok(0);
+            };
+            let merged = Self::merge_reconciled_reports(&stored_report, parsed_report);
+            // Nothing new: no write, no false success signal.
+            if merged == stored_report {
+                return Ok(0);
+            }
+            let update_res = sqlx::query(
+                r#"UPDATE receive_pack_requests
+                   SET parsed_report = $3
+                   WHERE id = $1 AND state = $2"#,
+            )
+            .bind(request_id)
+            .bind(&stored_state)
+            .bind(&merged)
             .execute(&self.pool)
             .await?;
+            // accepted_ordinal intentionally untouched: the stored value
+            // (captured above as stored_ordinal) remains the event key.
+            let _ = stored_ordinal;
             Ok(update_res.rows_affected())
         } else {
             Ok(res.rows_affected())
         }
+    }
+
+    /// Union `incoming.ref_results` (ok:true entries) into `stored`, keeping
+    /// stored entries otherwise intact. Both reports carry
+    /// `unpack_ok:true` and `synthetic:"reconciled"`; the merged report does too.
+    fn merge_reconciled_reports(
+        stored: &serde_json::Value,
+        incoming: &serde_json::Value,
+    ) -> serde_json::Value {
+        let mut names: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
+        for src in [stored, incoming] {
+            if let Some(arr) = src.get("ref_results").and_then(|v| v.as_array()) {
+                for entry in arr {
+                    if let Some(name) = entry.get("ref_name").and_then(|n| n.as_str()) {
+                        let ok = entry.get("ok").and_then(|o| o.as_bool()).unwrap_or(false);
+                        // Only reconciled ok:true entries ever enter; an explicit
+                        // false never overrides a stored true.
+                        if ok {
+                            names.insert(name.to_string(), true);
+                        } else {
+                            names.entry(name.to_string()).or_insert(false);
+                        }
+                    }
+                }
+            }
+        }
+        serde_json::json!({
+            "unpack_ok": true,
+            "ref_results": names.iter().map(|(name, ok)| serde_json::json!({
+                "ref_name": name,
+                "ok": ok,
+            })).collect::<Vec<_>>(),
+            "synthetic": "reconciled",
+        })
     }
 
     /// Requests stuck with applied children but a non-executable
@@ -4741,7 +4850,9 @@ impl Db {
         Ok(res.rows_affected())
     }
 
-    /// Enqueue a marker tombstone. Idempotent.
+    /// Enqueue a marker tombstone. Idempotent. Used by tests/direct calls;
+    /// production purge enqueues atomically inside `purge_terminal_batch`.
+    #[allow(dead_code)]
     pub async fn enqueue_marker_cleanup(&self, request_id: &str, repo_id: &str) -> Result<()> {
         sqlx::query(
             r#"INSERT INTO marker_cleanup_queue (request_id, repo_id, attempts, created_at, last_error)

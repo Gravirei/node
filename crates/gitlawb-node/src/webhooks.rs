@@ -111,7 +111,11 @@ pub fn fire_event_occurrence_with_claimed_hooks(
 }
 
 /// Claim webhook delivery before spawning HTTP POST.
-/// Returns the list of hook IDs that were successfully claimed.
+/// Returns `Some(hook ids)` successfully claimed, or `None` when the hook
+/// list itself could not be read (transient DB error, unknown membership).
+/// A `None` caller must fall back to best-effort send rather than dropping
+/// the delivery: children are still deleted downstream, so an empty claim
+/// set on DB error would lose the webhook permanently.
 /// This synchronous claim phase must be awaited before child deletion to prevent
 /// permanent webhook loss on crash between deletion and claim.
 pub async fn claim_webhook_delivery_before_spawn(
@@ -120,7 +124,7 @@ pub async fn claim_webhook_delivery_before_spawn(
     event: &str,
     request_id: Option<&str>,
     ref_name: Option<&str>,
-) -> Vec<String> {
+) -> Option<Vec<String>> {
     let mut claimed_hooks = Vec::new();
 
     // Only claim when we have occurrence context (request_id + ref_name)
@@ -129,7 +133,7 @@ pub async fn claim_webhook_delivery_before_spawn(
             Ok(h) => h,
             Err(e) => {
                 tracing::warn!(err = %e, "failed to list webhooks for event {event}");
-                return claimed_hooks;
+                return None;
             }
         };
 
@@ -141,12 +145,19 @@ pub async fn claim_webhook_delivery_before_spawn(
             {
                 Ok(true) => claimed_hooks.push(hook.id),
                 Ok(false) => continue, // Already claimed
-                Err(_) => continue,
+                // Send fallback (legacy best-effort): a transient claim
+                // error must not drop the delivery while children are
+                // still deleted. The in-task claimer this replaced sent
+                // anyway on claim error; keep that here.
+                Err(e) => {
+                    tracing::warn!(err = %e, hook_id = %hook.id, "webhook claim failed; sending anyway");
+                    claimed_hooks.push(hook.id);
+                }
             }
         }
     }
 
-    claimed_hooks
+    Some(claimed_hooks)
 }
 
 #[allow(clippy::too_many_arguments)]
