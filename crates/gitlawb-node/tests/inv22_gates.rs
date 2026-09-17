@@ -908,7 +908,9 @@ fn issue_26_namespace_gate_and_refusal_wiring() {
     // gate works, which the P1 findings above covered (non-UTF-8 line, bare name,
     // refusal wiring). This check verifies the exemption narrowing landed.
     assert!(
-        vis.contains(r#"!r.starts_with("refs/gitlawb/requests/") && !r.starts_with("refs/gitlawb/issues/")"#),
+        vis.contains(
+            r#"!r.starts_with("refs/gitlawb/requests/") && !r.starts_with("refs/gitlawb/issues/")"#
+        ),
         "P2 gate missing: the visibility exemption must be narrowed to requests/ and \
          issues/ only (the push gate is the premise; any other refs/gitlawb/* ref is \
          denied on push and must fail closed in the pack path)"
