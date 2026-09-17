@@ -2068,7 +2068,7 @@ pub async fn git_receive_pack(
     }
 
     // Parse ref updates from pkt-line body before handing to git
-    let ref_updates = parse_ref_updates(&body);
+    let ref_updates = parse_ref_updates(&body)?;
     tracing::debug!(
         ref_count = ref_updates.len(),
         "parsed ref updates from pack"
@@ -2130,10 +2130,14 @@ pub async fn git_receive_pack(
     // or tree is skipped by `rev-list --all` yet still served, bypassing
     // the fail-closed under-withhold check. Refuse before intent is
     // written so a denied push leaves no rows behind.
+    //
+    // Also match the bare `refs/gitlawb` name (no trailing slash): a push
+    // of that exact ref would not be caught by `starts_with("refs/gitlawb/")`
+    // and could land on a repo with no internal refs yet, bypassing the gate.
     if let Some(bad) = ref_updates
         .iter()
         .map(|u| u.ref_name.as_str())
-        .find(|r| r.starts_with("refs/gitlawb/"))
+        .find(|r| *r == "refs/gitlawb" || r.starts_with("refs/gitlawb/"))
     {
         tracing::warn!(
             repo = %name,
@@ -2296,6 +2300,12 @@ pub async fn git_receive_pack(
     // `received` + `prepared` aggregate strands (never purged, never
     // promotable without git evidence, and poisoning its tuple via
     // `has_competing_claimant`).
+    //
+    // Drop-guard: if the handler exits (early return, cancellation, panic)
+    // between here and the `receive_pack_raw_with_reflog` call below, the
+    // guard terminalizes the intent on drop so it never strands in
+    // `received` state.
+    let _intent_guard = IntentDropGuard::new(state.db.clone(), request_id.clone());
     let lease = match state
         .repo_write_leases
         .acquire(&repo_key, lease_steal_after)
@@ -2528,6 +2538,10 @@ pub async fn git_receive_pack(
     // still relies on marker + tuple/timestamp + history guards. Marker
     // namespace hiding was verified above by `verify_recovery_prereqs`.
     let reflog_action = format!("gitlawb-request:{request_id}");
+    // Disarm the drop-guard: git is about to start, so a dropped future
+    // from here forward is a mid-git disconnect (not a pre-git shed), and
+    // the mark_uncertain path below handles that case.
+    _intent_guard.disarm();
     let (receive_raw, exit_ok) = match smart_http::receive_pack_raw_with_reflog(
         &state.git_bin,
         &disk_path,
@@ -3818,6 +3832,60 @@ pub async fn get_icaptcha_proof(
     })))
 }
 
+// ── Drop guard for stranded intents ──────────────────────────────────────
+
+/// Drop-guard that terminalizes a durable intent if the handler exits (via
+/// early return, cancellation, or panic) after the intent insert but before
+/// `receive_pack` runs. A dropped future between the insert and git leaves a
+/// `received` parent + `prepared` children that nothing retires: purge
+/// excludes `received` even at 8 days, the drain skips it, and reconcile
+/// cannot prove a landing git never ran. The stranded children also poison
+/// `has_competing_claimant` checks. Disarm this guard once git starts.
+struct IntentDropGuard {
+    db: std::sync::Arc<crate::db::Db>,
+    request_id: String,
+    armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl IntentDropGuard {
+    fn new(db: std::sync::Arc<crate::db::Db>, request_id: String) -> Self {
+        Self {
+            db,
+            request_id,
+            armed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }
+    }
+
+    fn disarm(&self) {
+        self.armed
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl Drop for IntentDropGuard {
+    fn drop(&mut self) {
+        if self.armed.load(std::sync::atomic::Ordering::Acquire) {
+            let db = self.db.clone();
+            let request_id = self.request_id.clone();
+            tokio::spawn(async move {
+                if let Err(e) = db
+                    .refuse_receive_pack_before_git(
+                        &request_id,
+                        "handler dropped before git started",
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        err = %e,
+                        request_id = %request_id,
+                        "drop-guard cleanup failed"
+                    );
+                }
+            });
+        }
+    }
+}
+
 // ── Pkt-line parsing ──────────────────────────────────────────────────────
 
 /// `Clone` so `git_receive_pack` can hand the parsed updates to the detached
@@ -3832,7 +3900,13 @@ pub(crate) struct RefUpdate {
 
 /// Parse git receive-pack pkt-line ref updates from the request body.
 /// Format per line: `<40-hex-old> <40-hex-new> <refname>[NUL capabilities]\n`
-fn parse_ref_updates(body: &[u8]) -> Vec<RefUpdate> {
+///
+/// Returns `Err` if any command line in the ref-update section is not valid
+/// UTF-8. Silently skipping non-UTF-8 lines would allow a pusher to plant
+/// refs/gitlawb/* refs (bytes ≥ 0x80 are accepted by git but invisible to
+/// the namespace gate and visibility_pack exemption), so the whole push must
+/// be refused instead.
+fn parse_ref_updates(body: &[u8]) -> Result<Vec<RefUpdate>> {
     let mut updates = Vec::new();
     let mut pos = 0;
 
@@ -3858,9 +3932,18 @@ fn parse_ref_updates(body: &[u8]) -> Vec<RefUpdate> {
         let data = &body[pos + 4..pos + len];
         pos += len;
 
+        // Non-UTF-8 ref-update lines must be refused, not skipped. Git accepts
+        // refnames with bytes ≥ 0x80 (e.g. \xff-prefixed), so a skipped line
+        // bypasses the refs/gitlawb namespace gate below and lands a blob ref
+        // that is invisible to parse_ref_updates yet still served by
+        // visibility_pack. Reject the entire push so no such ref reaches git.
         let line = match std::str::from_utf8(data) {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(_) => {
+                return Err(AppError::BadRequest(
+                    "ref-update line is not valid UTF-8; push refused".into(),
+                ))
+            }
         };
 
         // Strip capabilities (after NUL) and trailing newline
@@ -3880,7 +3963,7 @@ fn parse_ref_updates(body: &[u8]) -> Vec<RefUpdate> {
         }
     }
 
-    updates
+    Ok(updates)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────

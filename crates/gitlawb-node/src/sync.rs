@@ -731,6 +731,48 @@ async fn fetch_repo(local_path: &Path, remote_url: &str, mode: MirrorMode) -> an
 
     git_run(&["-C", local_str, "remote", "set-url", "origin", remote_url]).await?;
 
+    // Guard against importing non-exempt refs/gitlawb/* refs from the origin.
+    // The push gate (repos.rs) prevents creating them locally, but mirrors
+    // `clone --mirror` then `fetch +refs/*:refs/*` via the stored refspec.
+    // Pre-gate nodes or the non-UTF-8 hole (fixed this PR) could have planted
+    // a `refs/gitlawb/<other>` ref pointing at a blob. That ref was exempt
+    // before the narrowing (visibility_pack.rs) but now fails
+    // `assert_all_refs_are_commits` closed. Prevent the fetch from importing
+    // these refs so one origin ref doesn't wedge serving on every mirror.
+    //
+    // The two exempt subtrees (requests/, issues/) are excluded from hideRefs
+    // so they still import; any other `refs/gitlawb/*` ref is hidden and won't
+    // be fetched. This is cumulative config (git merges multiple hideRefs
+    // entries), and `--prune` still applies to visible refs, so the mirror
+    // prunes deleted exempt refs but never imports non-exempt ones.
+    git_run(&[
+        "-C",
+        local_str,
+        "config",
+        "--add",
+        "transfer.hideRefs",
+        "refs/gitlawb/",
+    ])
+    .await?;
+    git_run(&[
+        "-C",
+        local_str,
+        "config",
+        "--add",
+        "transfer.hideRefs",
+        "!refs/gitlawb/requests/",
+    ])
+    .await?;
+    git_run(&[
+        "-C",
+        local_str,
+        "config",
+        "--add",
+        "transfer.hideRefs",
+        "!refs/gitlawb/issues/",
+    ])
+    .await?;
+
     match mode {
         MirrorMode::Promisor => {
             git_run(&["-C", local_str, "config", "remote.origin.promisor", "true"]).await?;

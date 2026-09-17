@@ -3417,46 +3417,61 @@ impl Db {
     /// return between intent insert and `receive_pack` must call this so a
     /// shed push never strands `received` + `prepared` rows the purge path
     /// never touches and reconcile can never promote (no git evidence).
+    ///
+    /// Bounded to 10s: the transaction is `pool.begin()` + three UPDATEs +
+    /// commit with no statement_timeout configured on the pool, so a
+    /// lock-blocked cleanup can pin a global write slot (and on four of the
+    /// five call sites, the lease and per-source permit too) indefinitely.
+    /// The 10s convention matches the other bounded git calls on the
+    /// receive-pack path.
     pub async fn refuse_receive_pack_before_git(
         &self,
         request_id: &str,
         reason: &str,
     ) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-        let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            r#"UPDATE receive_pack_requests
-               SET state = $2, git_exit_ok = FALSE, last_error = $3,
-                   completed_at = $4
-               WHERE id = $1 AND state = $5"#,
-        )
-        .bind(request_id)
-        .bind(request_state::REJECTED_AT_GIT)
-        .bind(reason)
-        .bind(&now)
-        .bind(request_state::RECEIVED)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            r#"UPDATE pending_ref_transitions
-               SET state = $2, cancelled_at = $3
-               WHERE request_id = $1 AND state = $4"#,
-        )
-        .bind(request_id)
-        .bind(pending_state::CANCELLED)
-        .bind(&now)
-        .bind(pending_state::PREPARED)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            r#"UPDATE request_proofs SET acked_at = $2 WHERE request_id = $1 AND acked_at IS NULL"#,
-        )
-        .bind(request_id)
-        .bind(&now)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(())
+        let cleanup = async {
+            let mut tx = self.pool.begin().await?;
+            let now = Utc::now().to_rfc3339();
+            sqlx::query(
+                r#"UPDATE receive_pack_requests
+                   SET state = $2, git_exit_ok = FALSE, last_error = $3,
+                       completed_at = $4
+                   WHERE id = $1 AND state = $5"#,
+            )
+            .bind(request_id)
+            .bind(request_state::REJECTED_AT_GIT)
+            .bind(reason)
+            .bind(&now)
+            .bind(request_state::RECEIVED)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"UPDATE pending_ref_transitions
+                   SET state = $2, cancelled_at = $3
+                   WHERE request_id = $1 AND state = $4"#,
+            )
+            .bind(request_id)
+            .bind(pending_state::CANCELLED)
+            .bind(&now)
+            .bind(pending_state::PREPARED)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"UPDATE request_proofs SET acked_at = $2 WHERE request_id = $1 AND acked_at IS NULL"#,
+            )
+            .bind(request_id)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok(())
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(10), cleanup).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "refuse_receive_pack_before_git timed out after 10s"
+            )),
+        }
     }
 
     /// #26 Split PR 1 step 5 — flip any non-terminal state to
@@ -3840,14 +3855,22 @@ impl Db {
         // as `applied` outside it. State is never moved here — only the
         // report widens.
         if res.rows_affected() == 0 {
+            // Take the row under FOR UPDATE in a transaction so the merge
+            // is atomic with the state it read: if the due worker flips
+            // `outcomes_committed` → `effects_pending` between the SELECT and
+            // the UPDATE, the UPDATE would match zero rows, `Ok(0)` would
+            // return, and the newly applied child would be left out of the
+            // report with no later scan revisiting it.
+            let mut tx = self.pool.begin().await?;
             let existing: Option<(serde_json::Value, Option<i32>, String)> = sqlx::query_as(
                 r#"SELECT parsed_report, accepted_ordinal, state FROM receive_pack_requests
-                   WHERE id = $1 AND state IN ($2, $3)"#,
+                   WHERE id = $1 AND state IN ($2, $3)
+                   FOR UPDATE"#,
             )
             .bind(request_id)
             .bind(request_state::OUTCOMES_COMMITTED)
             .bind(request_state::EFFECTS_PENDING)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
             let Some((stored_report, stored_ordinal, stored_state)) = existing else {
                 return Ok(0);
@@ -3865,8 +3888,9 @@ impl Db {
             .bind(request_id)
             .bind(&stored_state)
             .bind(&merged)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+            tx.commit().await?;
             // accepted_ordinal intentionally untouched: the stored value
             // (captured above as stored_ordinal) remains the event key.
             let _ = stored_ordinal;

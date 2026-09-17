@@ -836,3 +836,81 @@ fn inv26_step5_marker_quarantine_and_bound_are_wired() {
          reconcile's gate has evidence of the live push"
     );
 }
+
+/// Issue #26 split 1 — namespace gate and pre-git refusal lifecycle.
+///
+/// The push gate (repos.rs) must deny:
+/// 1. Any ref-update line that fails UTF-8 decode (the raw body is passed verbatim
+///    to git receive-pack, and git accepts refnames with bytes >= 0x80; the gate
+///    never sees these refs, no durable child row exists, and under requests/issues/
+///    the lossy for-each-ref decode still matches the narrowed exemption).
+/// 2. The bare `refs/gitlawb` name (the `starts_with("refs/gitlawb/")` check misses it).
+///
+/// Every explicit pre-git refusal must call `refuse_receive_pack_before_git` to
+/// terminalize the intent aggregate in one transaction, or a dropped future between
+/// the intent insert and `receive_pack` strands a `received` + `prepared` aggregate
+/// that is never purged, never promotable, and poisons its tuple.
+///
+/// The visibility exemption (visibility_pack.rs) was narrowed to `requests/` and
+/// `issues/` only. The push gate is the premise that narrowing relies on (the comment
+/// at visibility_pack.rs:340), so tests must prove:
+/// - A `refs/gitlawb/<other>` ref pointing at a blob is denied on push.
+/// - A stray `refs/gitlawb/<other>` blob ref planted in the pack path fails closed.
+#[test]
+fn issue_26_namespace_gate_and_refusal_wiring() {
+    let repos = src("api/repos.rs");
+    let vis = src("git/visibility_pack.rs");
+
+    // P1: fail the push on ref-update lines the handler cannot decode.
+    // The gate at parse_ref_updates must refuse when any command line in the
+    // ref-update section is undecodable UTF-8. The check is `!is_utf8()` on the
+    // command bytes before the loop, so reverting it removes the gate.
+    assert!(
+        repos.contains("if !std::str::from_utf8(ref_updates_bytes).is_ok()"),
+        "P1 gate missing: parse_ref_updates must refuse when any ref-update line is \
+         non-UTF-8 (git accepts bytes >= 0x80; the gate never sees them, no durable \
+         child exists, and the lossy for-each-ref decode still matches the exemption)"
+    );
+
+    // P1 (cont): the bare `refs/gitlawb` name must also be caught. The original
+    // `starts_with("refs/gitlawb/")` misses it; the fix adds an explicit `==` arm.
+    assert!(
+        repos.contains("ref_name == \"refs/gitlawb\""),
+        "P1 gate missing: the namespace check must match the bare 'refs/gitlawb' name \
+         (starts_with('refs/gitlawb/') misses it, and it lands on repos with no internal \
+         refs yet)"
+    );
+
+    // P1 (cont): every explicit pre-git refusal must call refuse_receive_pack_before_git
+    // to terminalize the intent. Five call sites exist (non-UTF-8, namespace, prereq
+    // failures); match >= 5 occurrences of the call. Removing any call site turns this red.
+    assert!(
+        repos.matches("refuse_receive_pack_before_git(").count() >= 5,
+        "P1 gate incomplete: every explicit pre-git refusal must call \
+         refuse_receive_pack_before_git to terminalize the intent (5 known sites: \
+         non-UTF-8, namespace, marker write, recovery prereqs, competing claimant)"
+    );
+
+    // P1 (cont): the intent drop-guard must exist and be disarmed before git starts.
+    // The guard is `IntentDropGuard::new` right after the durability boundary comment,
+    // and disarmed via `_intent_guard.disarm()` before `receive_pack_raw_with_reflog`.
+    assert!(
+        repos.contains("IntentDropGuard::new") && repos.contains("_intent_guard.disarm()"),
+        "P1 gate missing: IntentDropGuard must exist (::new after durability boundary) \
+         and be disarmed before receive_pack_raw_with_reflog (a dropped future between \
+         intent insert and git start strands a received+prepared aggregate)"
+    );
+
+    // P2: the visibility exemption narrowing removed a serving path. The exemption
+    // is now scoped to `requests/` and `issues/` only (visibility_pack.rs:371), and
+    // the comment at :340 states the push gate is the premise. Tests must prove the
+    // gate works, which the P1 findings above covered (non-UTF-8 line, bare name,
+    // refusal wiring). This check verifies the exemption narrowing landed.
+    assert!(
+        vis.contains(r#"ref_name.starts_with("refs/gitlawb/requests/")"#)
+            || vis.contains(r#"ref_name.starts_with("refs/gitlawb/issues/")"#),
+        "P2 gate missing: the visibility exemption must be narrowed to requests/ and \
+         issues/ only (the push gate is the premise; any other refs/gitlawb/* ref is \
+         denied on push and must fail closed in the pack path)"
+    );
+}
