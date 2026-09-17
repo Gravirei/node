@@ -863,10 +863,11 @@ fn issue_26_namespace_gate_and_refusal_wiring() {
 
     // P1: fail the push on ref-update lines the handler cannot decode.
     // The gate at parse_ref_updates must refuse when any command line in the
-    // ref-update section is undecodable UTF-8. The check is `!is_utf8()` on the
-    // command bytes before the loop, so reverting it removes the gate.
+    // ref-update section is undecodable UTF-8. The check is an Err arm on
+    // `from_utf8(data)` that returns BadRequest, so removing it allows non-UTF-8
+    // refs to bypass the namespace gate.
     assert!(
-        repos.contains("if !std::str::from_utf8(ref_updates_bytes).is_ok()"),
+        repos.contains("ref-update line is not valid UTF-8; push refused"),
         "P1 gate missing: parse_ref_updates must refuse when any ref-update line is \
          non-UTF-8 (git accepts bytes >= 0x80; the gate never sees them, no durable \
          child exists, and the lossy for-each-ref decode still matches the exemption)"
@@ -875,7 +876,7 @@ fn issue_26_namespace_gate_and_refusal_wiring() {
     // P1 (cont): the bare `refs/gitlawb` name must also be caught. The original
     // `starts_with("refs/gitlawb/")` misses it; the fix adds an explicit `==` arm.
     assert!(
-        repos.contains("ref_name == \"refs/gitlawb\""),
+        repos.contains("*r == \"refs/gitlawb\""),
         "P1 gate missing: the namespace check must match the bare 'refs/gitlawb' name \
          (starts_with('refs/gitlawb/') misses it, and it lands on repos with no internal \
          refs yet)"
@@ -907,8 +908,7 @@ fn issue_26_namespace_gate_and_refusal_wiring() {
     // gate works, which the P1 findings above covered (non-UTF-8 line, bare name,
     // refusal wiring). This check verifies the exemption narrowing landed.
     assert!(
-        vis.contains(r#"ref_name.starts_with("refs/gitlawb/requests/")"#)
-            || vis.contains(r#"ref_name.starts_with("refs/gitlawb/issues/")"#),
+        vis.contains(r#"!r.starts_with("refs/gitlawb/requests/") && !r.starts_with("refs/gitlawb/issues/")"#),
         "P2 gate missing: the visibility exemption must be narrowed to requests/ and \
          issues/ only (the push gate is the premise; any other refs/gitlawb/* ref is \
          denied on push and must fail closed in the pack path)"
