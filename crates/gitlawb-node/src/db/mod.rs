@@ -3474,6 +3474,60 @@ impl Db {
         }
     }
 
+    /// Post-git-start interruption (client disconnect during `receive_pack`,
+    /// or a handler drop before the outcome commit): parent `received` →
+    /// `rejected_at_git` (terminal, purge-eligible) and `prepared` children →
+    /// `uncertain` — never `cancelled`, because git may have landed refs and
+    /// reconcile must still prove each landing. This mirrors the
+    /// `receive_pack` Err arm's inline handling for drops that can never
+    /// reach it (a dropped future runs no Err arm; the detached reaper does
+    /// process teardown only, no DB writes). Startup reconcile promotes
+    /// proved children and the aggregate exactly as for that path: the
+    /// promotion gate covers `rejected_at_git` parents.
+    ///
+    /// Gated on `state = received`, so a drop after the outcome commit
+    /// resolved is a harmless no-op. The proof row is deliberately left
+    /// unacked here (unlike the pre-git refuse): the drain acks it when
+    /// effects complete, and an unacked proof blocks premature purge.
+    /// Bounded 10s like [`Db::refuse_receive_pack_before_git`].
+    pub async fn mark_receive_pack_interrupted(&self, request_id: &str) -> Result<()> {
+        let cleanup = async {
+            let mut tx = self.pool.begin().await?;
+            let now = Utc::now().to_rfc3339();
+            sqlx::query(
+                r#"UPDATE receive_pack_requests
+                   SET state = $2, git_exit_ok = FALSE,
+                       last_error = $3, completed_at = $4
+                   WHERE id = $1 AND state = $5"#,
+            )
+            .bind(request_id)
+            .bind(request_state::REJECTED_AT_GIT)
+            .bind("receive-pack interrupted before outcome commit")
+            .bind(&now)
+            .bind(request_state::RECEIVED)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"UPDATE pending_ref_transitions
+                   SET state = $1
+                   WHERE request_id = $2 AND state = $3"#,
+            )
+            .bind(pending_state::UNCERTAIN)
+            .bind(request_id)
+            .bind(pending_state::PREPARED)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok(())
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(10), cleanup).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "mark_receive_pack_interrupted timed out after 10s"
+            )),
+        }
+    }
+
     /// #26 Split PR 1 step 5 — flip any non-terminal state to
     /// `quarantined`. The reconcile calls this when the marker
     /// ref is missing or hash-mismatched; the drain's
@@ -3861,40 +3915,74 @@ impl Db {
             // the UPDATE, the UPDATE would match zero rows, `Ok(0)` would
             // return, and the newly applied child would be left out of the
             // report with no later scan revisiting it.
-            let mut tx = self.pool.begin().await?;
-            let existing: Option<(serde_json::Value, Option<i32>, String)> = sqlx::query_as(
-                r#"SELECT parsed_report, accepted_ordinal, state FROM receive_pack_requests
-                   WHERE id = $1 AND state IN ($2, $3)
-                   FOR UPDATE"#,
-            )
-            .bind(request_id)
-            .bind(request_state::OUTCOMES_COMMITTED)
-            .bind(request_state::EFFECTS_PENDING)
-            .fetch_optional(&mut *tx)
-            .await?;
-            let Some((stored_report, stored_ordinal, stored_state)) = existing else {
-                return Ok(0);
-            };
-            let merged = Self::merge_reconciled_reports(&stored_report, parsed_report);
-            // Nothing new: no write, no false success signal.
-            if merged == stored_report {
-                return Ok(0);
-            }
-            let update_res = sqlx::query(
-                r#"UPDATE receive_pack_requests
+            //
+            // Terminal states (`complete`, `quarantined`) are locked too:
+            // the due worker races the startup reconcile, so a parent may go
+            // terminal between the first UPDATE and this read. A child just
+            // marked applied then has effects that silently never run and is
+            // later purged under the terminal parent. There is nothing
+            // automatic left to do (the drain will not rerun a terminal
+            // request), so log loudly for operator attention instead of
+            // returning a silent success.
+            //
+            // Bounded 10s like the refuse path: a lock-blocked merge must not
+            // stall the reconcile page behind it indefinitely.
+            let merge = async {
+                let mut tx = self.pool.begin().await?;
+                let existing: Option<(serde_json::Value, Option<i32>, String)> = sqlx::query_as(
+                    r#"SELECT parsed_report, accepted_ordinal, state FROM receive_pack_requests
+                       WHERE id = $1 AND state IN ($2, $3, $4, $5)
+                       FOR UPDATE"#,
+                )
+                .bind(request_id)
+                .bind(request_state::OUTCOMES_COMMITTED)
+                .bind(request_state::EFFECTS_PENDING)
+                .bind(request_state::COMPLETE)
+                .bind(request_state::QUARANTINED)
+                .fetch_optional(&mut *tx)
+                .await?;
+                let Some((stored_report, stored_ordinal, stored_state)) = existing else {
+                    return Ok(0);
+                };
+                if stored_state == request_state::COMPLETE
+                    || stored_state == request_state::QUARANTINED
+                {
+                    tracing::error!(
+                        request_id = %request_id,
+                        state = %stored_state,
+                        "reconcile applied a child after the parent went terminal; \
+                         the late child's effects never ran and it will purge under \
+                         the terminal parent — operator attention required"
+                    );
+                    return Ok(0);
+                }
+                let merged = Self::merge_reconciled_reports(&stored_report, parsed_report);
+                // Nothing new: no write, no false success signal.
+                if merged == stored_report {
+                    return Ok(0);
+                }
+                let update_res = sqlx::query(
+                    r#"UPDATE receive_pack_requests
                    SET parsed_report = $3
                    WHERE id = $1 AND state = $2"#,
-            )
-            .bind(request_id)
-            .bind(&stored_state)
-            .bind(&merged)
-            .execute(&mut *tx)
-            .await?;
-            tx.commit().await?;
-            // accepted_ordinal intentionally untouched: the stored value
-            // (captured above as stored_ordinal) remains the event key.
-            let _ = stored_ordinal;
-            Ok(update_res.rows_affected())
+                )
+                .bind(request_id)
+                .bind(&stored_state)
+                .bind(&merged)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                // accepted_ordinal intentionally untouched: the stored value
+                // (captured above as stored_ordinal) remains the event key.
+                let _ = stored_ordinal;
+                Ok(update_res.rows_affected())
+            };
+            match tokio::time::timeout(std::time::Duration::from_secs(10), merge).await {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!(
+                    "promote_reconciled_request_outcomes_idempotent merge timed out after 10s"
+                )),
+            }
         } else {
             Ok(res.rows_affected())
         }

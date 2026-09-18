@@ -691,6 +691,96 @@ async fn existing_promisor_state(repo: &str) -> PromisorProbe {
     }
 }
 
+/// Byte-prefix check for the two node-managed blob namespaces exempt from
+/// the fail-closed commit walk (`visibility_pack.rs`): request markers
+/// (`refs/gitlawb/requests/`) and issue records (`refs/gitlawb/issues/`).
+/// Bytewise so non-UTF-8 refnames (which git accepts) are classified, not
+/// lossy-decoded into a false exempt match. Extracted so the predicate is
+/// unit-testable; [`prune_non_exempt_gitlawb_refs`] enforces it on import.
+fn gitlawb_ref_is_exempt(raw_refname: &[u8]) -> bool {
+    raw_refname.starts_with(b"refs/gitlawb/requests/")
+        || raw_refname.starts_with(b"refs/gitlawb/issues/")
+}
+
+/// Delete imported `refs/gitlawb/*` refs outside the two exempt subtrees.
+///
+/// Mirrors import whatever the origin advertises (`+refs/*:refs/*`), and
+/// `transfer.hideRefs` is a serve-side knob: a repo's own `git fetch` never
+/// consults local hideRefs, and origins hide only `requests/` anyway. So a
+/// planted `refs/gitlawb/<other>` blob ref — creatable on any pre-gate node —
+/// lands on every mirror and then trips `assert_all_refs_are_commits` closed,
+/// wedging serving on each one. Prune at import instead: after clone/fetch,
+/// list `refs/gitlawb` and delete every ref outside the exempt subtrees
+/// (negative refspecs cannot re-include them, so post-import deletion is the
+/// mechanism that works).
+///
+/// Enumeration is `git show-ref` (no pattern), parsed as raw bytes: refnames
+/// cannot contain newlines, so one line per ref is lossless even for
+/// non-UTF-8 names, which a lossy decode would miss and which
+/// `for-each-ref` cannot NUL-terminate. Fails the sync (retried on the next
+/// tick) rather than leaving the mirror in a state that wedges serving.
+async fn prune_non_exempt_gitlawb_refs(local_path: &Path) -> anyhow::Result<()> {
+    let local_str = local_path.to_str().unwrap_or(".");
+    let out = tokio::process::Command::new("git")
+        .args(["-C", local_str, "show-ref"])
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("git show-ref failed to spawn: {e}"))?;
+    // Exit 1 with empty output just means the repo has no refs at all.
+    if !out.status.success() && !out.stdout.is_empty() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(anyhow::anyhow!("git show-ref failed: {stderr}"));
+    }
+    for line in out.stdout.split(|b| *b == b'\n') {
+        // `<40-hex-sha> SP <refname>`; skip anything else-shaped.
+        let Some(raw) = line.get(41..).filter(|_| line.get(40) == Some(&b' ')) else {
+            continue;
+        };
+        if raw.is_empty()
+            || !(raw == b"refs/gitlawb" || raw.starts_with(b"refs/gitlawb/"))
+            || gitlawb_ref_is_exempt(raw)
+        {
+            continue;
+        }
+        // Delete by exact bytes (not the lossy display string below): a
+        // non-UTF-8 refname would otherwise survive the prune.
+        let refname_os = os_from_raw_refname(raw);
+        let shown = refname_os.to_string_lossy().into_owned();
+        let delete = tokio::process::Command::new("git")
+            .args(["-C", local_str, "update-ref", "-d"])
+            .arg(&refname_os)
+            .args(["--no-deref"])
+            .output()
+            .await
+            .map_err(|e| anyhow::anyhow!("git update-ref -d failed to spawn: {e}"))?;
+        if !delete.status.success() {
+            let stderr = String::from_utf8_lossy(&delete.stderr);
+            return Err(anyhow::anyhow!(
+                "git update-ref -d {shown} failed (mirror still carries a non-exempt refs/gitlawb ref): {stderr}"
+            ));
+        }
+        tracing::info!(
+            gitlawb_ref = %shown,
+            "mirror: pruned non-exempt refs/gitlawb ref on import"
+        );
+    }
+    Ok(())
+}
+
+/// Lossless bytes → OsString for `update-ref -d`: non-UTF-8 refnames must be
+/// deleted by exact bytes. Unix is the serving platform; elsewhere fall back
+/// to a lossy decode (best effort where exact bytes are unrepresentable).
+#[cfg(unix)]
+fn os_from_raw_refname(raw: &[u8]) -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStringExt;
+    std::ffi::OsString::from_vec(raw.to_vec())
+}
+
+#[cfg(not(unix))]
+fn os_from_raw_refname(raw: &[u8]) -> std::ffi::OsString {
+    String::from_utf8_lossy(raw).into_owned().into()
+}
+
 /// Mirror-clone a repo from a remote URL into a local bare repo.
 /// `Promisor` mode adds `--filter=blob:limit=10g`, which marks the repo a git
 /// promisor (so a pack with origin-omitted withheld blobs is accepted) while
@@ -714,6 +804,9 @@ async fn clone_repo(remote_url: &str, local_path: &Path, mode: MirrorMode) -> an
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(anyhow::anyhow!("git clone --mirror failed: {stderr}"));
     }
+    // A fresh mirror imports everything the origin advertises, including any
+    // planted non-exempt `refs/gitlawb/*` ref; prune before serving from it.
+    prune_non_exempt_gitlawb_refs(local_path).await?;
     Ok(())
 }
 
@@ -731,49 +824,11 @@ async fn fetch_repo(local_path: &Path, remote_url: &str, mode: MirrorMode) -> an
 
     git_run(&["-C", local_str, "remote", "set-url", "origin", remote_url]).await?;
 
-    // Guard against importing non-exempt refs/gitlawb/* refs from the origin.
-    // The push gate (repos.rs) prevents creating them locally, but mirrors
-    // `clone --mirror` then `fetch +refs/*:refs/*` via the stored refspec.
-    // Pre-gate nodes or the non-UTF-8 hole (fixed this PR) could have planted
-    // a `refs/gitlawb/<other>` ref pointing at a blob. That ref was exempt
-    // before the narrowing (visibility_pack.rs) but now fails
-    // `assert_all_refs_are_commits` closed. Prevent the fetch from importing
-    // these refs so one origin ref doesn't wedge serving on every mirror.
-    //
-    // The two exempt subtrees (requests/, issues/) are excluded from hideRefs
-    // so they still import; any other `refs/gitlawb/*` ref is hidden and won't
-    // be fetched. This is cumulative config (git merges multiple hideRefs
-    // entries), and `--prune` still applies to visible refs, so the mirror
-    // prunes deleted exempt refs but never imports non-exempt ones.
-    git_run(&[
-        "-C",
-        local_str,
-        "config",
-        "--add",
-        "transfer.hideRefs",
-        "refs/gitlawb/",
-    ])
-    .await?;
-    git_run(&[
-        "-C",
-        local_str,
-        "config",
-        "--add",
-        "transfer.hideRefs",
-        "!refs/gitlawb/requests/",
-    ])
-    .await?;
-    git_run(&[
-        "-C",
-        local_str,
-        "config",
-        "--add",
-        "transfer.hideRefs",
-        "!refs/gitlawb/issues/",
-    ])
-    .await?;
-
-    match mode {
+    // The fetch imports whatever the origin advertises via the stored
+    // `+refs/*:refs/*` refspec; prune non-exempt `refs/gitlawb/*` refs after
+    // every fetch so one planted origin ref cannot wedge serving on the
+    // mirror (see `prune_non_exempt_gitlawb_refs`).
+    let fetch_result = match mode {
         MirrorMode::Promisor => {
             git_run(&["-C", local_str, "config", "remote.origin.promisor", "true"]).await?;
             git_run(&[
@@ -813,7 +868,9 @@ async fn fetch_repo(local_path: &Path, remote_url: &str, mode: MirrorMode) -> an
                 git_run(&["-C", local_str, "fetch", "--prune", "origin"]).await
             }
         }
-    }
+    };
+    fetch_result?;
+    prune_non_exempt_gitlawb_refs(local_path).await
 }
 
 #[cfg(test)]
@@ -2053,5 +2110,145 @@ mod tests {
         assert!(mirror.is_dir(), "mirror missing at {}", mirror.display());
         assert!(object_count(&mirror) > 0, "mirror has no objects");
         assert_eq!(sync_status(&pool, "z6Mkfoo/hello").await, "done");
+    }
+
+    /// The import-exemption predicate is bytewise over both node-managed
+    /// namespaces and nothing else. Non-UTF-8 bytes never match (git accepts
+    /// them, so a lossy decode could false-exempt). Narrowing either prefix
+    /// turns these red.
+    #[test]
+    fn gitlawb_import_exemption_covers_both_namespaces_by_bytes() {
+        for exempt in [
+            &b"refs/gitlawb/requests/550e8400-e29b-41d4-a716-446655440000"[..],
+            &b"refs/gitlawb/issues/abc123"[..],
+        ] {
+            assert!(
+                gitlawb_ref_is_exempt(exempt),
+                "import must keep {}",
+                String::from_utf8_lossy(exempt)
+            );
+        }
+        for pruned in [
+            &b"refs/gitlawb/evil"[..],
+            &b"refs/gitlawb"[..],
+            &b"refs/gitlawbfoo"[..],
+            &b"refs/heads/main"[..],
+            &b""[..],
+            // Raw 0xFF byte: never an exempt prefix, always pruned.
+            &b"refs/gitlawb/\xffvil"[..],
+        ] {
+            assert!(
+                !gitlawb_ref_is_exempt(pruned),
+                "import must prune {}",
+                String::from_utf8_lossy(pruned)
+            );
+        }
+    }
+
+    /// End-to-end prune on a scratch bare repo: a planted non-exempt
+    /// `refs/gitlawb/*` blob ref is deleted, exempt `requests/`/`issues/`
+    /// blob refs and content refs survive. Removing the prune call from
+    /// `clone_repo`/`fetch_repo` leaves the evil ref in place, which is what
+    /// wedges serving on mirrors — this test plants exactly that state and
+    /// proves the prune removes it.
+    #[test]
+    fn prune_removes_non_exempt_gitlawb_refs_and_keeps_exempt() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        rt.block_on(async {
+            let td = TempDir::new().unwrap();
+            let work = td.path().join("work");
+            let bare = td.path().join("m.git");
+            std::fs::create_dir_all(&work).unwrap();
+            // A real commit for the content branch (branch refs must point
+            // at commits; the evil/exempt refs below point at blobs).
+            std::fs::write(work.join("f.txt"), b"x\n").unwrap();
+            let run_work = |args: &[&str]| {
+                assert!(
+                    Command::new("git")
+                        .args(args)
+                        .current_dir(&work)
+                        .status()
+                        .unwrap()
+                        .success(),
+                    "git {args:?} failed"
+                );
+            };
+            run_work(&["init", "-q"]);
+            run_work(&["config", "user.email", "t@t"]);
+            run_work(&["config", "user.name", "t"]);
+            run_work(&["add", "f.txt"]);
+            run_work(&["commit", "-qm", "init"]);
+            assert!(
+                Command::new("git")
+                    .args([
+                        "clone",
+                        "-q",
+                        "--bare",
+                        work.to_str().unwrap(),
+                        bare.to_str().unwrap()
+                    ])
+                    .current_dir(td.path())
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git clone --bare failed"
+            );
+            let run = |args: &[&str]| {
+                assert!(
+                    Command::new("git")
+                        .args(args)
+                        .current_dir(&bare)
+                        .status()
+                        .unwrap()
+                        .success(),
+                    "git {args:?} failed"
+                );
+            };
+            let run_out = |args: &[&str]| {
+                let out = Command::new("git")
+                    .args(args)
+                    .current_dir(&bare)
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "git {args:?} failed");
+                out.stdout
+            };
+            run(&["init", "-q", "--bare", "."]);
+            std::fs::write(bare.join("blob-body"), b"marker\n").unwrap();
+            let blob = String::from_utf8_lossy(&run_out(&["hash-object", "-w", "blob-body"]))
+                .trim()
+                .to_string();
+            // The clone carries the content branch; plant the evil ref and
+            // both exempt refs (all blob-pointing, like node metadata).
+            run(&["update-ref", "refs/gitlawb/evil", &blob]);
+            run(&["update-ref", "refs/gitlawb/requests/r1", &blob]);
+            run(&["update-ref", "refs/gitlawb/issues/i1", &blob]);
+
+            prune_non_exempt_gitlawb_refs(&bare)
+                .await
+                .expect("prune succeeds");
+
+            let raw_refs = run_out(&["for-each-ref", "--format=%(refname)"]);
+            let refs = String::from_utf8_lossy(&raw_refs);
+            let set: std::collections::HashSet<&str> = refs
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect();
+            assert!(
+                !set.contains("refs/gitlawb/evil"),
+                "non-exempt blob ref must be pruned, still present: {set:?}"
+            );
+            for keep in ["refs/gitlawb/requests/r1", "refs/gitlawb/issues/i1"] {
+                assert!(set.contains(keep), "{keep} must survive the prune: {set:?}");
+            }
+            assert!(
+                set.iter().any(|r| r.starts_with("refs/heads/")),
+                "content branch ref must survive the prune: {set:?}"
+            );
+        });
     }
 }

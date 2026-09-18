@@ -3250,4 +3250,75 @@ esac\n";
             "a blob also reachable via an allowed path must not be withheld"
         );
     }
+
+    /// A planted non-exempt `refs/gitlawb/*` blob ref fails the commit walk
+    /// closed, while the two exempt namespaces (`requests/`, `issues/`) pass.
+    /// The exemption narrowing removed a serving path, so this test pins the
+    /// denial: widening the exemption back to all of `refs/gitlawb/*` turns
+    /// the expect_err red. Real git, scratch bare repo.
+    #[test]
+    fn planted_non_exempt_gitlawb_blob_ref_fails_closed() {
+        use std::time::{Duration, Instant};
+        let td = TempDir::new().unwrap();
+        let bare = td.path().join("repo.git");
+        std::fs::create_dir_all(&bare).unwrap();
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&bare)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        let run_out = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&bare)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run(&["init", "-q", "--bare", "."]);
+        // A blob object to point refs at (node markers and issues are blobs).
+        std::fs::write(bare.join("marker-body"), b"marker\n").unwrap();
+        let blob = run_out(&["hash-object", "-w", "marker-body"]);
+        let check = |want_ok: bool, why: &str| {
+            let result =
+                assert_all_refs_are_commits(&bare, "git", Instant::now() + Duration::from_secs(30));
+            if want_ok {
+                result.expect(why);
+            } else {
+                let err = result.expect_err(why);
+                assert!(
+                    err.to_string().contains("refs/gitlawb/evil"),
+                    "the denial must name the offending ref, got: {err:#}"
+                );
+            }
+        };
+        // The bare `refs/gitlawb` name fails closed too (checked first: git
+        // forbids a bare ref coexisting with the subtree below, D/F conflict).
+        run(&["update-ref", "refs/gitlawb", &blob]);
+        let result =
+            assert_all_refs_are_commits(&bare, "git", Instant::now() + Duration::from_secs(30));
+        let err = result.expect_err("bare refs/gitlawb blob ref must fail closed");
+        assert!(
+            err.to_string().contains("refs/gitlawb"),
+            "the denial must name the offending ref, got: {err:#}"
+        );
+        run(&["update-ref", "-d", "refs/gitlawb", "--no-deref"]);
+        // Exempt namespaces with blob targets pass (node-managed by design).
+        run(&["update-ref", "refs/gitlawb/requests/r1", &blob]);
+        run(&["update-ref", "refs/gitlawb/issues/i1", &blob]);
+        check(true, "requests//issues/ blob refs are exempt and must pass");
+        // A non-exempt blob ref fails closed.
+        run(&["update-ref", "refs/gitlawb/evil", &blob]);
+        check(false, "a non-exempt refs/gitlawb blob ref must fail closed");
+        // Cleanup proves the denial is about that ref, not residue.
+        run(&["update-ref", "-d", "refs/gitlawb/evil", "--no-deref"]);
+        check(true, "removing the evil ref must restore the walk");
+    }
 }

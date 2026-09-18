@@ -856,6 +856,13 @@ fn inv26_step5_marker_quarantine_and_bound_are_wired() {
 /// at visibility_pack.rs:340), so tests must prove:
 /// - A `refs/gitlawb/<other>` ref pointing at a blob is denied on push.
 /// - A stray `refs/gitlawb/<other>` blob ref planted in the pack path fails closed.
+///
+/// Source gates below pin the wiring; behavioral proofs live next to the code:
+/// `parse_ref_updates_refuses_non_utf8_command_line` and
+/// `internal_namespace_gate_covers_bare_name_and_subtree` (api/repos.rs),
+/// `planted_non_exempt_gitlawb_blob_ref_fails_closed` (git/visibility_pack.rs),
+/// and the mirror import prune
+/// `prune_removes_non_exempt_gitlawb_refs_and_keeps_exempt` (sync.rs).
 #[test]
 fn issue_26_namespace_gate_and_refusal_wiring() {
     let repos = src("api/repos.rs");
@@ -873,33 +880,87 @@ fn issue_26_namespace_gate_and_refusal_wiring() {
          child exists, and the lossy for-each-ref decode still matches the exemption)"
     );
 
-    // P1 (cont): the bare `refs/gitlawb` name must also be caught. The original
-    // `starts_with("refs/gitlawb/")` misses it; the fix adds an explicit `==` arm.
+    // P1 (cont): the bare `refs/gitlawb` name must also be caught. The
+    // predicate is extracted as `ref_is_internal_namespace` so it is
+    // unit-testable; pin the bare-name arm inside it and its use at the
+    // push gate (a `starts_with("refs/gitlawb/")`-only check misses the
+    // bare name, and it lands on repos with no internal refs yet).
     assert!(
-        repos.contains("*r == \"refs/gitlawb\""),
-        "P1 gate missing: the namespace check must match the bare 'refs/gitlawb' name \
-         (starts_with('refs/gitlawb/') misses it, and it lands on repos with no internal \
-         refs yet)"
+        repos.contains("ref_name == \"refs/gitlawb\"")
+            && repos.contains(".find(|r| ref_is_internal_namespace(r))"),
+        "P1 gate missing: ref_is_internal_namespace must match the bare \
+         'refs/gitlawb' name and the push gate must consult it \
+         (starts_with('refs/gitlawb/') misses it, and it lands on repos with \
+         no internal refs yet)"
     );
 
     // P1 (cont): every explicit pre-git refusal must call refuse_receive_pack_before_git
-    // to terminalize the intent. Five call sites exist (non-UTF-8, namespace, prereq
-    // failures); match >= 5 occurrences of the call. Removing any call site turns this red.
-    assert!(
-        repos.matches("refuse_receive_pack_before_git(").count() >= 5,
-        "P1 gate incomplete: every explicit pre-git refusal must call \
-         refuse_receive_pack_before_git to terminalize the intent (5 known sites: \
-         non-UTF-8, namespace, marker write, recovery prereqs, competing claimant)"
+    // to terminalize the intent. Exactly 6 occurrences: the five inline call
+    // sites (lease cap, per-source cap, write pool, acquire timeout, acquire
+    // error) plus the drop-guard's own pre-git spawn. The post-git guard phase
+    // calls mark_receive_pack_interrupted (a different name), so deleting any
+    // one inline site drops the count to 5 and turns this red. The parse and
+    // namespace refusals correctly carry no call: they return before the
+    // intent insert, so there is no aggregate to terminalize.
+    assert_eq!(
+        repos.matches("refuse_receive_pack_before_git(").count(),
+        6,
+        "P1 wiring: exactly 6 refuse_receive_pack_before_git calls expected (5 \
+         inline refusal sites + guard pre-git spawn); deleting any inline site \
+         must turn this red"
     );
+    // Pin the five inline sites by their reason literals, so a site that stops
+    // terminalizing (or is renumbered away) fails by name, not just by count.
+    for reason in [
+        "repo write-lease waiter cap reached",
+        "admission per-source cap reached",
+        "git write pool saturated",
+        "acquire_write timed out",
+        "acquire_write failed",
+        "handler dropped before git started",
+    ] {
+        assert!(
+            repos.contains(reason),
+            "P1 wiring: refusal reason literal missing: {reason}"
+        );
+    }
 
-    // P1 (cont): the intent drop-guard must exist and be disarmed before git starts.
-    // The guard is `IntentDropGuard::new` right after the durability boundary comment,
-    // and disarmed via `_intent_guard.disarm()` before `receive_pack_raw_with_reflog`.
+    // P1 (cont): the intent drop-guard must be phase-aware. It is armed before
+    // the insert resolves (covering the cancellation window), flipped to
+    // git-started immediately before the receive_pack await (a drop from there
+    // is a mid-git disconnect, terminalized via mark_receive_pack_interrupted
+    // because the Err arm never runs on a drop), and disarmed once the outcome
+    // commit resolves. Assert the ordering, not just presence: the phase flip
+    // must precede the receive_pack call.
     assert!(
-        repos.contains("IntentDropGuard::new") && repos.contains("_intent_guard.disarm()"),
-        "P1 gate missing: IntentDropGuard must exist (::new after durability boundary) \
-         and be disarmed before receive_pack_raw_with_reflog (a dropped future between \
-         intent insert and git start strands a received+prepared aggregate)"
+        repos.contains("IntentDropGuard::new") && repos.contains("notify_git_started()"),
+        "P1 gate missing: IntentDropGuard must exist and flip to git-started phase \
+         before receive_pack (a dropped future between intent insert and git start \
+         strands a received+prepared aggregate)"
+    );
+    let flip_pos = repos
+        .find("notify_git_started()")
+        .expect("notify_git_started call must exist");
+    let git_pos = repos
+        .find("receive_pack_raw_with_reflog(")
+        .expect("receive_pack call must exist");
+    assert!(
+        flip_pos < git_pos,
+        "P1 ordering: notify_git_started() must precede the receive_pack call, \
+         or a mid-git drop is misclassified as a pre-git shed"
+    );
+    assert!(
+        repos.contains("_intent_guard.disarm()"),
+        "P1 gate missing: the guard must disarm once the outcome commit resolves, \
+         or every push spawns a wasteful cleanup txn at scope end"
+    );
+    // A sync Drop cannot await: cleanup is spawned via the current runtime
+    // handle with an off-runtime fallback. A bare tokio::spawn panics
+    // mid-unwind with no runtime (off-runtime drop, process teardown).
+    assert!(
+        repos.contains("Handle::try_current()"),
+        "P1 gate missing: guard Drop must spawn via Handle::try_current with an \
+         off-runtime arm, not a bare tokio::spawn"
     );
 
     // P2: the visibility exemption narrowing removed a serving path. The exemption

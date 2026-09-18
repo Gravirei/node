@@ -2130,14 +2130,10 @@ pub async fn git_receive_pack(
     // or tree is skipped by `rev-list --all` yet still served, bypassing
     // the fail-closed under-withhold check. Refuse before intent is
     // written so a denied push leaves no rows behind.
-    //
-    // Also match the bare `refs/gitlawb` name (no trailing slash): a push
-    // of that exact ref would not be caught by `starts_with("refs/gitlawb/")`
-    // and could land on a repo with no internal refs yet, bypassing the gate.
     if let Some(bad) = ref_updates
         .iter()
         .map(|u| u.ref_name.as_str())
-        .find(|r| *r == "refs/gitlawb" || r.starts_with("refs/gitlawb/"))
+        .find(|r| ref_is_internal_namespace(r))
     {
         tracing::warn!(
             repo = %name,
@@ -2201,6 +2197,11 @@ pub async fn git_receive_pack(
         content_digest: Some(content_digest.clone()),
     };
     let db_timeout = std::time::Duration::from_secs(30);
+    // Arm the drop-guard BEFORE the insert resolves: on timeout the
+    // cancellation may land after the commit did, stranding a `received`
+    // aggregate the early return below would otherwise leave behind. The
+    // refuse is a no-op on an id that never committed.
+    let _intent_guard = IntentDropGuard::new(state.db.clone(), request_id.clone());
     let db_result = tokio::time::timeout(
         db_timeout,
         state.db.insert_receive_pack_request_with_children(
@@ -2295,17 +2296,10 @@ pub async fn git_receive_pack(
     // delete+recreate under the same slug while the bare repo on disk is reused,
     // and an id-keyed lease stops serializing exactly across that rotation.
     let repo_key = crate::state::repo_identity_key(&record.owner_did, &record.name);
-    // Intent is already durable at this point: every refusal below must
-    // terminalize it via `refuse_receive_pack_before_git` so no
-    // `received` + `prepared` aggregate strands (never purged, never
-    // promotable without git evidence, and poisoning its tuple via
-    // `has_competing_claimant`).
-    //
-    // Drop-guard: if the handler exits (early return, cancellation, panic)
-    // between here and the `receive_pack_raw_with_reflog` call below, the
-    // guard terminalizes the intent on drop so it never strands in
-    // `received` state.
-    let _intent_guard = IntentDropGuard::new(state.db.clone(), request_id.clone());
+    // Drop-guard: armed above (before the insert resolved) so the
+    // insert-timeout cancellation window is covered too. Explicit refusals
+    // below still call `refuse_receive_pack_before_git` inline for a
+    // synchronous terminal state; the guard is the backstop for drops.
     let lease = match state
         .repo_write_leases
         .acquire(&repo_key, lease_steal_after)
@@ -2538,10 +2532,12 @@ pub async fn git_receive_pack(
     // still relies on marker + tuple/timestamp + history guards. Marker
     // namespace hiding was verified above by `verify_recovery_prereqs`.
     let reflog_action = format!("gitlawb-request:{request_id}");
-    // Disarm the drop-guard: git is about to start, so a dropped future
-    // from here forward is a mid-git disconnect (not a pre-git shed), and
-    // the mark_uncertain path below handles that case.
-    _intent_guard.disarm();
+    // Phase-flip the drop-guard: git is about to start, so a dropped future
+    // from here forward is a mid-git disconnect (not a pre-git shed). The
+    // guard then marks children uncertain and terminalizes the parent, which
+    // the mark_uncertain path below cannot do on a drop — it never runs, and
+    // the detached reaper does process teardown only, no DB writes.
+    _intent_guard.notify_git_started();
     let (receive_raw, exit_ok) = match smart_http::receive_pack_raw_with_reflog(
         &state.git_bin,
         &disk_path,
@@ -2857,6 +2853,15 @@ pub async fn git_receive_pack(
             }
         }
     };
+
+    // A resolved outcome commit leaves no `received` parent behind, so drops
+    // from here on need no guard cleanup — disarm to avoid a wasteful spawned
+    // txn per push. On persistent commit failure the guard stays in its
+    // git-started phase: a later drop still terminalizes the aggregate for
+    // startup reconcile instead of stranding it.
+    if outcome_commit_ok {
+        _intent_guard.disarm();
+    }
 
     // On non-zero exit, return an error to the caller. The outbox
     // rows have already been handled above (per-ref fates applied).
@@ -3834,64 +3839,123 @@ pub async fn get_icaptcha_proof(
 
 // ── Drop guard for stranded intents ──────────────────────────────────────
 
-/// Drop-guard that terminalizes a durable intent if the handler exits (via
-/// early return, cancellation, or panic) after the intent insert but before
-/// `receive_pack` runs. A dropped future between the insert and git leaves a
-/// `received` parent + `prepared` children that nothing retires: purge
-/// excludes `received` even at 8 days, the drain skips it, and reconcile
-/// cannot prove a landing git never ran. The stranded children also poison
-/// `has_competing_claimant` checks. Disarm this guard once git starts.
+/// Phase-aware drop-guard that terminalizes a durable intent when the handler
+/// future is dropped. Two uncovered spans need two cleanups:
+/// - Dropped before git starts (lease park, `acquire_write`, prereq checks,
+///   marker write, or a commit landing inside the insert-timeout cancellation
+///   window): no git evidence can exist, so refuse the aggregate outright —
+///   parent to `rejected_at_git`, `prepared` children to `cancelled`.
+/// - Dropped after git starts (the whole `receive_pack` await and the outcome
+///   commit): git may have landed refs, so mark `prepared` children `uncertain`
+///   and terminalize the parent, mirroring the `receive_pack` Err arm for a
+///   drop that can never reach it. Startup reconcile still promotes proved
+///   children of a `rejected_at_git` parent.
+///
+/// Arm before the intent insert resolves (the refuse is a no-op on an
+/// uncommitted id), move to git-started immediately before awaiting
+/// `receive_pack`, and disarm once the outcome commit resolves. A sync Drop
+/// cannot await, so cleanup is spawned like `KillGroupOnDrop` and
+/// `RepoWriteGuard` do: prefer the current runtime handle, and with no
+/// runtime (off-runtime drop, process teardown) log loudly instead of
+/// panicking on a bare `tokio::spawn`.
 struct IntentDropGuard {
     db: std::sync::Arc<crate::db::Db>,
     request_id: String,
-    armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    phase: std::sync::Arc<std::sync::atomic::AtomicU8>,
 }
+
+const INTENT_PHASE_PRE_GIT: u8 = 0;
+const INTENT_PHASE_GIT_STARTED: u8 = 1;
+const INTENT_PHASE_DONE: u8 = 2;
 
 impl IntentDropGuard {
     fn new(db: std::sync::Arc<crate::db::Db>, request_id: String) -> Self {
         Self {
             db,
             request_id,
-            armed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            phase: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(INTENT_PHASE_PRE_GIT)),
         }
     }
 
+    /// Call immediately before awaiting `receive_pack`: from here a drop is a
+    /// mid-git disconnect, not a pre-git shed.
+    fn notify_git_started(&self) {
+        self.phase.store(
+            INTENT_PHASE_GIT_STARTED,
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
     fn disarm(&self) {
-        self.armed
-            .store(false, std::sync::atomic::Ordering::Release);
+        self.phase
+            .store(INTENT_PHASE_DONE, std::sync::atomic::Ordering::Release);
     }
 }
 
 impl Drop for IntentDropGuard {
     fn drop(&mut self) {
-        if self.armed.load(std::sync::atomic::Ordering::Acquire) {
-            let db = self.db.clone();
-            let request_id = self.request_id.clone();
-            tokio::spawn(async move {
-                if let Err(e) = db
-                    .refuse_receive_pack_before_git(
-                        &request_id,
-                        "handler dropped before git started",
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        err = %e,
-                        request_id = %request_id,
-                        "drop-guard cleanup failed"
-                    );
+        let phase = self.phase.load(std::sync::atomic::Ordering::Acquire);
+        if phase == INTENT_PHASE_DONE {
+            return;
+        }
+        let db = self.db.clone();
+        let request_id = self.request_id.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                if phase == INTENT_PHASE_GIT_STARTED {
+                    handle.spawn(async move {
+                        if let Err(e) = db.mark_receive_pack_interrupted(&request_id).await {
+                            tracing::warn!(
+                                err = %e,
+                                request_id = %request_id,
+                                "drop-guard post-git cleanup failed"
+                            );
+                        }
+                    });
+                } else {
+                    handle.spawn(async move {
+                        if let Err(e) = db
+                            .refuse_receive_pack_before_git(
+                                &request_id,
+                                "handler dropped before git started",
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                err = %e,
+                                request_id = %request_id,
+                                "drop-guard cleanup failed"
+                            );
+                        }
+                    });
                 }
-            });
+            }
+            Err(_) => {
+                tracing::warn!(
+                    request_id = %request_id,
+                    phase,
+                    "intent drop-guard fired off-runtime; cannot spawn cleanup, intent may strand"
+                );
+            }
         }
     }
 }
 
 // ── Pkt-line parsing ──────────────────────────────────────────────────────
 
+/// True for refnames inside the node-managed namespace: the `refs/gitlawb/`
+/// subtree plus the bare `refs/gitlawb` name (no trailing slash), which
+/// `starts_with("refs/gitlawb/")` alone misses and which lands on repos with
+/// no internal refs yet. Extracted so the gate predicate is unit-testable;
+/// the handler denies any push naming such a ref before intent is written.
+fn ref_is_internal_namespace(ref_name: &str) -> bool {
+    ref_name == "refs/gitlawb" || ref_name.starts_with("refs/gitlawb/")
+}
+
 /// `Clone` so `git_receive_pack` can hand the parsed updates to the detached
 /// replication tail at the durability boundary while the certificate and webhook
 /// loops below still iterate their own copy (#174 U5).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct RefUpdate {
     pub(crate) old_sha: String,
     pub(crate) new_sha: String,
@@ -11539,5 +11603,70 @@ mod tests {
                 .is_empty(),
             "and the unvetted push still maps no CID"
         );
+    }
+
+    /// A ref-update command line that is not valid UTF-8 refuses the whole
+    /// push. Git accepts refnames with bytes >= 0x80, so silently skipping
+    /// such a line would plant a ref the namespace gate never sees and no
+    /// durable child row covers. Removing the Err arm (skip-and-continue)
+    /// turns the expect_err red.
+    #[test]
+    fn parse_ref_updates_refuses_non_utf8_command_line() {
+        // Well-formed section first: one command + flush parses fine.
+        let good_payload = format!("{} {} refs/heads/main\n", "0".repeat(40), "1".repeat(40));
+        let good_body = format!("{:04x}{}0000", good_payload.len() + 4, good_payload);
+        let updates = parse_ref_updates(good_body.as_bytes()).expect("well-formed section parses");
+        assert_eq!(updates.len(), 1, "one command line yields one update");
+        assert_eq!(updates[0].ref_name, "refs/heads/main");
+
+        // Same framing, but the refname carries a raw 0xFF byte (note: `b"\xff"`
+        // is one raw byte; `"\xff"` in a str literal would be U+00FF instead).
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"0000000000000000000000000000000000000000 ");
+        payload.extend_from_slice(b"1111111111111111111111111111111111111111 ");
+        payload.extend_from_slice(b"refs/gitlawb/issues/\xffx\n");
+        let mut body = format!("{:04x}", payload.len() + 4).into_bytes();
+        body.extend_from_slice(&payload);
+        body.extend_from_slice(b"0000");
+        let err =
+            parse_ref_updates(&body).expect_err("a non-UTF-8 command line must refuse the push");
+        assert!(
+            matches!(err, AppError::BadRequest(_)),
+            "undecodable ref-update line is a client error (400), got {err:?}"
+        );
+    }
+
+    /// The internal-namespace predicate covers the bare `refs/gitlawb` name
+    /// and the whole subtree, and nothing else. The handler denies any push
+    /// naming such a ref before intent is written; narrowing the predicate
+    /// (e.g. dropping the bare-name arm) turns these red.
+    #[test]
+    fn internal_namespace_gate_covers_bare_name_and_subtree() {
+        // Denied: bare name, subtree root, exempt namespaces, attacker refs.
+        for denied in [
+            "refs/gitlawb",
+            "refs/gitlawb/",
+            "refs/gitlawb/requests/550e8400-e29b-41d4-a716-446655440000",
+            "refs/gitlawb/issues/abc123",
+            "refs/gitlawb/evil",
+        ] {
+            assert!(
+                ref_is_internal_namespace(denied),
+                "push gate must deny {denied}"
+            );
+        }
+        // Allowed: content refs, lookalike prefixes, empty.
+        for allowed in [
+            "refs/heads/main",
+            "refs/tags/v1",
+            "refs/gitlawbfoo",
+            "refs/heads/gitlawb/x",
+            "",
+        ] {
+            assert!(
+                !ref_is_internal_namespace(allowed),
+                "push gate must allow {allowed}"
+            );
+        }
     }
 }
