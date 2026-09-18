@@ -435,6 +435,17 @@ async fn process_batch(
                 .await;
             }
             Err(e) => {
+                // Prune failures defer: the mirror is on disk but may still
+                // carry a non-exempt refs/gitlawb ref, a transient local-git
+                // condition a retry can clear. Failing the row would leave it
+                // unretried until the next peer announcement, wedging serving
+                // in the meantime; leaving it pending retries fetch+prune
+                // (both idempotent) on the next tick.
+                if e.downcast_ref::<PruneFailed>().is_some() {
+                    warn!(repo = %item.repo, origin = %origin_url, err = %e, "mirror prune failed; leaving sync row pending for retry");
+                    crate::metrics::record_sync_processed("deferred");
+                    continue;
+                }
                 warn!(repo = %item.repo, origin = %origin_url, err = %e, "repo sync failed");
                 let _ = db.mark_sync_failed(&item.id).await;
                 crate::metrics::record_sync_processed("failed");
@@ -714,11 +725,26 @@ fn gitlawb_ref_is_exempt(raw_refname: &[u8]) -> bool {
 /// (negative refspecs cannot re-include them, so post-import deletion is the
 /// mechanism that works).
 ///
+/// Callers map a prune error to [`PruneFailed`] so the batch defers the row
+/// (stays `pending`, retried next tick) instead of failing it: a failed row
+/// would leave a possibly-wedged mirror unretried until the next peer
+/// announcement.
+///
 /// Enumeration is `git show-ref` (no pattern), parsed as raw bytes: refnames
 /// cannot contain newlines, so one line per ref is lossless even for
-/// non-UTF-8 names, which a lossy decode would miss and which
-/// `for-each-ref` cannot NUL-terminate. Fails the sync (retried on the next
-/// tick) rather than leaving the mirror in a state that wedges serving.
+/// non-UTF-8 names, which a lossy decode would miss. (`for-each-ref` has no
+/// NUL-terminating mode on the git versions this node supports, so byte
+/// splitting its newline-terminated output would be equally lossy for names
+/// containing newlines — which git forbids — making `show-ref` the portable
+/// lossless choice.)
+///
+/// Fail-closed throughout: the exit code is classified (only `1` with empty
+/// output means "no refs"; anything else non-zero, e.g. 128 on a missing
+/// repo, is fatal, since a silent skip would leave an imported evil ref in
+/// place while the sync reports success), and any line that is not
+/// `<hex-sha> SP <refname>` — 40-hex SHA-1 or 64-hex SHA-256, which a sha256
+/// mirror inherits from its origin — fails the sync rather than being
+/// skipped into an unpruned wedge.
 async fn prune_non_exempt_gitlawb_refs(local_path: &Path) -> anyhow::Result<()> {
     let local_str = local_path.to_str().unwrap_or(".");
     let out = tokio::process::Command::new("git")
@@ -726,18 +752,37 @@ async fn prune_non_exempt_gitlawb_refs(local_path: &Path) -> anyhow::Result<()> 
         .output()
         .await
         .map_err(|e| anyhow::anyhow!("git show-ref failed to spawn: {e}"))?;
-    // Exit 1 with empty output just means the repo has no refs at all.
-    if !out.status.success() && !out.stdout.is_empty() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(anyhow::anyhow!("git show-ref failed: {stderr}"));
+    // Classify on the exit code (the `existing_promisor_state` precedent):
+    // 0 parses, 1 with empty output is an empty repo, anything else is a
+    // fatal enumeration failure that must not read as "nothing to prune".
+    match out.status.code() {
+        Some(0) => {}
+        Some(1) if out.stdout.is_empty() => return Ok(()),
+        _ => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(anyhow::anyhow!(
+                "git show-ref failed with code {:?}: {stderr}",
+                out.status.code()
+            ));
+        }
     }
     for line in out.stdout.split(|b| *b == b'\n') {
-        // `<40-hex-sha> SP <refname>`; skip anything else-shaped.
-        let Some(raw) = line.get(41..).filter(|_| line.get(40) == Some(&b' ')) else {
-            continue;
+        if line.is_empty() {
+            continue; // trailing newline
+        }
+        // `<hex-sha> SP <refname>`; anything else-shaped is an anomaly, not
+        // a skip: silently passing an unclassifiable line could leave an
+        // evil ref imported.
+        let Some(sp) = line.iter().position(|b| *b == b' ') else {
+            return Err(anyhow::anyhow!("git show-ref emitted an unparsable line"));
         };
-        if raw.is_empty()
-            || !(raw == b"refs/gitlawb" || raw.starts_with(b"refs/gitlawb/"))
+        let (sha, raw) = (&line[..sp], &line[sp + 1..]);
+        let sha_ok =
+            (sha.len() == 40 || sha.len() == 64) && sha.iter().all(|b| b.is_ascii_hexdigit());
+        if !sha_ok || raw.is_empty() {
+            return Err(anyhow::anyhow!("git show-ref emitted an unparsable line"));
+        }
+        if !(raw == b"refs/gitlawb" || raw.starts_with(b"refs/gitlawb/"))
             || gitlawb_ref_is_exempt(raw)
         {
             continue;
@@ -781,6 +826,25 @@ fn os_from_raw_refname(raw: &[u8]) -> std::ffi::OsString {
     String::from_utf8_lossy(raw).into_owned().into()
 }
 
+/// Marker for mirror-prune failures: the clone/fetch succeeded, so the
+/// mirror is on disk, but a non-exempt `refs/gitlawb/*` ref may still be
+/// imported. Local-git conditions are transient (a retry can succeed), while
+/// `mark_sync_failed` is terminal until the next peer announcement — and a
+/// failed row would leave a possibly-wedged mirror unretried in the
+/// meantime. The batch error arm downcasts to this and defers the row
+/// (stays `pending`, retried on the next 30s tick, where fetch+prune are
+/// idempotent) instead of failing it.
+#[derive(Debug)]
+struct PruneFailed(String);
+
+impl std::fmt::Display for PruneFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "mirror prune failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for PruneFailed {}
+
 /// Mirror-clone a repo from a remote URL into a local bare repo.
 /// `Promisor` mode adds `--filter=blob:limit=10g`, which marks the repo a git
 /// promisor (so a pack with origin-omitted withheld blobs is accepted) while
@@ -806,7 +870,11 @@ async fn clone_repo(remote_url: &str, local_path: &Path, mode: MirrorMode) -> an
     }
     // A fresh mirror imports everything the origin advertises, including any
     // planted non-exempt `refs/gitlawb/*` ref; prune before serving from it.
-    prune_non_exempt_gitlawb_refs(local_path).await?;
+    // A prune failure defers (stays pending) rather than failing the row —
+    // see `PruneFailed`.
+    prune_non_exempt_gitlawb_refs(local_path)
+        .await
+        .map_err(|e| anyhow::anyhow!(PruneFailed(e.to_string())))?;
     Ok(())
 }
 
@@ -870,7 +938,11 @@ async fn fetch_repo(local_path: &Path, remote_url: &str, mode: MirrorMode) -> an
         }
     };
     fetch_result?;
-    prune_non_exempt_gitlawb_refs(local_path).await
+    // Prune after every fetch (see above); a prune failure defers the row
+    // rather than failing it — see `PruneFailed`.
+    prune_non_exempt_gitlawb_refs(local_path)
+        .await
+        .map_err(|e| anyhow::anyhow!(PruneFailed(e.to_string())))
 }
 
 #[cfg(test)]

@@ -3919,14 +3919,18 @@ impl Db {
             // Terminal states (`complete`, `quarantined`) are locked too:
             // the due worker races the startup reconcile, so a parent may go
             // terminal between the first UPDATE and this read. A child just
-            // marked applied then has effects that silently never run and is
-            // later purged under the terminal parent. There is nothing
+            // marked applied then has effects that silently never run. Under
+            // a `complete` parent the child purges with the aggregate; under
+            // `quarantined` neither parent nor applied child ever enters the
+            // purge set (child rejection covers only `prepared`/`uncertain`),
+            // so it sits with no executor. Either way there is nothing
             // automatic left to do (the drain will not rerun a terminal
             // request), so log loudly for operator attention instead of
             // returning a silent success.
             //
-            // Bounded 10s like the refuse path: a lock-blocked merge must not
-            // stall the reconcile page behind it indefinitely.
+            // Only this merge transaction is bounded 10s; the single-statement
+            // promotion UPDATE above it is not (pre-existing) — a stall there
+            // still blocks the page.
             let merge = async {
                 let mut tx = self.pool.begin().await?;
                 let existing: Option<(serde_json::Value, Option<i32>, String)> = sqlx::query_as(
@@ -3951,8 +3955,9 @@ impl Db {
                         request_id = %request_id,
                         state = %stored_state,
                         "reconcile applied a child after the parent went terminal; \
-                         the late child's effects never ran and it will purge under \
-                         the terminal parent — operator attention required"
+                         the late child's effects never ran (it purges with a \
+                         `complete` aggregate, or sits executor-less under \
+                         `quarantined`) — operator attention required"
                     );
                     return Ok(0);
                 }

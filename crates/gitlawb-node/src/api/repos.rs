@@ -2811,6 +2811,22 @@ pub async fn git_receive_pack(
     // the next process restart, when startup reconcile promotes disk-proved
     // children and the aggregate. This attended-restart window is by design:
     // refs are safe on disk, never silently dropped, just not yet accounted.
+    //
+    // Stash the computed fates on the drop-guard first: a drop during the
+    // retries (or anywhere later while the guard is armed) then commits these
+    // fates via the guard's bounded retry instead of a context-free blanket
+    // `uncertain` — git-proven rejections land `cancelled`, not `uncertain`.
+    _intent_guard.set_fates(ComputedFates {
+        ok_names: ok_names.iter().map(|s| s.to_string()).collect(),
+        ng_names: ng_names.iter().map(|s| s.to_string()).collect(),
+        uncertain_names: uncertain_names.iter().map(|s| s.to_string()).collect(),
+        unpack_failed,
+        git_exit_ok: exit_ok,
+        parsed_json: parsed_json_opt.clone(),
+        accepted_ordinal,
+        rejected_reason: rejected_reason.clone(),
+        terminal_no_effects,
+    });
     let mut delay_ms = 20;
     let outcome_commit_ok = loop {
         match state
@@ -2847,7 +2863,9 @@ pub async fn git_receive_pack(
                     request_id = %request_id,
                     repo = %name,
                     "commit_request_outcomes_atomically failed after retries; \
-                     parent stays received, effects deferred to startup reconcile"
+                     effects deferred to startup reconcile (parent stays received \
+                     unless the still-armed guard terminalizes it on scope exit, \
+                     which startup reconcile recovers the same way)"
                 );
                 break false;
             }
@@ -3002,9 +3020,10 @@ pub async fn git_receive_pack(
     // Unless refs landed AND the outcome was durably committed, return 200
     // with the receive-pack body and run no durable effects (no push event,
     // no trust score, no metrics, no webhooks, no certs, no anchor jobs).
-    // Unlanded refs were flipped to `cancelled` / `uncertain` above and
-    // reconcile will not promote them; uncommitted outcomes wait for
-    // startup reconcile.
+    // Refs the commit resolved were flipped to `cancelled` / `uncertain`
+    // above and reconcile will not promote them; on commit failure children
+    // stay `prepared` until the guard's scope-exit drop commits the stashed
+    // fates or marks them `uncertain`, and reconcile resolves either outcome.
     if !disposition.run_effects {
         return axum::response::Response::builder()
             .status(axum::http::StatusCode::OK)
@@ -3853,15 +3872,19 @@ pub async fn get_icaptcha_proof(
 ///
 /// Arm before the intent insert resolves (the refuse is a no-op on an
 /// uncommitted id), move to git-started immediately before awaiting
-/// `receive_pack`, and disarm once the outcome commit resolves. A sync Drop
-/// cannot await, so cleanup is spawned like `KillGroupOnDrop` and
-/// `RepoWriteGuard` do: prefer the current runtime handle, and with no
-/// runtime (off-runtime drop, process teardown) log loudly instead of
-/// panicking on a bare `tokio::spawn`.
+/// `receive_pack`, stash computed fates once the report is parsed, and disarm
+/// once the outcome commit resolves. A sync Drop cannot await, so cleanup is
+/// spawned like `KillGroupOnDrop` and `RepoWriteGuard` do: prefer the current
+/// runtime handle, and with no runtime (off-runtime drop, process teardown)
+/// log loudly instead of panicking on a bare `tokio::spawn`. The spawned
+/// cleanup retries with backoff until the aggregate leaves `received`
+/// (see `retry_guard_cleanup`): a single shot can lose the race the early
+/// arming was meant to close.
 struct IntentDropGuard {
     db: std::sync::Arc<crate::db::Db>,
     request_id: String,
     phase: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    fates: std::sync::Arc<std::sync::Mutex<Option<ComputedFates>>>,
 }
 
 const INTENT_PHASE_PRE_GIT: u8 = 0;
@@ -3874,6 +3897,15 @@ impl IntentDropGuard {
             db,
             request_id,
             phase: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(INTENT_PHASE_PRE_GIT)),
+            fates: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Stash the computed outcome fates once git's report is parsed, so a
+    /// later drop commits fates instead of a blanket `uncertain`.
+    fn set_fates(&self, fates: ComputedFates) {
+        if let Ok(mut slot) = self.fates.lock() {
+            *slot = Some(fates);
         }
     }
 
@@ -3892,6 +3924,110 @@ impl IntentDropGuard {
     }
 }
 
+/// Owned per-ref outcome fates computed from git's report-status, stashed on
+/// the drop-guard so a post-git drop commits them instead of a context-free
+/// blanket `uncertain`. A guard that only knows "git started" would flip even
+/// git-proven rejections to `uncertain`, which reconcile can never resolve
+/// (a rejected ref never lands, so no proof can exist) — they would linger
+/// until an operator path. With fates, rejections go straight to `cancelled`
+/// (terminal, purgeable) and only genuinely unknown refs stay `uncertain`.
+#[derive(Clone)]
+struct ComputedFates {
+    ok_names: Vec<String>,
+    ng_names: Vec<String>,
+    uncertain_names: Vec<String>,
+    unpack_failed: bool,
+    git_exit_ok: bool,
+    parsed_json: Option<serde_json::Value>,
+    accepted_ordinal: Option<i32>,
+    rejected_reason: Option<String>,
+    terminal_no_effects: bool,
+}
+
+/// Spawned drop-guard cleanup with bounded retry. A single shot can evaluate
+/// the `state = 'received'` gate before a racing commit lands (the
+/// insert-timeout cancellation window) or hit a transient DB error — either
+/// strands permanently since nothing re-drives it. Retry with short backoff
+/// until the aggregate leaves `received` (terminal or purged) or the budget
+/// expires. The budget covers the 30s intent-insert lifetime, so a commit
+/// landing inside the cancellation window is always observed.
+///
+/// A missing parent retries rather than stopping: it may be an insert whose
+/// commit has not landed yet. Only a non-`received` parent stops the loop.
+async fn retry_guard_cleanup(
+    db: &std::sync::Arc<crate::db::Db>,
+    request_id: &str,
+    post_git: bool,
+    fates: Option<ComputedFates>,
+) {
+    let budget = std::time::Duration::from_secs(30);
+    let start = std::time::Instant::now();
+    let mut delay = std::time::Duration::from_millis(100);
+    loop {
+        match db.get_receive_pack_request(request_id).await {
+            Ok(None) => {
+                // No row yet (or already purged): only the budget decides.
+            }
+            Ok(Some(req)) if req.state != crate::db::request_state::RECEIVED => return,
+            Ok(Some(_)) => {
+                let attempt = if post_git {
+                    match &fates {
+                        Some(f) if !(f.terminal_no_effects && f.parsed_json.is_none()) => {
+                            let ok: Vec<&str> = f.ok_names.iter().map(String::as_str).collect();
+                            let ng: Vec<&str> = f.ng_names.iter().map(String::as_str).collect();
+                            let un: Vec<&str> =
+                                f.uncertain_names.iter().map(String::as_str).collect();
+                            db.commit_request_outcomes_atomically(
+                                request_id,
+                                &ok,
+                                &ng,
+                                &un,
+                                f.unpack_failed,
+                                f.git_exit_ok,
+                                f.parsed_json.as_ref(),
+                                f.accepted_ordinal,
+                                f.rejected_reason.as_deref(),
+                                f.terminal_no_effects,
+                            )
+                            .await
+                        }
+                        _ => db.mark_receive_pack_interrupted(request_id).await,
+                    }
+                } else {
+                    db.refuse_receive_pack_before_git(
+                        request_id,
+                        "handler dropped before git started",
+                    )
+                    .await
+                };
+                if let Err(e) = attempt {
+                    tracing::warn!(
+                        err = %e,
+                        request_id = %request_id,
+                        "drop-guard cleanup attempt failed; retrying within budget"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    err = %e,
+                    request_id = %request_id,
+                    "drop-guard state check failed; retrying within budget"
+                );
+            }
+        }
+        if start.elapsed() + delay > budget {
+            tracing::warn!(
+                request_id = %request_id,
+                "drop-guard cleanup budget exhausted with aggregate still uncommitted/received"
+            );
+            return;
+        }
+        tokio::time::sleep(delay).await;
+        delay = std::cmp::min(delay * 2, std::time::Duration::from_secs(5));
+    }
+}
+
 impl Drop for IntentDropGuard {
     fn drop(&mut self) {
         let phase = self.phase.load(std::sync::atomic::Ordering::Acquire);
@@ -3900,35 +4036,13 @@ impl Drop for IntentDropGuard {
         }
         let db = self.db.clone();
         let request_id = self.request_id.clone();
+        let post_git = phase == INTENT_PHASE_GIT_STARTED;
+        let fates = self.fates.lock().ok().and_then(|mut slot| slot.take());
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
-                if phase == INTENT_PHASE_GIT_STARTED {
-                    handle.spawn(async move {
-                        if let Err(e) = db.mark_receive_pack_interrupted(&request_id).await {
-                            tracing::warn!(
-                                err = %e,
-                                request_id = %request_id,
-                                "drop-guard post-git cleanup failed"
-                            );
-                        }
-                    });
-                } else {
-                    handle.spawn(async move {
-                        if let Err(e) = db
-                            .refuse_receive_pack_before_git(
-                                &request_id,
-                                "handler dropped before git started",
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                err = %e,
-                                request_id = %request_id,
-                                "drop-guard cleanup failed"
-                            );
-                        }
-                    });
-                }
+                handle.spawn(async move {
+                    retry_guard_cleanup(&db, &request_id, post_git, fates).await;
+                });
             }
             Err(_) => {
                 tracing::warn!(
@@ -7029,6 +7143,114 @@ mod tests {
             "once the lock frees, a follow-up push must admit past the (recovered) write \
              pool and acquire; got {followup:?}"
         );
+    }
+
+    /// A handler refusal after intent insert leaves a terminal aggregate, not
+    /// a strand. Same stall as the deadline test above, but the push carries
+    /// a real ref command, so intent has children: after the 503 the parent
+    /// must be `rejected_at_git` with `completed_at` (purge-eligible), every
+    /// child `cancelled` (never promotable, no tuple poisoning), and the
+    /// proof acked (no purge block). Deleting any inline refuse call strands
+    /// `received` + `prepared` and turns these red. The inline refuse is
+    /// synchronous, so no sleep/poll is needed — unlike the drop-guard path.
+    #[sqlx::test]
+    async fn receive_pack_refusal_terminalizes_intent_aggregate(pool: sqlx::PgPool) {
+        use crate::git::repo_store::advisory_lock_key;
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+
+        let owner = "z6refuseagg";
+        let name = "ra1";
+        let owner_slug = owner.replace([':', '/'], "_");
+        let lock_key = advisory_lock_key(&owner_slug, name);
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let mut cfg = (*state.config).clone();
+        cfg.git_acquire_timeout_secs = 2;
+        cfg.git_service_timeout_secs = 600;
+        state.config = std::sync::Arc::new(cfg);
+        state
+            .db
+            .upsert_mirror_repo(owner, name, "/tmp/z6refuseagg-ra1", None, false)
+            .await
+            .unwrap();
+        let repo_id = state
+            .db
+            .get_repo(owner, name)
+            .await
+            .unwrap()
+            .expect("mirror row exists")
+            .id;
+
+        // Stall acquire_write on a second pooled connection.
+        let mut lock_conn = pool.acquire().await.expect("second connection");
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(lock_key)
+            .execute(&mut *lock_conn)
+            .await
+            .expect("hold the advisory lock");
+
+        let did = "did:key:z6refuseagg";
+        let peer: SocketAddr = "203.0.113.91:5000".parse().unwrap();
+        let result = git_receive_pack(
+            State(state.clone()),
+            Path((owner.to_string(), name.to_string())),
+            Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            crate::rate_limit::PeerAddr(Some(peer)),
+            axum::http::HeaderMap::new(),
+            ref_update_body("1111111111111111111111111111111111111111"),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(AppError::Overloaded(_))),
+            "stalled acquire_write must shed with Overloaded/503; got {result:?}"
+        );
+
+        // Exactly one aggregate for this push, terminal on both levels.
+        let (req_id, req_state, completed_at): (String, String, Option<String>) = sqlx::query_as(
+            "SELECT id, state, completed_at FROM receive_pack_requests WHERE repo_id = $1",
+        )
+        .bind(&repo_id)
+        .fetch_one(state.db.pool())
+        .await
+        .expect("one intent aggregate per refused push");
+        assert_eq!(
+            req_state,
+            crate::db::request_state::REJECTED_AT_GIT,
+            "refused parent is terminal"
+        );
+        assert!(
+            completed_at.is_some(),
+            "refused parent carries completed_at so retention can purge it"
+        );
+        let children = state
+            .db
+            .list_pending_ref_transitions_for_request(&req_id)
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1, "the ref command produced one child");
+        assert_eq!(
+            children[0].state,
+            crate::db::pending_state::CANCELLED,
+            "refused child is cancelled, never prepared"
+        );
+        let proof = state
+            .db
+            .get_request_proof(&req_id)
+            .await
+            .unwrap()
+            .expect("proof row exists");
+        assert!(
+            proof.acked_at.is_some(),
+            "refused proof is acked so purge is not blocked"
+        );
+
+        sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(lock_key)
+            .execute(&mut *lock_conn)
+            .await
+            .expect("release the advisory lock");
     }
 
     #[cfg(unix)]

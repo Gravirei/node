@@ -963,6 +963,48 @@ fn issue_26_namespace_gate_and_refusal_wiring() {
          off-runtime arm, not a bare tokio::spawn"
     );
 
+    // P2: the post-git drop arm must exist and be wired. The guard's
+    // GIT_STARTED phase spawns `mark_receive_pack_interrupted` (parent to
+    // `rejected_at_git`, children to `uncertain` — the Err arm never runs on
+    // a drop). Deleting that spawn keeps every count above green, so pin the
+    // method name; its behavior is proved by
+    // `post_git_interruption_marks_uncertain_and_terminalizes_parent`.
+    assert!(
+        repos.contains("mark_receive_pack_interrupted("),
+        "P2 wiring: the guard's post-git phase must spawn \
+         mark_receive_pack_interrupted (a mid-git drop otherwise strands \
+         received+prepared with no Err arm to mark them uncertain)"
+    );
+    // The guard must commit computed fates rather than a blanket uncertain
+    // once the report is parsed, and only disarm on a resolved commit: pin
+    // both the stash call and the `outcome_commit_ok` gate. Making disarm()
+    // unconditional strands the commit-failure path and misfiles proven
+    // rejections as uncertain.
+    assert!(
+        repos.contains("set_fates(ComputedFates"),
+        "P2 wiring: computed fates must be stashed on the guard once parsed, \
+         or a post-commit drop can only apply a context-free uncertain"
+    );
+    assert!(
+        repos.contains("if outcome_commit_ok"),
+        "P2 wiring: disarm must be gated on outcome_commit_ok; unconditional \
+         disarm strands the persistent-commit-failure path"
+    );
+
+    // P2: pin the mirror prune call sites. The prune helper is called from
+    // both `clone_repo` and `fetch_repo` (plus its own definition) — deleting
+    // either call leaves the direct-helper test green while mirrors import
+    // evil refs again. Count occurrences of the call with its argument.
+    let sync_src = src("sync.rs");
+    assert_eq!(
+        sync_src
+            .matches("prune_non_exempt_gitlawb_refs(local_path)")
+            .count(),
+        2,
+        "P2 wiring: prune must be called from both clone_repo and fetch_repo; \
+         deleting either call must turn this red"
+    );
+
     // P2: the visibility exemption narrowing removed a serving path. The exemption
     // is now scoped to `requests/` and `issues/` only (visibility_pack.rs:371), and
     // the comment at :340 states the push gate is the premise. Tests must prove the

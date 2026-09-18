@@ -4992,6 +4992,123 @@ mod drain_tests {
         );
     }
 
+    /// Post-git interruption (a drop the `receive_pack` Err arm never runs
+    /// for) terminalizes the parent but keeps children recoverable: parent
+    /// `received` → `rejected_at_git` with `completed_at`, `prepared`
+    /// children → `uncertain` (never `cancelled` — git may have landed refs,
+    /// so reconcile must still prove each landing), and the proof stays
+    /// unacked (the drain acks it when effects complete; an unacked proof
+    /// blocks premature purge). A second call once the parent left
+    /// `received` is a no-op. Deleting the guard's GIT_STARTED spawn arm
+    /// keeps every wiring pin green, so this behavioral test pins the arm.
+    #[sqlx::test]
+    async fn post_git_interruption_marks_uncertain_and_terminalizes_parent(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let now = chrono::Utc::now().to_rfc3339();
+        let req = crate::db::ReceivePackRequest {
+            id: "req-mid-git-drop".to_string(),
+            repo_id: "repo-mid-git".to_string(),
+            pusher_did: "did:key:z6pusher".to_string(),
+            node_did: state.node_did.to_string(),
+            request_bytes: Vec::new(),
+            request_bytes_hash: vec![7u8; 32],
+            state: request_state::RECEIVED.to_string(),
+            git_exit_ok: None,
+            parsed_report: None,
+            accepted_ordinal: None,
+            attempt_count: 0,
+            last_error: None,
+            next_attempt_at: None,
+            created_at: now.clone(),
+            completed_at: None,
+            signature_header: Some("sig".to_string()),
+            signature_input: Some("sig-input".to_string()),
+            content_digest: Some("digest".to_string()),
+        };
+        let updates = vec![crate::api::repos::RefUpdate {
+            old_sha: "0".repeat(40),
+            new_sha: "1".repeat(40),
+            ref_name: "refs/heads/main".to_string(),
+        }];
+        state
+            .db
+            .insert_receive_pack_request_with_children(
+                &req,
+                "repo-mid-git",
+                &state.node_did.to_string(),
+                "did:key:z6pusher",
+                &updates,
+                "sig",
+                "sig-input",
+                "digest",
+            )
+            .await
+            .unwrap();
+
+        // The drop during git: the Err arm never runs for it.
+        state
+            .db
+            .mark_receive_pack_interrupted("req-mid-git-drop")
+            .await
+            .unwrap();
+
+        let parent = state
+            .db
+            .get_receive_pack_request("req-mid-git-drop")
+            .await
+            .unwrap()
+            .expect("parent exists");
+        assert_eq!(
+            parent.state,
+            request_state::REJECTED_AT_GIT,
+            "interrupted parent is terminal (purge-eligible, still promotable)"
+        );
+        assert!(
+            parent.completed_at.is_some(),
+            "interrupted parent carries completed_at"
+        );
+        let children = state
+            .db
+            .list_pending_ref_transitions_for_request("req-mid-git-drop")
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1, "the child exists");
+        assert_eq!(
+            children[0].state,
+            pending_state::UNCERTAIN,
+            "interrupted child is uncertain (git may have landed it), never cancelled"
+        );
+        let proof = state
+            .db
+            .get_request_proof("req-mid-git-drop")
+            .await
+            .unwrap()
+            .expect("proof row exists");
+        assert!(
+            proof.acked_at.is_none(),
+            "interrupted proof stays unacked so purge waits for the drain"
+        );
+
+        // Received-gate no-op: a second call changes nothing (the aggregate
+        // already left `received`), so a duplicate guard firing is harmless.
+        state
+            .db
+            .mark_receive_pack_interrupted("req-mid-git-drop")
+            .await
+            .unwrap();
+        let again = state
+            .db
+            .get_receive_pack_request("req-mid-git-drop")
+            .await
+            .unwrap()
+            .expect("parent exists");
+        assert_eq!(
+            again.state,
+            request_state::REJECTED_AT_GIT,
+            "repeat interruption is a no-op once terminal"
+        );
+    }
+
     /// Re-promotion merges later-page children without rewriting the
     /// consumed event key. A mid-bundle crash deletes children once
     /// their effects land, so recomputing the ordinal as min-over-survivors
