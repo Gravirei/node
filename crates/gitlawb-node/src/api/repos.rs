@@ -3110,6 +3110,18 @@ pub async fn git_receive_pack(
                 );
             }
         }
+        Ok(crate::durable_outbox::EffectsOutcome::AwaitingSiblings) => {
+            // Siblings unresolved: completion waits for startup reconcile,
+            // not for a failed effect. Route nowhere near retry accounting
+            // — incrementing attempts here would quarantine a request that
+            // is only waiting. The aggregate stays `outcomes_committed` and
+            // due, so the drain re-checks it and reconcile resolves it.
+            tracing::debug!(
+                request_id = %request_id,
+                repo = %name,
+                "live path: siblings unresolved, waiting for reconcile (no retry accounting)"
+            );
+        }
         Err(e) => {
             // Execution errors must advance retry accounting so the request
             // is not frozen behind the 300s claim lease with attempt_count
@@ -3865,8 +3877,10 @@ pub async fn get_icaptcha_proof(
 ///   window): no git evidence can exist, so refuse the aggregate outright —
 ///   parent to `rejected_at_git`, `prepared` children to `cancelled`.
 /// - Dropped after git starts (the whole `receive_pack` await and the outcome
-///   commit): git may have landed refs, so mark `prepared` children `uncertain`
-///   and terminalize the parent, mirroring the `receive_pack` Err arm for a
+///   commit): git may have landed refs, so commit the stashed fates when the
+///   report was already parsed (proven rejections go `cancelled`, unknowns
+///   `uncertain`); with no fates, mark `prepared` children `uncertain` and
+///   terminalize the parent, mirroring the `receive_pack` Err arm for a
 ///   drop that can never reach it. Startup reconcile still promotes proved
 ///   children of a `rejected_at_git` parent.
 ///
@@ -3948,19 +3962,40 @@ struct ComputedFates {
 /// the `state = 'received'` gate before a racing commit lands (the
 /// insert-timeout cancellation window) or hit a transient DB error — either
 /// strands permanently since nothing re-drives it. Retry with short backoff
-/// until the aggregate leaves `received` (terminal or purged) or the budget
-/// expires. The budget covers the 30s intent-insert lifetime, so a commit
+/// until a live aggregate leaves `received`; a missing row retries until the
+/// budget expires instead, since it may be an insert whose commit has not
+/// landed yet. The budget covers the 30s intent-insert lifetime, so a commit
 /// landing inside the cancellation window is always observed.
 ///
-/// A missing parent retries rather than stopping: it may be an insert whose
-/// commit has not landed yet. Only a non-`received` parent stops the loop.
+/// Each attempt is bounded 10s like the sibling cleanups: a lock-blocked
+/// `commit_request_outcomes_atomically` (awaited bare, unbounded inside) must
+/// not park the spawned task and its pool connection past the budget — the
+/// case the bound exists for. The existing warn arm retries inside the budget.
 async fn retry_guard_cleanup(
     db: &std::sync::Arc<crate::db::Db>,
     request_id: &str,
     post_git: bool,
     fates: Option<ComputedFates>,
 ) {
-    let budget = std::time::Duration::from_secs(30);
+    retry_guard_cleanup_with_budget(
+        db,
+        request_id,
+        post_git,
+        fates,
+        std::time::Duration::from_secs(30),
+    )
+    .await
+}
+
+/// Budget-parameterized core of [`retry_guard_cleanup`]; the wrapper above
+/// supplies the production 30s, tests supply milliseconds.
+async fn retry_guard_cleanup_with_budget(
+    db: &std::sync::Arc<crate::db::Db>,
+    request_id: &str,
+    post_git: bool,
+    fates: Option<ComputedFates>,
+    budget: std::time::Duration,
+) {
     let start = std::time::Instant::now();
     let mut delay = std::time::Duration::from_millis(100);
     loop {
@@ -3970,42 +4005,53 @@ async fn retry_guard_cleanup(
             }
             Ok(Some(req)) if req.state != crate::db::request_state::RECEIVED => return,
             Ok(Some(_)) => {
-                let attempt = if post_git {
-                    match &fates {
-                        Some(f) if !(f.terminal_no_effects && f.parsed_json.is_none()) => {
-                            let ok: Vec<&str> = f.ok_names.iter().map(String::as_str).collect();
-                            let ng: Vec<&str> = f.ng_names.iter().map(String::as_str).collect();
-                            let un: Vec<&str> =
-                                f.uncertain_names.iter().map(String::as_str).collect();
-                            db.commit_request_outcomes_atomically(
-                                request_id,
-                                &ok,
-                                &ng,
-                                &un,
-                                f.unpack_failed,
-                                f.git_exit_ok,
-                                f.parsed_json.as_ref(),
-                                f.accepted_ordinal,
-                                f.rejected_reason.as_deref(),
-                                f.terminal_no_effects,
-                            )
-                            .await
+                let run = async {
+                    if post_git {
+                        match &fates {
+                            Some(f) if !(f.terminal_no_effects && f.parsed_json.is_none()) => {
+                                let ok: Vec<&str> = f.ok_names.iter().map(String::as_str).collect();
+                                let ng: Vec<&str> = f.ng_names.iter().map(String::as_str).collect();
+                                let un: Vec<&str> =
+                                    f.uncertain_names.iter().map(String::as_str).collect();
+                                db.commit_request_outcomes_atomically(
+                                    request_id,
+                                    &ok,
+                                    &ng,
+                                    &un,
+                                    f.unpack_failed,
+                                    f.git_exit_ok,
+                                    f.parsed_json.as_ref(),
+                                    f.accepted_ordinal,
+                                    f.rejected_reason.as_deref(),
+                                    f.terminal_no_effects,
+                                )
+                                .await
+                            }
+                            _ => db.mark_receive_pack_interrupted(request_id).await,
                         }
-                        _ => db.mark_receive_pack_interrupted(request_id).await,
+                    } else {
+                        db.refuse_receive_pack_before_git(
+                            request_id,
+                            "handler dropped before git started",
+                        )
+                        .await
                     }
-                } else {
-                    db.refuse_receive_pack_before_git(
-                        request_id,
-                        "handler dropped before git started",
-                    )
-                    .await
                 };
-                if let Err(e) = attempt {
-                    tracing::warn!(
-                        err = %e,
-                        request_id = %request_id,
-                        "drop-guard cleanup attempt failed; retrying within budget"
-                    );
+                match tokio::time::timeout(std::time::Duration::from_secs(10), run).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            err = %e,
+                            request_id = %request_id,
+                            "drop-guard cleanup attempt failed; retrying within budget"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            request_id = %request_id,
+                            "drop-guard cleanup attempt timed out; retrying within budget"
+                        );
+                    }
                 }
             }
             Err(e) => {
@@ -11856,6 +11902,216 @@ mod tests {
             matches!(err, AppError::BadRequest(_)),
             "undecodable ref-update line is a client error (400), got {err:?}"
         );
+    }
+
+    /// The spawned guard cleanup commits stashed fates instead of a blanket
+    /// `uncertain`: an `ok` child lands `applied`, an `ng` child lands
+    /// `cancelled` (terminal, purgeable — reconcile could never resolve a
+    /// proven rejection left `uncertain`), and the parent carries the parsed
+    /// report. Reverting the fates arm to `mark_receive_pack_interrupted`
+    /// flips the ng child to `uncertain` and turns this red.
+    #[sqlx::test]
+    async fn guard_retry_with_fates_commits_them_not_blanket_uncertain(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let now = chrono::Utc::now().to_rfc3339();
+        let req = crate::db::ReceivePackRequest {
+            id: "req-guard-fates".to_string(),
+            repo_id: "repo-guard-fates".to_string(),
+            pusher_did: "did:key:z6pusher".to_string(),
+            node_did: state.node_did.to_string(),
+            request_bytes: Vec::new(),
+            request_bytes_hash: vec![7u8; 32],
+            state: crate::db::request_state::RECEIVED.to_string(),
+            git_exit_ok: None,
+            parsed_report: None,
+            accepted_ordinal: None,
+            attempt_count: 0,
+            last_error: None,
+            next_attempt_at: None,
+            created_at: now.clone(),
+            completed_at: None,
+            signature_header: Some("sig".to_string()),
+            signature_input: Some("sig-input".to_string()),
+            content_digest: Some("digest".to_string()),
+        };
+        let updates = vec![
+            RefUpdate {
+                old_sha: "0".repeat(40),
+                new_sha: "1".repeat(40),
+                ref_name: "refs/heads/main".to_string(),
+            },
+            RefUpdate {
+                old_sha: "0".repeat(40),
+                new_sha: "2".repeat(40),
+                ref_name: "refs/heads/feat".to_string(),
+            },
+        ];
+        state
+            .db
+            .insert_receive_pack_request_with_children(
+                &req,
+                "repo-guard-fates",
+                &state.node_did.to_string(),
+                "did:key:z6pusher",
+                &updates,
+                "sig",
+                "sig-input",
+                "digest",
+            )
+            .await
+            .unwrap();
+        let fates = ComputedFates {
+            ok_names: vec!["refs/heads/main".to_string()],
+            ng_names: vec!["refs/heads/feat".to_string()],
+            uncertain_names: Vec::new(),
+            unpack_failed: false,
+            git_exit_ok: true,
+            parsed_json: Some(serde_json::json!({
+                "unpack_ok": true,
+                "ref_results": [
+                    {"ref_name": "refs/heads/main", "ok": true},
+                    {"ref_name": "refs/heads/feat", "ok": false},
+                ],
+            })),
+            accepted_ordinal: Some(0),
+            rejected_reason: None,
+            terminal_no_effects: false,
+        };
+        retry_guard_cleanup(&state.db, "req-guard-fates", true, Some(fates)).await;
+
+        let parent = state
+            .db
+            .get_receive_pack_request("req-guard-fates")
+            .await
+            .unwrap()
+            .expect("parent exists");
+        assert_eq!(
+            parent.state,
+            crate::db::request_state::OUTCOMES_COMMITTED,
+            "fates commit advances the parent"
+        );
+        assert!(
+            parent.parsed_report.is_some(),
+            "committed fates carry the parsed report"
+        );
+        let children = state
+            .db
+            .list_pending_ref_transitions_for_request("req-guard-fates")
+            .await
+            .unwrap();
+        let by_name: std::collections::HashMap<&str, &str> = children
+            .iter()
+            .map(|c| (c.ref_name.as_str(), c.state.as_str()))
+            .collect();
+        assert_eq!(
+            by_name.get("refs/heads/main"),
+            Some(&crate::db::pending_state::APPLIED),
+            "ok child applies"
+        );
+        assert_eq!(
+            by_name.get("refs/heads/feat"),
+            Some(&crate::db::pending_state::CANCELLED),
+            "git-proven rejection cancels (never blanket uncertain)"
+        );
+    }
+
+    /// Without stashed fates the post-git cleanup falls back to
+    /// `mark_receive_pack_interrupted`, and a non-`received` aggregate stops
+    /// the loop immediately. A missing id exhausts only the (short test)
+    /// budget and returns — proving the budget exit without a 30s test.
+    #[sqlx::test]
+    async fn guard_retry_without_fates_marks_interrupted_and_stops_when_terminal(
+        pool: sqlx::PgPool,
+    ) {
+        let state = crate::test_support::test_state(pool).await;
+        let now = chrono::Utc::now().to_rfc3339();
+        let req = crate::db::ReceivePackRequest {
+            id: "req-guard-nofates".to_string(),
+            repo_id: "repo-guard-nofates".to_string(),
+            pusher_did: "did:key:z6pusher".to_string(),
+            node_did: state.node_did.to_string(),
+            request_bytes: Vec::new(),
+            request_bytes_hash: vec![7u8; 32],
+            state: crate::db::request_state::RECEIVED.to_string(),
+            git_exit_ok: None,
+            parsed_report: None,
+            accepted_ordinal: None,
+            attempt_count: 0,
+            last_error: None,
+            next_attempt_at: None,
+            created_at: now.clone(),
+            completed_at: None,
+            signature_header: Some("sig".to_string()),
+            signature_input: Some("sig-input".to_string()),
+            content_digest: Some("digest".to_string()),
+        };
+        let updates = vec![RefUpdate {
+            old_sha: "0".repeat(40),
+            new_sha: "1".repeat(40),
+            ref_name: "refs/heads/main".to_string(),
+        }];
+        state
+            .db
+            .insert_receive_pack_request_with_children(
+                &req,
+                "repo-guard-nofates",
+                &state.node_did.to_string(),
+                "did:key:z6pusher",
+                &updates,
+                "sig",
+                "sig-input",
+                "digest",
+            )
+            .await
+            .unwrap();
+
+        retry_guard_cleanup(&state.db, "req-guard-nofates", true, None).await;
+        let parent = state
+            .db
+            .get_receive_pack_request("req-guard-nofates")
+            .await
+            .unwrap()
+            .expect("parent exists");
+        assert_eq!(
+            parent.state,
+            crate::db::request_state::REJECTED_AT_GIT,
+            "no-fates fallback terminalizes the parent"
+        );
+        let children = state
+            .db
+            .list_pending_ref_transitions_for_request("req-guard-nofates")
+            .await
+            .unwrap();
+        assert_eq!(
+            children[0].state,
+            crate::db::pending_state::UNCERTAIN,
+            "no-fates fallback leaves the child uncertain for reconcile"
+        );
+
+        // Terminal aggregate: returns without touching anything.
+        retry_guard_cleanup(&state.db, "req-guard-nofates", true, None).await;
+        let again = state
+            .db
+            .get_receive_pack_request("req-guard-nofates")
+            .await
+            .unwrap()
+            .expect("parent exists");
+        assert_eq!(
+            again.state,
+            crate::db::request_state::REJECTED_AT_GIT,
+            "cleanup on a terminal aggregate is a no-op"
+        );
+
+        // Missing id: only the budget decides; a millisecond budget proves
+        // the exit without waiting out production 30s.
+        retry_guard_cleanup_with_budget(
+            &state.db,
+            "req-never-existed",
+            false,
+            None,
+            std::time::Duration::from_millis(150),
+        )
+        .await;
     }
 
     /// The internal-namespace predicate covers the bare `refs/gitlawb` name

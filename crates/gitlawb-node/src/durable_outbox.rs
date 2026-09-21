@@ -897,6 +897,18 @@ where
                     );
                 }
             }
+            Ok(EffectsOutcome::AwaitingSiblings) => {
+                // Waiting on reconcile siblings, not a failed effect: leave
+                // the aggregate untouched — no attempt increment, no
+                // backoff, no quarantine. The row stays due, so the next
+                // pass re-checks the siblings; startup reconcile resolves
+                // them and a later pass completes. Debug-level: this fires
+                // every pass until reconcile runs.
+                tracing::debug!(
+                    request_id = %request_id,
+                    "drain: siblings unresolved, waiting for reconcile (no retry accounting)"
+                );
+            }
             Err(e) => {
                 // Execution errors must also advance retry accounting;
                 // leaving the row untouched retries every pass with
@@ -1073,11 +1085,24 @@ pub async fn drain_marker_cleanup_queue(
 /// transiently. The request is moved to `effects_pending` with
 /// `next_attempt_at` in the future. The drain will retry on the next
 /// startup.
+///
+/// `AwaitingSiblings` — the bundle ran (or was not owed) but a
+/// `prepared`/`uncertain` sibling remains, so completion must wait for
+/// reconcile, which runs only at startup. This is waiting, not failure:
+/// neither the live handler nor the drain may route it through
+/// `schedule_request_retry_or_quarantine`, or a long-lived process would
+/// increment `attempt_count` toward quarantine for a request that is only
+/// waiting on reconcile. Both callers leave the aggregate untouched (still
+/// `outcomes_committed`, still due) so the next pass re-checks the
+/// siblings; startup reconcile resolves them and a later pass completes.
+/// (A leftover `applied` row with no reconcile-resolvable sibling is
+/// divergent, not waiting — phase 2 returns `Retry` for operator review.)
 #[derive(Debug)]
 pub enum EffectsOutcome {
     Done,
     Nothing,
     Retry { last_error: String },
+    AwaitingSiblings,
 }
 
 /// #26 Split PR 1 step 3 — the shared effect executor. The live
@@ -1104,9 +1129,9 @@ pub enum EffectsOutcome {
 ///
 /// Returns `Ok(Done)` as a proceed-to-gate sentinel, not the final outcome:
 /// request completion is decided by the phase-2 gate in the caller, which
-/// returns `Retry` while any non-cancelled sibling remains and `Done` /
-/// `Nothing` only when every sibling is cancelled or gone. `Ok(Retry{..})`
-/// retries the bundle; `Err` propagates hard errors (e.g. proof-table
+/// returns `AwaitingSiblings` while any non-cancelled sibling remains and
+/// `Done` / `Nothing` only when every sibling is cancelled or gone.
+/// `Ok(Retry{..})` retries the bundle; `Err` propagates hard errors (e.g. proof-table
 /// failure) for the drain's `Err` retry arm.
 async fn run_effect_bundle(
     state: &AppState,
@@ -1497,8 +1522,9 @@ pub async fn apply_request_effects(
     // function tail) terminalizes only when no non-cancelled sibling
     // remains. An empty accepted set with only cancelled siblings
     // yields `Nothing` (no bundle owed); an empty accepted set with a
-    // live sibling yields `Retry` so a later `Nothing` pass can never
-    // complete the parent while effects are still owed.
+    // live sibling yields `AwaitingSiblings` so a later `Nothing` pass can
+    // never complete the parent while effects are still owed, and so the
+    // wait never counts toward quarantine.
     //
     // MUTATION (RED): moving the webhook block below the sibling
     // check without the completion gate, or deleting accepted children
@@ -1525,20 +1551,31 @@ pub async fn apply_request_effects(
         }
     }
 
-    // Phase 2 — request completion gate. Retry while any non-cancelled
-    // sibling remains (evidence owed or a reconciled promotion pending);
-    // terminalize only when every sibling is cancelled or gone. The
-    // bundle flag decides `Done` (bundle ran) vs `Nothing` (nothing owed).
+    // Phase 2 — request completion gate. Wait (without retry accounting)
+    // while a reconcile-resolvable sibling remains (`prepared`/`uncertain`
+    // are reconciliation evidence the startup walk may still promote);
+    // terminalize only when every sibling is cancelled or gone. A leftover
+    // `applied` row with no `prepared`/`uncertain` sibling is divergent
+    // (e.g. unpack proved no landing, yet an applied row claims one):
+    // reconcile never revisits `applied` rows, so waiting would be silent
+    // forever — route to retry/quarantine for operator attention instead.
+    // The bundle flag decides `Done` (bundle ran) vs `Nothing` (nothing owed).
     let remaining = state
         .db
         .list_pending_ref_transitions_for_request(request_id)
         .await?;
+    if remaining.iter().any(|c| {
+        c.state == crate::db::pending_state::PREPARED
+            || c.state == crate::db::pending_state::UNCERTAIN
+    }) {
+        return Ok(EffectsOutcome::AwaitingSiblings);
+    }
     if remaining
         .iter()
         .any(|c| c.state != crate::db::pending_state::CANCELLED)
     {
         return Ok(EffectsOutcome::Retry {
-            last_error: "unresolved siblings remain for reconcile".to_string(),
+            last_error: "divergent applied children need operator review".to_string(),
         });
     }
     if bundle_owed {
@@ -2188,7 +2225,9 @@ mod drain_tests {
         let outcome = apply_request_effects(&state, request_id).await.unwrap();
         assert!(
             matches!(outcome, EffectsOutcome::Retry { .. }),
-            "unresolved sibling must keep the request retryable, got {outcome:?}"
+            "applied-but-unreported sibling is divergent (reconcile never revisits \
+             applied rows), so it must stay retryable toward quarantine for operator \
+             review, got {outcome:?}"
         );
         // The unreported child evidence survives completion of its sibling.
         let remaining = state
@@ -2204,8 +2243,8 @@ mod drain_tests {
 
     /// Partial completion never drops webhooks permanently. Pass 1 fires the
     /// webhook occurrence for the landed ref inside the effect bundle (before
-    /// child deletion) and returns `Retry` for the uncertain sibling; pass 2
-    /// must stay `Retry` — never `Nothing` → `complete` — and must not fire
+    /// child deletion) and returns `AwaitingSiblings` for the uncertain sibling; pass 2
+    /// must stay waiting — never `Nothing` → `complete` — and must not fire
     /// a second webhook for the same occurrence.
     ///
     /// MUTATION (RED): moving the webhook block below the sibling check
@@ -2278,11 +2317,11 @@ mod drain_tests {
             .await
             .unwrap();
 
-        // Pass 1: bundle runs for the landed ref, sibling keeps it Retry.
+        // Pass 1: bundle runs for the landed ref, sibling keeps it waiting.
         let outcome = apply_request_effects(&state, request_id).await.unwrap();
         assert!(
-            matches!(outcome, EffectsOutcome::Retry { .. }),
-            "partial completion must stay retryable, got {outcome:?}"
+            matches!(outcome, EffectsOutcome::AwaitingSiblings),
+            "partial completion must wait for reconcile, got {outcome:?}"
         );
         // The webhook occurrence fired exactly once, before child deletion.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -2302,10 +2341,10 @@ mod drain_tests {
         }
 
         // Pass 2: the landed child is gone but the uncertain sibling
-        // remains — must stay Retry, never Nothing → complete.
+        // remains — must stay AwaitingSiblings, never Nothing → complete.
         let outcome2 = apply_request_effects(&state, request_id).await.unwrap();
         assert!(
-            matches!(outcome2, EffectsOutcome::Retry { .. }),
+            matches!(outcome2, EffectsOutcome::AwaitingSiblings),
             "second pass with a live sibling must not terminalize, got {outcome2:?}"
         );
         let parent = state
@@ -2326,6 +2365,111 @@ mod drain_tests {
                 .await
                 .unwrap();
         assert_eq!(n, 1, "no second webhook for the same occurrence");
+    }
+
+    /// Sibling-wait never counts toward quarantine. Stage `outcomes_committed`
+    /// with one applied/ok child and one `uncertain` sibling, then run the
+    /// real drain past `effects_max_attempts` (bound pinned to 2 here),
+    /// resetting the claim lease between passes to simulate successive
+    /// due-worker ticks on a long-lived process. The parent must stay
+    /// `outcomes_committed` with `attempt_count` 0 — never quarantined with
+    /// children cancelled — and the uncertain sibling evidence must remain
+    /// for reconcile or operator resolve. Routing sibling-wait through
+    /// `schedule_request_retry_or_quarantine` quarantines on pass 3 and
+    /// turns every assertion red.
+    #[sqlx::test]
+    async fn sibling_wait_never_counts_toward_quarantine(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state_with(pool, |cfg| {
+            cfg.effects_max_attempts = 2;
+        })
+        .await;
+        let request_id = "req-sibling-wait";
+        let repo_id = "repo-sibling-wait";
+        let mk = |ref_name: &str, new: &str, ord: i32, st: &str| {
+            let now = Utc::now().to_rfc3339();
+            PendingRefTransition {
+                id: crate::db::deterministic_id(&[
+                    "pending_ref_transition",
+                    request_id,
+                    repo_id,
+                    ref_name,
+                    &"0".repeat(40),
+                    new,
+                ]),
+                request_id: request_id.to_string(),
+                repo_id: repo_id.to_string(),
+                ref_name: ref_name.to_string(),
+                old_sha: "0".repeat(40),
+                new_sha: new.to_string(),
+                pusher_did: "did:key:z6pusher".to_string(),
+                node_did: "did:key:z6node".to_string(),
+                signature_header: "s".to_string(),
+                signature_input: "si".to_string(),
+                content_digest: "d".to_string(),
+                state: st.to_string(),
+                created_at: now.clone(),
+                applied_at: (st == pending_state::APPLIED).then(|| now.clone()),
+                cancelled_at: None,
+                ordinal: ord,
+                git_target_kind: Some("update".to_string()),
+            }
+        };
+        let c1 = mk("refs/heads/one", &"b".repeat(40), 0, pending_state::APPLIED);
+        let c2 = mk(
+            "refs/heads/two",
+            &"c".repeat(40),
+            1,
+            pending_state::UNCERTAIN,
+        );
+        let parsed = serde_json::json!({
+            "unpack_ok": true,
+            "ref_results": [{ "ref_name": "refs/heads/one", "ok": true }],
+        });
+        stage_request_with_children(&state.db, request_id, repo_id, Some(0), &[c1, c2], parsed)
+            .await;
+
+        // Five due-worker passes with a bound of 2: the old routing
+        // quarantines on pass 3. Reset the claim lease between passes to
+        // simulate successive ticks (the claim sets next_attempt 300s out).
+        for pass in 1..=5 {
+            let (processed, examined) = drain_receive_pack_requests(state.clone(), 100)
+                .await
+                .unwrap();
+            assert_eq!(processed, 0, "pass {pass}: sibling-wait never completes");
+            assert_eq!(examined, 1, "pass {pass}: the waiting request is seen");
+            sqlx::query("UPDATE receive_pack_requests SET next_attempt_at = NULL WHERE id = $1")
+                .bind(request_id)
+                .execute(state.db.pool())
+                .await
+                .unwrap();
+        }
+
+        let parent = state
+            .db
+            .get_receive_pack_request(request_id)
+            .await
+            .unwrap()
+            .expect("parent row exists");
+        assert_eq!(
+            parent.state,
+            request_state::OUTCOMES_COMMITTED,
+            "waiting on reconcile siblings must not quarantine"
+        );
+        assert_eq!(
+            parent.attempt_count, 0,
+            "sibling-wait must not increment attempt_count toward the bound"
+        );
+        let remaining = state
+            .db
+            .list_pending_ref_transitions_for_request(request_id)
+            .await
+            .unwrap();
+        assert!(
+            remaining
+                .iter()
+                .any(|c| c.ref_name == "refs/heads/two" && c.state == pending_state::UNCERTAIN),
+            "uncertain sibling evidence remains for reconcile, got {remaining:?}"
+        );
     }
 
     /// Proof is acked on success and blocks purge until acked. Removing
