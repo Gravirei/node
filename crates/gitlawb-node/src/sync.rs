@@ -737,10 +737,12 @@ fn show_ref_refname(line: &[u8]) -> anyhow::Result<Option<&[u8]>> {
 /// (negative refspecs cannot re-include them, so post-import deletion is the
 /// mechanism that works).
 ///
-/// Callers map a prune error to [`PruneFailed`] so the batch defers the row
-/// (stays `pending`, retried next tick) instead of failing it: a failed row
-/// would leave a possibly-wedged mirror unretried until the next peer
-/// announcement.
+/// Callers map a transient prune error to [`PruneFailed`] so the batch
+/// defers the row (stays `pending`, retried next tick) instead of failing
+/// it: a failed row would leave a possibly-wedged mirror unretried until
+/// the next peer announcement. Deterministic refusals (identity mismatch,
+/// malformed enumeration) map to [`PruneInvalid`], which fails terminally
+/// since no retry can clear them.
 ///
 /// Enumeration is `git show-ref` (no pattern), parsed as raw bytes: refnames
 /// cannot contain newlines, so one line per ref is lossless even for
@@ -771,9 +773,9 @@ async fn prune_non_exempt_gitlawb_refs(local_path: &Path) -> anyhow::Result<()> 
         .map_err(|e| anyhow::anyhow!("git rev-parse failed to spawn: {e}"))?;
     if !git_dir_out.status.success() {
         let stderr = String::from_utf8_lossy(&git_dir_out.stderr);
-        return Err(anyhow::anyhow!(
+        return Err(anyhow::anyhow!(PruneInvalid(format!(
             "mirror path is not a git repo (rev-parse failed): {stderr}"
-        ));
+        ))));
     }
     let actual_dir = PathBuf::from(
         String::from_utf8_lossy(&git_dir_out.stdout)
@@ -782,14 +784,14 @@ async fn prune_non_exempt_gitlawb_refs(local_path: &Path) -> anyhow::Result<()> 
     );
     let canonical_path = local_path
         .canonicalize()
-        .map_err(|e| anyhow::anyhow!("mirror path does not resolve: {e}"))?;
+        .map_err(|e| anyhow::anyhow!(PruneInvalid(format!("mirror path does not resolve: {e}"))))?;
     let canonical_git_dir = actual_dir
         .canonicalize()
-        .map_err(|e| anyhow::anyhow!("git dir does not resolve: {e}"))?;
+        .map_err(|e| anyhow::anyhow!(PruneInvalid(format!("git dir does not resolve: {e}"))))?;
     if canonical_git_dir != canonical_path {
-        return Err(anyhow::anyhow!(
+        return Err(anyhow::anyhow!(PruneInvalid(format!(
             "mirror path {local_str} is not itself a repo (git dir resolves elsewhere); refusing to enumerate"
-        ));
+        ))));
     }
     let out = tokio::process::Command::new("git")
         .args(["-C", local_str, "show-ref"])
@@ -811,7 +813,11 @@ async fn prune_non_exempt_gitlawb_refs(local_path: &Path) -> anyhow::Result<()> 
         }
     }
     for line in out.stdout.split(|b| *b == b'\n') {
-        let Some(raw) = show_ref_refname(line)? else {
+        // Malformed lines are deterministic (same git, same output every
+        // tick): fail terminally via PruneInvalid, not transiently.
+        let Some(raw) =
+            show_ref_refname(line).map_err(|e| anyhow::anyhow!(PruneInvalid(e.to_string())))?
+        else {
             continue;
         };
         if !(raw == b"refs/gitlawb" || raw.starts_with(b"refs/gitlawb/"))
@@ -877,12 +883,31 @@ impl std::fmt::Display for PruneFailed {
 
 impl std::error::Error for PruneFailed {}
 
-/// Classify a mirror sync failure for one queue row. Prune failures defer:
-/// the mirror is on disk but may still carry a non-exempt refs/gitlawb ref,
-/// a transient local-git condition a retry can clear — failing the row would
-/// leave it unretried until the next peer announcement, wedging serving in
-/// the meantime. Everything else fails the row terminally. Extracted so the
-/// deferral (not just the prune itself) is unit-testable.
+/// Marker for deterministic mirror-prune refusals: the identity check (path
+/// is not itself a repo) and malformed `show-ref` output cannot clear on
+/// retry — re-running fetch+prune every tick would spin forever on a
+/// permanently bad path. Unlike [`PruneFailed`], these fail the row
+/// terminally so the condition surfaces instead of looping silently.
+#[derive(Debug)]
+struct PruneInvalid(String);
+
+impl std::fmt::Display for PruneInvalid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "mirror prune refused: {}", self.0)
+    }
+}
+
+impl std::error::Error for PruneInvalid {}
+
+/// Classify a mirror sync failure for one queue row. Transient prune
+/// failures ([`PruneFailed`]) defer: the mirror is on disk but may still
+/// carry a non-exempt refs/gitlawb ref, a transient local-git condition a
+/// retry can clear — failing the row would leave it unretried until the
+/// next peer announcement, wedging serving in the meantime. Deterministic
+/// refusals ([`PruneInvalid`]) and everything else fail the row terminally:
+/// retrying a permanently bad path every tick would spin forever instead of
+/// surfacing. Extracted so the deferral (not just the prune itself) is
+/// unit-testable.
 async fn handle_sync_item_error(
     db: &Db,
     item: &crate::db::SyncQueueItem,
@@ -2425,10 +2450,11 @@ mod tests {
         }
     }
 
-    /// Pruning a path that is not a repo errors instead of enumerating some
-    /// ancestor (or silently skipping): `git -C <missing> show-ref` exits
-    /// 128 with stderr-only output, which the old empty-stdout check read as
-    /// "no refs" while an evil ref survived.
+    /// Pruning a path that is not a repo errors. Two shapes: a missing path
+    /// fails `rev-parse` outright (exit 128), while a plain subdirectory of
+    /// a repo would otherwise enumerate the ancestor's refs — covered by the
+    /// identity test below. Either way the prune refuses instead of pruning
+    /// the wrong repo or silently skipping an evil ref.
     #[test]
     fn prune_on_non_repo_path_errors() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -2444,6 +2470,72 @@ mod tests {
                 err.to_string().contains("not a git repo")
                     || err.to_string().contains("does not resolve"),
                 "unexpected error shape: {err:#}"
+            );
+        });
+    }
+
+    /// Identity check: pruning a plain subdirectory of a repo refuses instead
+    /// of enumerating the ancestor. `git -C` on the child exits 0 from
+    /// `show-ref` with the ANCESTOR's refs, so without the
+    /// `rev-parse --absolute-git-dir` identity check the delete loop would
+    /// enumerate and delete the wrong repository's refs. Deleting the check
+    /// makes the prune succeed and removes the ancestor's evil ref — both
+    /// assertions go red.
+    #[test]
+    fn prune_on_non_repo_child_of_repo_refuses_and_touches_nothing() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        rt.block_on(async {
+            let td = TempDir::new().unwrap();
+            let ancestor = td.path().join("ancestor.git");
+            std::fs::create_dir_all(&ancestor).unwrap();
+            let run_ancestor = |args: &[&str]| {
+                assert!(
+                    Command::new("git")
+                        .args(args)
+                        .current_dir(&ancestor)
+                        .status()
+                        .unwrap()
+                        .success(),
+                    "git {args:?} failed"
+                );
+            };
+            run_ancestor(&["init", "-q", "--bare", "."]);
+            // Blob target for the planted ref (mirrors the node-metadata shape).
+            std::fs::write(ancestor.join("blob-body"), b"marker\n").unwrap();
+            let out = Command::new("git")
+                .args(["hash-object", "-w", "blob-body"])
+                .current_dir(&ancestor)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git hash-object failed");
+            let blob = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            run_ancestor(&["update-ref", "refs/gitlawb/evil", &blob]);
+
+            // A plain child directory: not itself a repo.
+            let child = ancestor.join("not-a-repo");
+            std::fs::create_dir_all(&child).unwrap();
+
+            let err = prune_non_exempt_gitlawb_refs(&child)
+                .await
+                .expect_err("pruning a non-repo child must refuse, not enumerate the ancestor");
+            assert!(
+                err.to_string().contains("not itself a repo"),
+                "refusal must name the identity mismatch, got: {err:#}"
+            );
+
+            // The ancestor's evil ref is untouched.
+            let refs_out = Command::new("git")
+                .args(["for-each-ref", "--format=%(refname)"])
+                .current_dir(&ancestor)
+                .output()
+                .unwrap();
+            let refs = String::from_utf8_lossy(&refs_out.stdout);
+            assert!(
+                refs.lines().any(|l| l.trim() == "refs/gitlawb/evil"),
+                "ancestor evil ref must survive the refused prune"
             );
         });
     }
@@ -2516,9 +2608,9 @@ mod tests {
     }
 
     /// Prune failures defer the queue row (stays `pending` for the next
-    /// tick); any other sync error fails it terminally. Deleting the
-    /// `downcast_ref::<PruneFailed>` arm restores terminal failure and turns
-    /// the first assertion red.
+    /// tick); deterministic prune refusals and any other sync error fail it
+    /// terminally. Deleting the `downcast_ref::<PruneFailed>` arm restores
+    /// terminal failure and turns the first assertion red.
     #[sqlx::test]
     async fn prune_failure_defers_row_other_failures_fail_it(pool: PgPool) {
         let state = crate::test_support::test_state(pool).await;
@@ -2540,8 +2632,8 @@ mod tests {
                 .unwrap();
             row.0
         }
-        // Seed two pending rows directly (enqueue_sync mints random ids).
-        for id in ["sync-prune-defer", "sync-other-fail"] {
+        // Seed three pending rows directly (enqueue_sync mints random ids).
+        for id in ["sync-prune-defer", "sync-prune-invalid", "sync-other-fail"] {
             sqlx::query(
                 "INSERT INTO sync_queue (id, repo, node_did, ref_name, new_sha, cid, status, enqueued_at)
                  VALUES ($1, $2, $3, $4, $5, NULL, 'pending', $6)",
@@ -2581,6 +2673,21 @@ mod tests {
             status_of(state.db.pool(), "sync-other-fail").await,
             "failed",
             "non-prune failure must fail the row"
+        );
+
+        // Deterministic refusal: no retry can clear it, so it fails
+        // terminally instead of spinning every tick forever.
+        handle_sync_item_error(
+            &state.db,
+            &item("sync-prune-invalid"),
+            "http://origin.example",
+            anyhow::anyhow!(PruneInvalid("not itself a repo".to_string())),
+        )
+        .await;
+        assert_eq!(
+            status_of(state.db.pool(), "sync-prune-invalid").await,
+            "failed",
+            "deterministic prune refusal must fail the row, not defer forever"
         );
     }
 }

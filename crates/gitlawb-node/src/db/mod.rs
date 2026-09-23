@@ -238,6 +238,20 @@ pub mod pending_state {
     /// actually landed.
     #[allow(dead_code)]
     pub const UNCERTAIN: &str = "uncertain";
+
+    /// States a reconcile pass may still resolve into `applied`. Single
+    /// source for the set: the SQL walks bind this slice positionally via
+    /// `= ANY($1)`, and the Rust gate uses [`is_reconcilable`], so adding
+    /// a resolvable state is one edit here rather than three matching
+    /// literals across two files.
+    pub const RECONCILABLE: [&str; 2] = [PREPARED, UNCERTAIN];
+
+    /// Rust half of [`RECONCILABLE`]: true while reconcile may still
+    /// promote a row in this state. Phase 2 of the effect executor waits
+    /// on exactly this set; anything else non-cancelled is divergent.
+    pub fn is_reconcilable(state: &str) -> bool {
+        RECONCILABLE.contains(&state)
+    }
 }
 
 /// #26 Split PR 1 — durable intent row for a single (request, ref) transition.
@@ -4208,14 +4222,20 @@ impl Db {
             .execute(&mut *tx)
             .await?;
         } else if let Some(reason) = rejected_reason {
+            // Indeterminate rejections (no report-status, incomplete report):
+            // persist the true git exit — a capability-free client can omit
+            // report-status on a fully successful push, and recording FALSE
+            // would mislabel "await disk evidence" as unpack failure for
+            // operators and any consumer trusting `git_exit_ok`.
             sqlx::query(
                 r#"UPDATE receive_pack_requests
-                   SET state = $2, git_exit_ok = FALSE, last_error = $3,
-                       completed_at = $4
-                   WHERE id = $1 AND state = $5"#,
+                   SET state = $2, git_exit_ok = $3, last_error = $4,
+                       completed_at = $5
+                   WHERE id = $1 AND state = $6"#,
             )
             .bind(request_id)
             .bind(request_state::REJECTED_AT_GIT)
+            .bind(git_exit_ok)
             .bind(reason)
             .bind(&now)
             .bind(request_state::RECEIVED)
@@ -4489,12 +4509,11 @@ impl Db {
                        signature_header, signature_input, content_digest, state, created_at,
                        applied_at, cancelled_at, ordinal, git_target_kind
                FROM pending_ref_transitions
-               WHERE state IN ($1, $2) AND (created_at, id) > ($3, $4)
+               WHERE state = ANY($1) AND (created_at, id) > ($2, $3)
                ORDER BY created_at ASC, id ASC
-               LIMIT $5"#,
+               LIMIT $4"#,
         )
-        .bind(pending_state::PREPARED)
-        .bind(pending_state::UNCERTAIN)
+        .bind(&pending_state::RECONCILABLE[..])
         .bind(after_created_at)
         .bind(after_id)
         .bind(limit)
@@ -4525,13 +4544,12 @@ impl Db {
         let res = sqlx::query(
             r#"UPDATE pending_ref_transitions
                SET state = $1, applied_at = $2
-               WHERE id = ANY($3) AND state IN ($4, $5)"#,
+               WHERE id = ANY($3) AND state = ANY($4)"#,
         )
         .bind(pending_state::APPLIED)
         .bind(&now)
         .bind(ids)
-        .bind(pending_state::PREPARED)
-        .bind(pending_state::UNCERTAIN)
+        .bind(&pending_state::RECONCILABLE[..])
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected())
@@ -4935,9 +4953,17 @@ impl Db {
         Ok(row.0 > 0)
     }
 
-    /// Operator transition for attended work: quarantined/prepared
-    /// requests can be resolved to terminal complete (no effects) or
-    /// rejected_at_git. Returns rows affected.
+    /// Operator transition for attended work: requests waiting on a human
+    /// decision can be resolved to terminal complete (no effects) or
+    /// rejected_at_git. Covers quarantined/received/rejected_at_git AND the
+    /// waiting executable states (outcomes_committed/effects_pending), so a
+    /// request parked on unresolvable reconcile siblings has a reachable
+    /// terminal path via operator decision instead of waiting forever.
+    /// Non-terminal children (prepared/uncertain) are cancelled in the same
+    /// transaction — otherwise a resolved parent would keep live children
+    /// that block retention; applied children are left alone (their effects
+    /// may have run: history, not evidence). Returns rows affected (the
+    /// parent flip; 0 = wrong state or unknown decision).
     #[allow(dead_code)]
     pub async fn resolve_attended_request(
         &self,
@@ -4950,20 +4976,41 @@ impl Db {
             "reject" | "rejected_at_git" => request_state::REJECTED_AT_GIT,
             _ => return Ok(0),
         };
+        let mut tx = self.pool.begin().await?;
+        let now = Utc::now().to_rfc3339();
         let res = sqlx::query(
             r#"UPDATE receive_pack_requests
                SET state=$2, completed_at=$3, last_error=$4
-               WHERE id=$1 AND state IN ($5,$6,$7)"#,
+               WHERE id=$1 AND state IN ($5,$6,$7,$8,$9)"#,
         )
         .bind(request_id)
         .bind(target)
-        .bind(Utc::now().to_rfc3339())
+        .bind(&now)
         .bind(note)
         .bind(request_state::QUARANTINED)
         .bind(request_state::RECEIVED)
         .bind(request_state::REJECTED_AT_GIT)
-        .execute(&self.pool)
+        .bind(request_state::OUTCOMES_COMMITTED)
+        .bind(request_state::EFFECTS_PENDING)
+        .execute(&mut *tx)
         .await?;
+        if res.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(0);
+        }
+        sqlx::query(
+            r#"UPDATE pending_ref_transitions
+               SET state = $2, cancelled_at = $3
+               WHERE request_id = $1 AND state IN ($4, $5)"#,
+        )
+        .bind(request_id)
+        .bind(pending_state::CANCELLED)
+        .bind(&now)
+        .bind(pending_state::PREPARED)
+        .bind(pending_state::UNCERTAIN)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(res.rows_affected())
     }
 

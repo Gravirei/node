@@ -990,6 +990,16 @@ fn issue_26_namespace_gate_and_refusal_wiring() {
         "P2 wiring: disarm must be gated on outcome_commit_ok; unconditional \
          disarm strands the persistent-commit-failure path"
     );
+    // The live-handler `AwaitingSiblings` arm is unreachable through the
+    // current outcome builder (documented at the arm itself) and therefore
+    // has no behavioral test; pin its presence so removing it is conscious.
+    // The drain consumer IS behaviorally driven (sibling-wait tests).
+    assert_eq!(
+        repos.matches("EffectsOutcome::AwaitingSiblings").count(),
+        1,
+        "live AwaitingSiblings arm must exist (defensive symmetry with the \
+         drain consumer); deleting it must turn this red"
+    );
 
     // P2: pin the mirror prune call sites. The prune helper is called from
     // both `clone_repo` and `fetch_repo` (plus its own definition) — deleting

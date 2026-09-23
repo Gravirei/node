@@ -2678,12 +2678,35 @@ pub async fn git_receive_pack(
         Option<serde_json::Value>,
         Option<String>,
         bool,
-    ) = if !unpack_ok {
-        // Unpack failure proves no ref landed, regardless of per-ref
-        // `ok` bits or process exit. Cancel every child, clear any
-        // accepted ordinal, and terminalize with no effects so the
-        // executor can never outrun the cancelled rows.
-        if let Some(parsed) = &report {
+    ) = match &report {
+        None => {
+            // No report-status: indeterminate regardless of exit status.
+            // Process success is not per-ref success — a capability-free
+            // client can omit `report-status` and Git then emits zero
+            // result bytes even for rejected commands. Every declared ref
+            // stays `uncertain`; reconcile must prove landing on disk
+            // before any push event, certificate, anchor, or webhook.
+            // The client still receives the Git response; only durable
+            // effects are deferred. This arm runs FIRST: with no report the
+            // `unpack_ok` flag below is meaningless, and routing here through
+            // the unpack-failure arm would mislabel the aggregate and persist
+            // a false `git_exit_ok`.
+            (
+                false,
+                Vec::new(),
+                Vec::new(),
+                pending_ref_names.clone(),
+                None,
+                Some("no report-status: awaiting request-bound disk evidence".to_string()),
+                false,
+            )
+        }
+        Some(parsed) if !unpack_ok => {
+            // Unpack failure proves no ref landed, regardless of per-ref
+            // `ok` bits or process exit. The report is present here (absence
+            // is handled above), so its ref list is authoritative: cancel
+            // every child, clear any accepted ordinal, and terminalize with
+            // no effects so the executor can never outrun the cancelled rows.
             let parsed_json = serde_json::json!({
                 "unpack_ok": false,
                 "ref_results": parsed.1.iter().map(|(n, _)| serde_json::json!({
@@ -2700,106 +2723,79 @@ pub async fn git_receive_pack(
                 None,
                 true,
             )
-        } else {
-            // Unpack flag false without a parsed report (defensive):
-            // treat as indeterminate.
-            (
-                false,
-                Vec::new(),
-                Vec::new(),
-                pending_ref_names.clone(),
-                None,
-                Some("unpack failed without parseable report".to_string()),
-                false,
-            )
         }
-    } else if let Some(parsed) = &report {
-        let mut ok_names: Vec<&str> = Vec::new();
-        let mut ng_names: Vec<&str> = Vec::new();
-        let mut unmentioned: Vec<&str> = Vec::new();
-        let reported: std::collections::HashSet<&str> =
-            parsed.1.iter().map(|(n, _)| n.as_str()).collect();
-        for name in &pending_ref_names {
-            if !reported.contains(name) {
-                unmentioned.push(*name);
-            } else if ok_set.contains(name) {
-                ok_names.push(*name);
-            } else {
-                ng_names.push(*name);
+        Some(parsed) => {
+            // Report present with unpack ok (absence is handled in the first
+            // arm): per-ref fates from the authoritative report.
+            let mut ok_names: Vec<&str> = Vec::new();
+            let mut ng_names: Vec<&str> = Vec::new();
+            let mut unmentioned: Vec<&str> = Vec::new();
+            let reported: std::collections::HashSet<&str> =
+                parsed.1.iter().map(|(n, _)| n.as_str()).collect();
+            for name in &pending_ref_names {
+                if !reported.contains(name) {
+                    unmentioned.push(*name);
+                } else if ok_set.contains(name) {
+                    ok_names.push(*name);
+                } else {
+                    ng_names.push(*name);
+                }
             }
-        }
-        // Syntactic completeness (flush) is enforced in
-        // `strip_sideband`; command-set completeness is enforced here:
-        // a parsed report that omits declared refs is not
-        // authoritative. Persist the whole request as indeterminate so
-        // reconciliation produces a fresh normalized outcome before
-        // anything is retired. Otherwise a partial prefix would commit
-        // one ok child as applied, leave siblings uncertain, and the
-        // executor would delete the unresolved evidence on completion.
-        if !unmentioned.is_empty() {
-            tracing::warn!(
-                request_id = %request_id,
-                repo = %name,
-                unmentioned = ?unmentioned,
-                "report-status omits declared refs; persisting as indeterminate"
-            );
-            (
-                false,
-                Vec::new(),
-                Vec::new(),
-                pending_ref_names.clone(),
-                None,
-                Some("incomplete report-status: omitted declared refs".to_string()),
-                false,
-            )
-        } else {
-            if !ng_names.is_empty() {
+            // Syntactic completeness (flush) is enforced in
+            // `strip_sideband`; command-set completeness is enforced here:
+            // a parsed report that omits declared refs is not
+            // authoritative. Persist the whole request as indeterminate so
+            // reconciliation produces a fresh normalized outcome before
+            // anything is retired. Otherwise a partial prefix would commit
+            // one ok child as applied, leave siblings uncertain, and the
+            // executor would delete the unresolved evidence on completion.
+            if !unmentioned.is_empty() {
                 tracing::warn!(
                     request_id = %request_id,
                     repo = %name,
-                    rejected_refs = ?ng_names,
-                    "git report-status: some refs rejected; durable effects will skip them"
+                    unmentioned = ?unmentioned,
+                    "report-status omits declared refs; persisting as indeterminate"
                 );
+                (
+                    false,
+                    Vec::new(),
+                    Vec::new(),
+                    pending_ref_names.clone(),
+                    None,
+                    Some("incomplete report-status: omitted declared refs".to_string()),
+                    false,
+                )
+            } else {
+                if !ng_names.is_empty() {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        repo = %name,
+                        rejected_refs = ?ng_names,
+                        "git report-status: some refs rejected; durable effects will skip them"
+                    );
+                }
+                let parsed_json = serde_json::json!({
+                    "unpack_ok": parsed.0,
+                    "ref_results": parsed.1.iter().map(|(n, ok)| serde_json::json!({
+                        "ref_name": n,
+                        "ok": ok,
+                    })).collect::<Vec<_>>(),
+                });
+                // All refs rejected with exit zero: terminal with no
+                // effects. The startup drain must have nothing executable
+                // to revisit and retention must be able to purge.
+                let terminal = ok_names.is_empty() && !pending_ref_names.is_empty();
+                (
+                    false,
+                    ok_names,
+                    ng_names,
+                    unmentioned,
+                    Some(parsed_json),
+                    None,
+                    terminal,
+                )
             }
-            let parsed_json = serde_json::json!({
-                "unpack_ok": parsed.0,
-                "ref_results": parsed.1.iter().map(|(n, ok)| serde_json::json!({
-                    "ref_name": n,
-                    "ok": ok,
-                })).collect::<Vec<_>>(),
-            });
-            // All refs rejected with exit zero: terminal with no
-            // effects. The startup drain must have nothing executable
-            // to revisit and retention must be able to purge.
-            let terminal = ok_names.is_empty() && !pending_ref_names.is_empty();
-            (
-                false,
-                ok_names,
-                ng_names,
-                unmentioned,
-                Some(parsed_json),
-                None,
-                terminal,
-            )
         }
-    } else {
-        // No report-status: indeterminate regardless of exit status.
-        // Process success is not per-ref success — a capability-free
-        // client can omit `report-status` and Git then emits zero
-        // result bytes even for rejected commands. Every declared ref
-        // stays `uncertain`; reconcile must prove landing on disk
-        // before any push event, certificate, anchor, or webhook.
-        // The client still receives the Git response; only durable
-        // effects are deferred.
-        (
-            false,
-            Vec::new(),
-            Vec::new(),
-            pending_ref_names.clone(),
-            None,
-            Some("no report-status: awaiting request-bound disk evidence".to_string()),
-            false,
-        )
     };
 
     // Bounded synchronous retry for post-git outcome commit. After git has landed
@@ -3114,8 +3110,20 @@ pub async fn git_receive_pack(
             // Siblings unresolved: completion waits for startup reconcile,
             // not for a failed effect. Route nowhere near retry accounting
             // — incrementing attempts here would quarantine a request that
-            // is only waiting. The aggregate stays `outcomes_committed` and
-            // due, so the drain re-checks it and reconcile resolves it.
+            // is only waiting. The aggregate stays `outcomes_committed`,
+            // re-checkable once the claim lease lapses, so the drain
+            // re-checks it and reconcile resolves it.
+            //
+            // Accepted residual, stated honestly: this arm is unreachable
+            // through the current outcome builder — `run_effects` requires a
+            // non-empty committed ok-set, and a successful commit leaves no
+            // `prepared`/`uncertain` sibling behind (every prepared child is
+            // flipped; unmentioned refs force the indeterminate path, which
+            // does not run effects). The arm exists for symmetry with the
+            // drain consumer, so a future builder change that CAN produce
+            // live siblings waits instead of misrouting to quarantine. Its
+            // presence (not behavior) is pinned in inv22_gates; deleting it
+            // must be a conscious edit, not drift.
             tracing::debug!(
                 request_id = %request_id,
                 repo = %name,
@@ -3996,15 +4004,64 @@ async fn retry_guard_cleanup_with_budget(
     fates: Option<ComputedFates>,
     budget: std::time::Duration,
 ) {
+    const ATTEMPT_CAP: std::time::Duration = std::time::Duration::from_secs(10);
     let start = std::time::Instant::now();
     let mut delay = std::time::Duration::from_millis(100);
     loop {
-        match db.get_receive_pack_request(request_id).await {
-            Ok(None) => {
-                // No row yet (or already purged): only the budget decides.
+        if start.elapsed() >= budget {
+            tracing::warn!(
+                request_id = %request_id,
+                "drop-guard cleanup budget exhausted with aggregate still uncommitted/received"
+            );
+            return;
+        }
+        // Every DB round is bounded, and each bound is clamped to the
+        // remaining budget: a fixed 10s attempt (or an unbounded state
+        // read) could otherwise overshoot the budget by a whole window,
+        // parking the spawned task and its pool connection past it.
+        let slice = std::cmp::min(ATTEMPT_CAP, budget - start.elapsed());
+        enum Check {
+            Missing,
+            Terminal,
+            Received,
+            Unknown,
+        }
+        let check = match tokio::time::timeout(slice, db.get_receive_pack_request(request_id)).await
+        {
+            Err(_) => {
+                tracing::warn!(
+                    request_id = %request_id,
+                    "drop-guard state check timed out; retrying within budget"
+                );
+                Check::Unknown
             }
-            Ok(Some(req)) if req.state != crate::db::request_state::RECEIVED => return,
-            Ok(Some(_)) => {
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    err = %e,
+                    request_id = %request_id,
+                    "drop-guard state check failed; retrying within budget"
+                );
+                Check::Unknown
+            }
+            Ok(Ok(None)) => Check::Missing,
+            Ok(Ok(Some(req))) if req.state != crate::db::request_state::RECEIVED => Check::Terminal,
+            Ok(Ok(Some(_))) => Check::Received,
+        };
+        match check {
+            Check::Terminal => return,
+            // Missing (uncommitted or purged) and Unknown (failed read):
+            // only the budget decides; a missing row may be an insert
+            // whose commit has not landed yet.
+            Check::Missing | Check::Unknown => {}
+            Check::Received => {
+                let remaining = budget.saturating_sub(start.elapsed());
+                if remaining.is_zero() {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        "drop-guard cleanup budget exhausted with aggregate still received"
+                    );
+                    return;
+                }
                 let run = async {
                     if post_git {
                         match &fates {
@@ -4037,7 +4094,7 @@ async fn retry_guard_cleanup_with_budget(
                         .await
                     }
                 };
-                match tokio::time::timeout(std::time::Duration::from_secs(10), run).await {
+                match tokio::time::timeout(std::cmp::min(ATTEMPT_CAP, remaining), run).await {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
                         tracing::warn!(
@@ -4053,13 +4110,6 @@ async fn retry_guard_cleanup_with_budget(
                         );
                     }
                 }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    err = %e,
-                    request_id = %request_id,
-                    "drop-guard state check failed; retrying within budget"
-                );
             }
         }
         if start.elapsed() + delay > budget {
@@ -8431,6 +8481,41 @@ mod tests {
             due.is_empty(),
             "indeterminate request must not become executable without disk evidence"
         );
+        // The aggregate must read as indeterminate, not unpack-failed: the
+        // documented no-report reason and the TRUE git exit (0 here), so
+        // operators see "await disk evidence" instead of a false unpack
+        // failure flag. Routing the absent report through the unpack arm
+        // persists "unpack failed without parseable report" + FALSE.
+        let repo_id = state
+            .db
+            .get_repo("z6noreport", "n1")
+            .await
+            .unwrap()
+            .expect("repo exists")
+            .id;
+        let (req_state, last_error, git_exit_ok): (String, Option<String>, Option<bool>) =
+            sqlx::query_as(
+                "SELECT state, last_error, git_exit_ok FROM receive_pack_requests WHERE repo_id = $1",
+            )
+            .bind(&repo_id)
+            .fetch_one(state.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            req_state,
+            crate::db::request_state::REJECTED_AT_GIT,
+            "indeterminate parent waits in rejected_at_git for reconcile"
+        );
+        assert_eq!(
+            last_error.as_deref(),
+            Some("no report-status: awaiting request-bound disk evidence"),
+            "parent carries the indeterminate reason, not an unpack-failure label"
+        );
+        assert_eq!(
+            git_exit_ok,
+            Some(true),
+            "parent records the true git exit (0), not a false unpack failure"
+        );
     }
 
     /// `unpack_ok: false` with a per-ref `ok: true` bit and exit zero must
@@ -12112,6 +12197,77 @@ mod tests {
             std::time::Duration::from_millis(150),
         )
         .await;
+    }
+
+    /// Each cleanup attempt is bounded, not just the loop: with the parent
+    /// row locked by an open transaction, the refuse UPDATE blocks until the
+    /// per-attempt timeout fires, and the loop exits at the (short test)
+    /// budget instead of parking the task past it. Unwrapping the attempt
+    /// timeout parks the UPDATE forever and this hangs (caught by the outer
+    /// guard timeout, slow-red rather than green).
+    #[sqlx::test]
+    async fn guard_retry_attempt_bounded_under_row_lock(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let now = chrono::Utc::now().to_rfc3339();
+        let req = crate::db::ReceivePackRequest {
+            id: "req-row-locked".to_string(),
+            repo_id: "repo-row-locked".to_string(),
+            pusher_did: "did:key:z6pusher".to_string(),
+            node_did: state.node_did.to_string(),
+            request_bytes: Vec::new(),
+            request_bytes_hash: vec![7u8; 32],
+            state: crate::db::request_state::RECEIVED.to_string(),
+            git_exit_ok: None,
+            parsed_report: None,
+            accepted_ordinal: None,
+            attempt_count: 0,
+            last_error: None,
+            next_attempt_at: None,
+            created_at: now.clone(),
+            completed_at: None,
+            signature_header: Some("sig".to_string()),
+            signature_input: Some("sig-input".to_string()),
+            content_digest: Some("digest".to_string()),
+        };
+        state
+            .db
+            .insert_receive_pack_request_with_children(
+                &req,
+                "repo-row-locked",
+                &state.node_did.to_string(),
+                "did:key:z6pusher",
+                &[],
+                "sig",
+                "sig-input",
+                "digest",
+            )
+            .await
+            .unwrap();
+
+        // Hold a row lock on the parent for the whole call: every cleanup
+        // UPDATE blocks on it.
+        let mut locker = pool.acquire().await.expect("locker connection");
+        sqlx::query("SELECT 1 FROM receive_pack_requests WHERE id = $1 FOR UPDATE")
+            .bind("req-row-locked")
+            .fetch_one(&mut *locker)
+            .await
+            .unwrap();
+
+        // Outer guard: GREEN returns at the test budget (~0.5s); a missing
+        // per-attempt bound parks the UPDATE past it and trips this.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            retry_guard_cleanup_with_budget(
+                &state.db,
+                "req-row-locked",
+                false,
+                None,
+                std::time::Duration::from_millis(500),
+            ),
+        )
+        .await
+        .expect("bounded attempts must return at the budget, not park past it");
+        drop(locker);
     }
 
     /// The internal-namespace predicate covers the bare `refs/gitlawb` name

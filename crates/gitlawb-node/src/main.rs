@@ -587,7 +587,11 @@ async fn main() -> Result<()> {
 
     let _legacy_cid_sweep = spawn_legacy_cid_sweep(&state, &config);
     let _queue_lifecycle_sweep = spawn_queue_lifecycle_sweep(&state, &config);
-    let _due_request_worker = spawn_due_request_worker(&state);
+    // NOTE: the due-request worker is spawned AFTER the one-shot startup
+    // reconcile/drain below, not here: its 5s interval would otherwise tick
+    // during operator/PoS setup and interleave with boot recovery on backlog
+    // rows (state gates prevent data loss, but the interleave costs recovery
+    // latency and widens the reconcile/drain race window).
     let _marker_cleanup_worker = spawn_marker_cleanup_worker(&state);
 
     let router = server::build_router(state.clone());
@@ -731,6 +735,11 @@ async fn main() -> Result<()> {
             "pending ref transition drain failed at startup (non-fatal; will retry on next start)"
         ),
     }
+
+    // Start the due-request worker only now that boot recovery is done (see
+    // the note at the other spawns above): its first tick must not interleave
+    // with the one-shot reconcile/drain on backlog rows.
+    let _due_request_worker = spawn_due_request_worker(&state);
 
     // `into_make_service_with_connect_info` exposes the socket peer address as
     // `ConnectInfo<SocketAddr>` so the push limiter can key on the real client

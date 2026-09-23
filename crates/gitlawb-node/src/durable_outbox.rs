@@ -900,10 +900,11 @@ where
             Ok(EffectsOutcome::AwaitingSiblings) => {
                 // Waiting on reconcile siblings, not a failed effect: leave
                 // the aggregate untouched — no attempt increment, no
-                // backoff, no quarantine. The row stays due, so the next
-                // pass re-checks the siblings; startup reconcile resolves
-                // them and a later pass completes. Debug-level: this fires
-                // every pass until reconcile runs.
+                // backoff, no quarantine. The claim lease (300s) makes the
+                // row non-due until it lapses, after which the next pass
+                // re-checks the siblings; startup reconcile resolves them
+                // and a later pass completes. Debug-level: this fires every
+                // pass until reconcile runs.
                 tracing::debug!(
                     request_id = %request_id,
                     "drain: siblings unresolved, waiting for reconcile (no retry accounting)"
@@ -1093,10 +1094,17 @@ pub async fn drain_marker_cleanup_queue(
 /// `schedule_request_retry_or_quarantine`, or a long-lived process would
 /// increment `attempt_count` toward quarantine for a request that is only
 /// waiting on reconcile. Both callers leave the aggregate untouched (still
-/// `outcomes_committed`, still due) so the next pass re-checks the
-/// siblings; startup reconcile resolves them and a later pass completes.
+/// `outcomes_committed`; re-checkable once the 300s claim lease lapses) so
+/// later passes re-check the siblings; startup reconcile resolves them and
+/// a later pass completes.
 /// (A leftover `applied` row with no reconcile-resolvable sibling is
 /// divergent, not waiting — phase 2 returns `Retry` for operator review.)
+///
+/// A sibling that can never be promoted (unprovable rows reconcile leaves
+/// by design) parks the parent indefinitely — but not irrecoverably: the
+/// operator terminal path is `Db::resolve_attended_request`, whose gate
+/// covers the waiting executable states and cancels the remaining
+/// `prepared`/`uncertain` children in the same transaction.
 #[derive(Debug)]
 pub enum EffectsOutcome {
     Done,
@@ -1129,10 +1137,11 @@ pub enum EffectsOutcome {
 ///
 /// Returns `Ok(Done)` as a proceed-to-gate sentinel, not the final outcome:
 /// request completion is decided by the phase-2 gate in the caller, which
-/// returns `AwaitingSiblings` while any non-cancelled sibling remains and
-/// `Done` / `Nothing` only when every sibling is cancelled or gone.
-/// `Ok(Retry{..})` retries the bundle; `Err` propagates hard errors (e.g. proof-table
-/// failure) for the drain's `Err` retry arm.
+/// returns `AwaitingSiblings` while a reconcile-resolvable (`prepared` /
+/// `uncertain`) sibling remains, `Retry` for a divergent `applied`
+/// leftover, and `Done` / `Nothing` only when every sibling is cancelled
+/// or gone. `Ok(Retry{..})` retries the bundle; `Err` propagates hard
+/// errors (e.g. proof-table failure) for the drain's `Err` retry arm.
 async fn run_effect_bundle(
     state: &AppState,
     req: &crate::db::ReceivePackRequest,
@@ -1564,10 +1573,10 @@ pub async fn apply_request_effects(
         .db
         .list_pending_ref_transitions_for_request(request_id)
         .await?;
-    if remaining.iter().any(|c| {
-        c.state == crate::db::pending_state::PREPARED
-            || c.state == crate::db::pending_state::UNCERTAIN
-    }) {
+    if remaining
+        .iter()
+        .any(|c| crate::db::pending_state::is_reconcilable(&c.state))
+    {
         return Ok(EffectsOutcome::AwaitingSiblings);
     }
     if remaining
@@ -2469,6 +2478,177 @@ mod drain_tests {
                 .iter()
                 .any(|c| c.ref_name == "refs/heads/two" && c.state == pending_state::UNCERTAIN),
             "uncertain sibling evidence remains for reconcile, got {remaining:?}"
+        );
+    }
+
+    /// A request parked on unresolvable reconcile siblings has a reachable
+    /// terminal path: `resolve_attended_request` admits the waiting
+    /// executable states (`outcomes_committed`/`effects_pending`) and
+    /// cancels the remaining `prepared`/`uncertain` children in the same
+    /// transaction, while leaving `applied` children alone (their effects
+    /// may have run). Narrowing the gate back to quarantined/received/
+    /// rejected_at_git returns 0 rows here and turns this red.
+    #[sqlx::test]
+    async fn resolve_attended_request_terminates_waiting_aggregate(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let mk =
+            |request_id: &str, repo_id: &str, ref_name: &str, new: &str, ord: i32, st: &str| {
+                let now = Utc::now().to_rfc3339();
+                PendingRefTransition {
+                    id: crate::db::deterministic_id(&[
+                        "pending_ref_transition",
+                        request_id,
+                        repo_id,
+                        ref_name,
+                        &"0".repeat(40),
+                        new,
+                    ]),
+                    request_id: request_id.to_string(),
+                    repo_id: repo_id.to_string(),
+                    ref_name: ref_name.to_string(),
+                    old_sha: "0".repeat(40),
+                    new_sha: new.to_string(),
+                    pusher_did: "did:key:z6pusher".to_string(),
+                    node_did: "did:key:z6node".to_string(),
+                    signature_header: "s".to_string(),
+                    signature_input: "si".to_string(),
+                    content_digest: "d".to_string(),
+                    state: st.to_string(),
+                    created_at: now.clone(),
+                    applied_at: (st == pending_state::APPLIED).then(|| now.clone()),
+                    cancelled_at: None,
+                    ordinal: ord,
+                    git_target_kind: Some("update".to_string()),
+                }
+            };
+        let parsed = serde_json::json!({
+            "unpack_ok": true,
+            "ref_results": [{ "ref_name": "refs/heads/one", "ok": true }],
+        });
+        // Waiting aggregate 1: applied + uncertain siblings.
+        let c1 = mk(
+            "req-wait-resolve",
+            "repo-wait-resolve",
+            "refs/heads/one",
+            &"b".repeat(40),
+            0,
+            pending_state::APPLIED,
+        );
+        let c2 = mk(
+            "req-wait-resolve",
+            "repo-wait-resolve",
+            "refs/heads/two",
+            &"c".repeat(40),
+            1,
+            pending_state::UNCERTAIN,
+        );
+        stage_request_with_children(
+            &state.db,
+            "req-wait-resolve",
+            "repo-wait-resolve",
+            Some(0),
+            &[c1, c2],
+            parsed.clone(),
+        )
+        .await;
+        // Waiting aggregate 2: resolve to complete instead of reject.
+        let d1 = mk(
+            "req-wait-complete",
+            "repo-wait-complete",
+            "refs/heads/one",
+            &"b".repeat(40),
+            0,
+            pending_state::PREPARED,
+        );
+        stage_request_with_children(
+            &state.db,
+            "req-wait-complete",
+            "repo-wait-complete",
+            Some(0),
+            &[d1],
+            parsed,
+        )
+        .await;
+
+        assert_eq!(
+            state
+                .db
+                .resolve_attended_request("req-wait-resolve", "reject", Some("operator reviewed"))
+                .await
+                .unwrap(),
+            1,
+            "waiting aggregate is resolvable"
+        );
+        let parent = state
+            .db
+            .get_receive_pack_request("req-wait-resolve")
+            .await
+            .unwrap()
+            .expect("parent exists");
+        assert_eq!(
+            parent.state,
+            request_state::REJECTED_AT_GIT,
+            "resolve reject terminalizes the waiting parent"
+        );
+        assert!(
+            parent.completed_at.is_some(),
+            "resolved parent carries completed_at for retention"
+        );
+        let children = state
+            .db
+            .list_pending_ref_transitions_for_request("req-wait-resolve")
+            .await
+            .unwrap();
+        let by_name: std::collections::HashMap<&str, &str> = children
+            .iter()
+            .map(|c| (c.ref_name.as_str(), c.state.as_str()))
+            .collect();
+        assert_eq!(
+            by_name.get("refs/heads/two"),
+            Some(&pending_state::CANCELLED),
+            "uncertain sibling is cancelled with the parent"
+        );
+        assert_eq!(
+            by_name.get("refs/heads/one"),
+            Some(&pending_state::APPLIED),
+            "applied child is left alone (effects may have run)"
+        );
+
+        assert_eq!(
+            state
+                .db
+                .resolve_attended_request("req-wait-complete", "complete", None)
+                .await
+                .unwrap(),
+            1,
+            "waiting aggregate resolves to complete"
+        );
+        let done_parent = state
+            .db
+            .get_receive_pack_request("req-wait-complete")
+            .await
+            .unwrap()
+            .expect("parent exists");
+        assert_eq!(done_parent.state, request_state::COMPLETE);
+
+        // Terminal rows and unknown decisions affect nothing.
+        assert_eq!(
+            state
+                .db
+                .resolve_attended_request("req-wait-complete", "reject", None)
+                .await
+                .unwrap(),
+            0,
+            "resolve on a terminal row is a no-op"
+        );
+        assert_eq!(
+            state
+                .db
+                .resolve_attended_request("req-wait-resolve", "bogus", None)
+                .await
+                .unwrap(),
+            0,
+            "unknown decision is a no-op"
         );
     }
 
