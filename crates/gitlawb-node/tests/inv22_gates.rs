@@ -1014,6 +1014,16 @@ fn issue_26_namespace_gate_and_refusal_wiring() {
         "P2 wiring: prune must be called from both clone_repo and fetch_repo; \
          deleting either call must turn this red"
     );
+    // Both call sites must route through `wrap_prune_error`, which preserves
+    // deterministic `PruneInvalid` refusals instead of stringifying every
+    // error into transient `PruneFailed` (an every-tick deferral spin for
+    // permanently invalid mirrors). Pin the exact call shape at both sites.
+    assert_eq!(
+        sync_src.matches(".map_err(wrap_prune_error)").count(),
+        2,
+        "P2 wiring: both prune call sites must use wrap_prune_error; inline \
+         rewrap must turn this red"
+    );
 
     // P2: the visibility exemption narrowing removed a serving path. The exemption
     // is now scoped to `requests/` and `issues/` only (visibility_pack.rs:371), and

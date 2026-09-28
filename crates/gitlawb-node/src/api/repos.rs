@@ -1918,6 +1918,17 @@ const SYNC_NOTIFY_PATH: &str = "/api/v1/sync/notify";
 /// accounting (`run_effects`: push events, certs, webhooks) instead
 /// waits for the outcome commit, else startup reconcile (Option B
 /// attended-restart contract).
+///
+/// Storage/replication split for capability-free pushes: a zero
+/// `report-status` with git exit ok may still have landed refs, and the
+/// shared Tigris copy must stay fresh — otherwise the next write's
+/// `acquire_write` download replaces the local repo with the stale
+/// archive, erasing the acknowledged landing (and its marker) before
+/// startup reconcile can prove it. So `release_ok` also covers exit-ok
+/// pushes with no report (`report_absent`), while `spawn_tail` stays
+/// proven-refs-only: uploading the post-push disk state is always safe,
+/// announcing unproven refs is not. The deferred tail for late-proved
+/// refs runs from the drain (see `tail_owed_after_proof`).
 #[derive(Debug, PartialEq, Eq)]
 struct PostGitDisposition {
     spawn_tail: bool,
@@ -1929,11 +1940,12 @@ fn post_git_disposition(
     exit_ok: bool,
     any_ref_ok: bool,
     outcome_commit_ok: bool,
+    report_absent: bool,
 ) -> PostGitDisposition {
     let landed = exit_ok && any_ref_ok;
     PostGitDisposition {
         spawn_tail: landed,
-        release_ok: landed,
+        release_ok: exit_ok && (any_ref_ok || report_absent),
         run_effects: landed && outcome_commit_ok,
     }
 }
@@ -2246,6 +2258,23 @@ pub async fn git_receive_pack(
             ));
         }
     }
+    // Empty command stream (`0000` flush, no ref updates): no child can ever
+    // consume the proof, and the no-report outcome below terminalizes the
+    // parent without an accepted child that could ack it — leaving a
+    // terminal aggregate the retention gate holds forever. Ack up front:
+    // with zero children there are no effects to complete, so the proof is
+    // vacuously durable. (The ACK gate itself is untouched: any request
+    // that may have landed refs still waits for the drain's ack.)
+    if ref_updates.is_empty() {
+        if let Err(e) = state.db.ack_request_proof(&request_id).await {
+            tracing::warn!(
+                err = %e,
+                request_id = %request_id,
+                repo = %name,
+                "empty push: proof ack failed; retention will hold the aggregate"
+            );
+        }
+    }
 
     // Per-repo in-process write lease (#174 U2/F3): SUPPLEMENTS the cluster-wide pg
     // advisory lock. Acquire it BEFORE acquire_write (one consistent order everywhere,
@@ -2488,9 +2517,18 @@ pub async fn git_receive_pack(
     // Marker hiding was verified above by `verify_recovery_prereqs`,
     // which is warn-and-proceed (not a push refusal): on failure the
     // marker is still written and reconcile quarantines on a missing
-    // or mismatched marker. Write the per-request marker through the
-    // bounded runner using the configured git binary.
-    match crate::git::store::marker_value_for(&disk_path, &req_row.request_bytes_hash) {
+    // or mismatched marker. Compute the value and write the per-request
+    // marker through the bounded runners using the configured git binary:
+    // both hold admission permits, the lease, and the write lock, so an
+    // unbounded `hash-object` could pin them all on a hung child.
+    match crate::git::store::marker_value_for_bounded(
+        &state.git_bin,
+        &disk_path,
+        &req_row.request_bytes_hash,
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    {
         Ok(marker_value) => {
             if let Err(e) = crate::git::store::write_marker_bounded(
                 &state.git_bin,
@@ -2697,7 +2735,7 @@ pub async fn git_receive_pack(
                 Vec::new(),
                 pending_ref_names.clone(),
                 None,
-                Some("no report-status: awaiting request-bound disk evidence".to_string()),
+                Some(crate::durable_outbox::NO_REPORT_AWAITING_EVIDENCE.to_string()),
                 false,
             )
         }
@@ -2970,7 +3008,8 @@ pub async fn git_receive_pack(
     //
     // MUTATION (RED): gating `spawn_tail`/`release_ok` on
     // `outcome_commit_ok` breaks `post_git_disposition_replication_carve_out`.
-    let disposition = post_git_disposition(exit_ok, any_ref_ok, outcome_commit_ok);
+    let disposition =
+        post_git_disposition(exit_ok, any_ref_ok, outcome_commit_ok, report.is_none());
 
     if disposition.spawn_tail {
         // Spawn the replication tail only for refs that landed.
@@ -3171,7 +3210,11 @@ pub async fn git_receive_pack(
 /// the per-repo-coalesced pin/encrypt task, and this push's own Pinata + announce
 /// task. Split out of `git_receive_pack` so the ordering the coalescing gate depends
 /// on is directly testable; the handler spawns it and returns.
-async fn post_receive_replication_tail(
+/// Deferred-replication entry: the drain spawns this for aggregates that
+/// complete without ever having a live tail (capability-free pushes whose
+/// landing reconcile proved). `pub(crate)` so the drain can call it; the
+/// live handler is the other caller.
+pub(crate) async fn post_receive_replication_tail(
     state: AppState,
     record: RepoRecord,
     ref_updates: Vec<RefUpdate>,
@@ -4697,7 +4740,7 @@ mod tests {
     fn post_git_disposition_replication_carve_out() {
         // Happy path: everything runs.
         assert_eq!(
-            post_git_disposition(true, true, true),
+            post_git_disposition(true, true, true, false),
             PostGitDisposition {
                 spawn_tail: true,
                 release_ok: true,
@@ -4706,28 +4749,49 @@ mod tests {
         );
         // Commit failure defers accounting but NOT replication/Tigris.
         assert_eq!(
-            post_git_disposition(true, true, false),
+            post_git_disposition(true, true, false, false),
             PostGitDisposition {
                 spawn_tail: true,
                 release_ok: true,
                 run_effects: false
             },
         );
-        // No landed refs: nothing runs anywhere.
+        // No landed refs with a report: nothing runs anywhere.
         assert_eq!(
-            post_git_disposition(true, false, true),
+            post_git_disposition(true, false, true, false),
             PostGitDisposition {
                 spawn_tail: false,
                 release_ok: false,
                 run_effects: false
             },
         );
-        // Failed git: nothing runs anywhere.
+        // Failed git: nothing runs anywhere, report or not.
         assert_eq!(
-            post_git_disposition(false, false, false),
+            post_git_disposition(false, false, false, false),
             PostGitDisposition {
                 spawn_tail: false,
                 release_ok: false,
+                run_effects: false
+            },
+        );
+        assert_eq!(
+            post_git_disposition(false, false, true, true),
+            PostGitDisposition {
+                spawn_tail: false,
+                release_ok: false,
+                run_effects: false
+            },
+        );
+        // No report with exit ok: refs may have landed, so the shared
+        // copy is refreshed (no stale-download erasure) but nothing is
+        // announced and no effects run until reconcile proves the landing.
+        // MUTATION (RED): dropping `report_absent` from `release_ok`
+        // reintroduces the stale-Tigris erasure of acknowledged pushes.
+        assert_eq!(
+            post_git_disposition(true, false, true, true),
+            PostGitDisposition {
+                spawn_tail: false,
+                release_ok: true,
                 run_effects: false
             },
         );
@@ -8508,13 +8572,106 @@ mod tests {
         );
         assert_eq!(
             last_error.as_deref(),
-            Some("no report-status: awaiting request-bound disk evidence"),
+            Some(crate::durable_outbox::NO_REPORT_AWAITING_EVIDENCE),
             "parent carries the indeterminate reason, not an unpack-failure label"
         );
         assert_eq!(
             git_exit_ok,
             Some(true),
             "parent records the true git exit (0), not a false unpack failure"
+        );
+        // Storage durability: git exited ok, so the shared copy is refreshed
+        // even with no proven refs — otherwise the next Tigris-backed write
+        // restores a stale archive over the landed refs (and their marker)
+        // before reconcile can prove the landing. The upload-site counter
+        // records reaching the upload decision (tests run tigris: None).
+        assert_eq!(
+            state.repo_store.tigris_upload_site_reached(),
+            1,
+            "exit-ok push must reach the Tigris upload site with or without a report"
+        );
+    }
+
+    /// A valid empty (`0000`, no commands) push terminalizes with its proof
+    /// acked, so retention can purge it: no child can ever consume the
+    /// proof, and the no-report outcome has no accepted child to ack it.
+    /// Without the up-front ack the terminal parent fails the ACK gate
+    /// forever. Backdates `completed_at` past retention and proves the
+    /// purge deletes the aggregate.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn empty_receive_pack_acks_proof_for_retention(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let git_bin = write_fake_git(tmp.path(), "#!/bin/sh\ncat >/dev/null\nexit 0\n");
+        let mut state =
+            f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6empty", "e1", false).await;
+        let mut cfg = (*state.config).clone();
+        cfg.enforce_owner_push = false;
+        state.config = std::sync::Arc::new(cfg);
+
+        let peer: SocketAddr = "203.0.113.97:5000".parse().unwrap();
+        let resp = git_receive_pack(
+            State(state.clone()),
+            Path(("z6empty".to_string(), "e1".to_string())),
+            Extension(crate::auth::AuthenticatedDid("did:key:z6empty".to_string())),
+            crate::rate_limit::PeerAddr(Some(peer)),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from_static(b"0000"),
+        )
+        .await
+        .expect("empty push receives the Git response");
+        assert_eq!(resp.status(), 200);
+
+        let repo_id = state
+            .db
+            .get_repo("z6empty", "e1")
+            .await
+            .unwrap()
+            .expect("repo exists")
+            .id;
+        let (req_id, req_state): (String, String) =
+            sqlx::query_as("SELECT id, state FROM receive_pack_requests WHERE repo_id = $1")
+                .bind(&repo_id)
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            req_state,
+            crate::db::request_state::REJECTED_AT_GIT,
+            "empty push terminalizes without effects"
+        );
+        let proof = state
+            .db
+            .get_request_proof(&req_id)
+            .await
+            .unwrap()
+            .expect("proof row exists");
+        assert!(
+            proof.acked_at.is_some(),
+            "empty push acks its proof up front (no child ever could)"
+        );
+
+        // Age past retention: the aggregate must purge.
+        let old = (chrono::Utc::now() - chrono::Duration::days(8)).to_rfc3339();
+        sqlx::query("UPDATE receive_pack_requests SET completed_at = $1 WHERE id = $2")
+            .bind(&old)
+            .bind(&req_id)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(7)).to_rfc3339();
+        let purged = state
+            .db
+            .purge_completed_receive_pack_requests_returning(&cutoff, 100)
+            .await
+            .unwrap();
+        assert!(
+            purged.iter().any(|(id, _)| id == &req_id),
+            "empty terminal aggregate is purge-eligible, got {purged:?}"
         );
     }
 
@@ -12244,30 +12401,45 @@ mod tests {
             .await
             .unwrap();
 
-        // Hold a row lock on the parent for the whole call: every cleanup
-        // UPDATE blocks on it.
-        let mut locker = pool.acquire().await.expect("locker connection");
+        // Hold the parent row locked inside an EXPLICIT transaction for the
+        // whole call: a pooled `SELECT ... FOR UPDATE` outside a transaction
+        // releases at statement end (autocommit) and holds nothing. Every
+        // cleanup UPDATE below blocks on this lock until the per-attempt
+        // timeout fires.
+        let mut locker = pool.begin().await.expect("locker transaction");
         sqlx::query("SELECT 1 FROM receive_pack_requests WHERE id = $1 FOR UPDATE")
             .bind("req-row-locked")
             .fetch_one(&mut *locker)
             .await
             .unwrap();
 
-        // Outer guard: GREEN returns at the test budget (~0.5s); a missing
-        // per-attempt bound parks the UPDATE past it and trips this.
+        // GREEN returns at the test budget with elapsed below the 10s
+        // per-attempt cap, proving the clamp (not just the loop budget):
+        // without the per-attempt bound the UPDATE parks until the lock
+        // releases — never, in this test — and trips the outer guard.
+        // The outer guard sits above the 10s cap but far below infinity so
+        // a regression slow-fails instead of wedging the suite.
+        let started = std::time::Instant::now();
         tokio::time::timeout(
-            std::time::Duration::from_secs(20),
+            std::time::Duration::from_secs(15),
             retry_guard_cleanup_with_budget(
                 &state.db,
                 "req-row-locked",
                 false,
                 None,
-                std::time::Duration::from_millis(500),
+                std::time::Duration::from_secs(2),
             ),
         )
         .await
-        .expect("bounded attempts must return at the budget, not park past it");
-        drop(locker);
+        .expect("bounded attempts must return, not park past the outer guard");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "cleanup under a held row lock must return inside the per-attempt \
+             bound, not park the UPDATE; took {elapsed:?}"
+        );
+        // Releasing the lock lets the stranded aggregate terminalize.
+        locker.rollback().await.unwrap();
     }
 
     /// The internal-namespace predicate covers the bare `refs/gitlawb` name

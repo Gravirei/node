@@ -4513,7 +4513,7 @@ impl Db {
                ORDER BY created_at ASC, id ASC
                LIMIT $4"#,
         )
-        .bind(&pending_state::RECONCILABLE[..])
+        .bind(pending_state::RECONCILABLE.to_vec())
         .bind(after_created_at)
         .bind(after_id)
         .bind(limit)
@@ -4549,7 +4549,7 @@ impl Db {
         .bind(pending_state::APPLIED)
         .bind(&now)
         .bind(ids)
-        .bind(&pending_state::RECONCILABLE[..])
+        .bind(pending_state::RECONCILABLE.to_vec())
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected())
@@ -4954,16 +4954,34 @@ impl Db {
     }
 
     /// Operator transition for attended work: requests waiting on a human
-    /// decision can be resolved to terminal complete (no effects) or
-    /// rejected_at_git. Covers quarantined/received/rejected_at_git AND the
-    /// waiting executable states (outcomes_committed/effects_pending), so a
-    /// request parked on unresolvable reconcile siblings has a reachable
-    /// terminal path via operator decision instead of waiting forever.
-    /// Non-terminal children (prepared/uncertain) are cancelled in the same
-    /// transaction — otherwise a resolved parent would keep live children
-    /// that block retention; applied children are left alone (their effects
-    /// may have run: history, not evidence). Returns rows affected (the
-    /// parent flip; 0 = wrong state or unknown decision).
+    /// decision are resolved terminally, recording the decision
+    /// (`operator complete` / `operator reject` plus note) in `last_error`.
+    /// Covers quarantined/rejected_at_git AND the waiting executable states
+    /// (outcomes_committed/effects_pending), so a request parked on
+    /// unresolvable reconcile siblings has a reachable terminal path via
+    /// operator decision instead of waiting forever.
+    ///
+    /// The target is always `complete` — never `rejected_at_git`, even for
+    /// "reject": `rejected_at_git` is recoverable-terminal by design (the
+    /// stuck-aggregate repair promotes applied children under it), so an
+    /// operator rejection landing there with `applied` children would
+    /// resurrect at the next startup reconcile and ship effects the
+    /// operator just refused. `complete` is never selected by repair,
+    /// drain, or reconcile.
+    ///
+    /// `received` is deliberately NOT admitted: git may be executing for
+    /// such a row right now, and cancelling its `prepared` children would
+    /// make the live outcome commit a no-op while refs git landed sit as
+    /// `cancelled` rows reconcile never re-examines (and that no longer
+    /// count as competing claimants).
+    ///
+    /// Non-terminal children ([`pending_state::RECONCILABLE`]) are cancelled
+    /// in the same transaction — otherwise a resolved parent would keep
+    /// live children that block retention; applied children are left alone
+    /// (their effects may have run: history, not evidence). The request
+    /// proof is acked in the same transaction so retention is not gated
+    /// forever on a row whose effects will never run. Returns rows affected
+    /// (the parent flip; 0 = wrong state or unknown decision).
     #[allow(dead_code)]
     pub async fn resolve_attended_request(
         &self,
@@ -4971,24 +4989,27 @@ impl Db {
         decision: &str,
         note: Option<&str>,
     ) -> Result<u64> {
-        let target = match decision {
-            "complete" => request_state::COMPLETE,
-            "reject" | "rejected_at_git" => request_state::REJECTED_AT_GIT,
+        let verdict = match decision {
+            "complete" => "complete",
+            "reject" | "rejected_at_git" => "reject",
             _ => return Ok(0),
         };
         let mut tx = self.pool.begin().await?;
         let now = Utc::now().to_rfc3339();
+        let last_error = match note {
+            Some(n) => format!("operator {verdict}: {n}"),
+            None => format!("operator {verdict}"),
+        };
         let res = sqlx::query(
             r#"UPDATE receive_pack_requests
                SET state=$2, completed_at=$3, last_error=$4
-               WHERE id=$1 AND state IN ($5,$6,$7,$8,$9)"#,
+               WHERE id=$1 AND state IN ($5,$6,$7,$8)"#,
         )
         .bind(request_id)
-        .bind(target)
+        .bind(request_state::COMPLETE)
         .bind(&now)
-        .bind(note)
+        .bind(&last_error)
         .bind(request_state::QUARANTINED)
-        .bind(request_state::RECEIVED)
         .bind(request_state::REJECTED_AT_GIT)
         .bind(request_state::OUTCOMES_COMMITTED)
         .bind(request_state::EFFECTS_PENDING)
@@ -5001,13 +5022,19 @@ impl Db {
         sqlx::query(
             r#"UPDATE pending_ref_transitions
                SET state = $2, cancelled_at = $3
-               WHERE request_id = $1 AND state IN ($4, $5)"#,
+               WHERE request_id = $1 AND state = ANY($4)"#,
         )
         .bind(request_id)
         .bind(pending_state::CANCELLED)
         .bind(&now)
-        .bind(pending_state::PREPARED)
-        .bind(pending_state::UNCERTAIN)
+        .bind(&pending_state::RECONCILABLE[..])
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"UPDATE request_proofs SET acked_at = $2 WHERE request_id = $1 AND acked_at IS NULL"#,
+        )
+        .bind(request_id)
+        .bind(&now)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;

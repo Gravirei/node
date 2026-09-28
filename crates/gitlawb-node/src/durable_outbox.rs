@@ -197,7 +197,17 @@ async fn reconcile_prepared_page(
             }
         };
         let disk_path = std::path::Path::new(&repo.disk_path);
-        let refs = match crate::git::store::list_refs(disk_path) {
+        // Bounded: startup awaits reconcile before serving, so a hung
+        // `for-each-ref` would hold the boot past the nonfatal error arm
+        // below. Expiry fails the same way (rows untouched) as any other
+        // git error here.
+        let refs = match crate::git::store::list_refs_bounded(
+            &state.git_bin,
+            disk_path,
+            reconcile_git_timeout(&state),
+        )
+        .await
+        {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
@@ -359,11 +369,26 @@ async fn reconcile_prepared_page(
                 }
             };
             let marker_ref = format!("refs/gitlawb/requests/{}", row.request_id);
-            let marker_ok = match crate::git::store::read_ref(disk_path, &marker_ref) {
-                Ok(Some(value)) => match crate::git::store::marker_value_for(
+            // Bounded like the list_refs above: each read degrades to
+            // "marker unreadable" (quarantine signal) on expiry, never a
+            // hung startup.
+            let git_timeout = reconcile_git_timeout(&state);
+            let marker_ok = match crate::git::store::read_ref_bounded(
+                &state.git_bin,
+                disk_path,
+                &marker_ref,
+                git_timeout,
+            )
+            .await
+            {
+                Ok(Some(value)) => match crate::git::store::marker_value_for_bounded(
+                    &state.git_bin,
                     disk_path,
                     &request.request_bytes_hash,
-                ) {
+                    git_timeout,
+                )
+                .await
+                {
                     Ok(expected) => value == expected,
                     Err(e) => {
                         tracing::warn!(
@@ -385,7 +410,14 @@ async fn reconcile_prepared_page(
                 }
             };
             if !marker_ok {
-                let reason = match crate::git::store::read_ref(disk_path, &marker_ref) {
+                let reason = match crate::git::store::read_ref_bounded(
+                    &state.git_bin,
+                    disk_path,
+                    &marker_ref,
+                    git_timeout,
+                )
+                .await
+                {
                     Ok(Some(_)) => "marker hash mismatch",
                     _ => "missing marker ref",
                 };
@@ -654,17 +686,31 @@ fn reflog_proves_landing(
         .any(|e| e.old_sha == old_sha && e.new_sha == new_sha && e.at >= floor)
 }
 
+/// Timeout for per-repo git reads during startup reconcile
+/// (`for-each-ref`, `show-ref`, `hash-object`): the operator-configured
+/// git service bound, matching the other production git callers. Startup
+/// awaits reconcile before serving, so these reads must be bounded —
+/// expiry degrades to "rows untouched" (fail-closed) like any git error.
+fn reconcile_git_timeout(state: &AppState) -> std::time::Duration {
+    std::time::Duration::from_secs(state.config.git_service_timeout_secs)
+}
+
 /// How far BEFORE a row's `created_at` a reflog entry may be stamped
 /// and still count as proof of that row's landing.
 ///
 /// Git writes whole-second reflog timestamps while `created_at` is an
 /// RFC 3339 instant with sub-second precision, so a ref that landed
 /// 200ms after the intent was written can carry a reflog stamp one
-/// second EARLIER than the row. The tolerance covers that truncation
-/// and small clock jitter; it is deliberately far smaller than
-/// [`MAX_RECONCILE_AGE`], so it cannot readmit an old entry left by a
-/// previous push of the same pair.
-pub const REFLOG_CLOCK_SKEW: chrono::Duration = chrono::Duration::seconds(60);
+/// second EARLIER than the row. The 5s tolerance covers that truncation
+/// plus scheduling jitter — and nothing more. A wider window admits a
+/// stale rejection to steal attribution: a second request submitting the
+/// same now-stale command gets rejected by git, and if its report is lost,
+/// reconcile would otherwise match the tip and the FIRST request's reflog
+/// entry, crediting the rejected pusher with a transition it did not
+/// cause. Ambiguous same-tuple history stays unproven (attended); only
+/// request-causal evidence — an entry that cannot predate the intent that
+/// caused it beyond clock precision — promotes.
+pub const REFLOG_CLOCK_SKEW: chrono::Duration = chrono::Duration::seconds(5);
 
 /// P2 (reviewer-1/2 round 3): multi-pass reconcile for the prepared/
 /// uncertain backlog. Mirrors `drain_receive_pack_requests_all`:
@@ -1105,6 +1151,29 @@ pub async fn drain_marker_cleanup_queue(
 /// operator terminal path is `Db::resolve_attended_request`, whose gate
 /// covers the waiting executable states and cancels the remaining
 /// `prepared`/`uncertain` children in the same transaction.
+///
+/// `last_error` marker for capability-free pushes whose `report-status`
+/// was absent: children stay `uncertain` until reconcile proves the
+/// landing. Single source for the string the handler stamps and the drain
+/// matches on (notably [`tail_owed_after_proof`]); a literal in either
+/// place would silently fork the contract.
+pub const NO_REPORT_AWAITING_EVIDENCE: &str =
+    "no report-status: awaiting request-bound disk evidence";
+
+/// True when an aggregate completing in the drain never had a live
+/// replication tail: the live handler spawns the tail only for proven
+/// landings, so a no-report aggregate reaching `Done` via reconcile
+/// promotion still owes pins/announce/peer-notify. The drain spawns the
+/// deferred tail exactly once, on the completing pass (accepted children
+/// are deleted and the parent completes, so no later pass re-fires).
+/// Residual: a transient effect failure overwrites `last_error` via the
+/// retry scheduler before completion, and the tail is then missed — data
+/// stays durable (upload) and accounted (drain), only replication lags;
+/// acceptable best-effort, logged where it happens.
+fn tail_owed_after_proof(req: &crate::db::ReceivePackRequest) -> bool {
+    req.last_error.as_deref() == Some(NO_REPORT_AWAITING_EVIDENCE)
+}
+
 #[derive(Debug)]
 pub enum EffectsOutcome {
     Done,
@@ -1213,6 +1282,18 @@ async fn run_effect_bundle(
     let mut first_error: Option<String> = None;
     for child in accepted_children {
         let cert_id = crate::db::ref_cert_id_for(&req.id, child.ordinal);
+        // Freshness is landing order, not intent order: `applied_at` is
+        // stamped once, when the row is accepted (outcome commit or
+        // reconcile promotion — both run after git serialized the
+        // landing), while `created_at` predates the per-repo lease, so two
+        // intents inserted A,B can land B,A and A's later landing must win
+        // the greater-`issued_at` upsert rule. `applied_at` is stable per
+        // row (never rewritten), so a stale replay re-issues its original
+        // stamp and still cannot regress a newer certificate.
+        let issued_at = child
+            .applied_at
+            .clone()
+            .unwrap_or_else(|| child.created_at.clone());
         if let Err(e) = cert::issue_ref_certificate_with_issued_at(
             state,
             &req.repo_id,
@@ -1221,7 +1302,7 @@ async fn run_effect_bundle(
             &child.new_sha,
             &req.pusher_did,
             &cert_id,
-            Some(child.created_at.clone()),
+            Some(issued_at),
         )
         .await
         {
@@ -1588,10 +1669,77 @@ pub async fn apply_request_effects(
         });
     }
     if bundle_owed {
+        // Deferred replication: a no-report aggregate reaching Done via
+        // reconcile promotion never had a live tail (the live handler only
+        // spawns for proven landings). Spawn it now that the landing is
+        // proved; reported aggregates (live tail already ran) are excluded
+        // by the predicate. Exactly-once: accepted children are deleted and
+        // the parent completes, so no later pass re-fires.
+        spawn_deferred_tail_after_proof(state, &req, &accepted_children);
         Ok(EffectsOutcome::Done)
     } else {
         Ok(EffectsOutcome::Nothing)
     }
+}
+
+/// Spawn the deferred replication tail for an aggregate completing without
+/// ever having a live one ([`tail_owed_after_proof`]). Accepted children
+/// are passed by value (rebuilt from the in-memory rows before deletion,
+/// so no landing-history query is needed). Best-effort fire-and-forget
+/// like the live spawn: replication must not fail accounting.
+fn spawn_deferred_tail_after_proof(
+    state: &AppState,
+    req: &crate::db::ReceivePackRequest,
+    accepted: &[&PendingRefTransition],
+) {
+    if !tail_owed_after_proof(req) || accepted.is_empty() {
+        return;
+    }
+    let repo_id = req.repo_id.clone();
+    let pusher_did = req.pusher_did.clone();
+    let landed: Vec<(String, String, String)> = accepted
+        .iter()
+        .map(|c| (c.ref_name.clone(), c.old_sha.clone(), c.new_sha.clone()))
+        .collect();
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        let repo = match state_clone.db.get_repo_by_id(&repo_id).await {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                tracing::warn!(
+                    repo_id = %repo_id,
+                    "deferred tail: repo row missing, skipping replication"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    err = %e,
+                    repo_id = %repo_id,
+                    "deferred tail: repo lookup failed, skipping replication"
+                );
+                return;
+            }
+        };
+        let ref_updates: Vec<crate::api::repos::RefUpdate> = landed
+            .into_iter()
+            .map(
+                |(ref_name, old_sha, new_sha)| crate::api::repos::RefUpdate {
+                    old_sha,
+                    new_sha,
+                    ref_name,
+                },
+            )
+            .collect();
+        crate::api::repos::post_receive_replication_tail(
+            state_clone,
+            repo.clone(),
+            ref_updates,
+            std::path::PathBuf::from(repo.disk_path.clone()),
+            pusher_did,
+        )
+        .await;
+    });
 }
 
 #[cfg(test)]
@@ -2587,12 +2735,18 @@ mod drain_tests {
             .expect("parent exists");
         assert_eq!(
             parent.state,
-            request_state::REJECTED_AT_GIT,
-            "resolve reject terminalizes the waiting parent"
+            request_state::COMPLETE,
+            "resolve lands terminal complete even for reject: rejected_at_git \
+             would resurrect via stuck-aggregate repair"
         );
         assert!(
             parent.completed_at.is_some(),
             "resolved parent carries completed_at for retention"
+        );
+        assert_eq!(
+            parent.last_error.as_deref(),
+            Some("operator reject: operator reviewed"),
+            "the reject decision is recorded, not the state"
         );
         let children = state
             .db
@@ -2650,6 +2804,92 @@ mod drain_tests {
             0,
             "unknown decision is a no-op"
         );
+
+        // No resurrection: the resolved aggregate (complete parent, applied
+        // child left in place) is invisible to stuck-aggregate repair, and a
+        // reconcile pass promotes nothing and ships no effects for it.
+        let stuck = state.db.list_stuck_request_aggregates(1000).await.unwrap();
+        assert!(
+            !stuck.contains(&"req-wait-resolve".to_string()),
+            "resolved aggregate must not match the stuck-aggregate scan"
+        );
+        let n = reconcile_prepared_from_disk(state.clone(), 100)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "reconcile promotes nothing for a resolved aggregate");
+        let still = state
+            .db
+            .get_receive_pack_request("req-wait-resolve")
+            .await
+            .unwrap()
+            .expect("parent exists");
+        assert_eq!(
+            still.state,
+            request_state::COMPLETE,
+            "resolved parent stays terminal across reconcile"
+        );
+    }
+
+    /// A no-report aggregate that reconcile promotes still owes its
+    /// replication tail (the live handler only spawns for proven landings).
+    /// Drive startup recovery to completion on a real repo and assert the
+    /// deferred tail broadcasts the proved ref: deleting the drain-side
+    /// spawn leaves accounting complete with no broadcast and turns this
+    /// red. Best-effort delivery like the live spawn — the assertion is the
+    /// broadcast, not the network sends (no peers/pinata in test).
+    #[sqlx::test]
+    async fn deferred_tail_broadcasts_once_landing_proved(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bare = tmp.path().join("repo.git");
+        crate::git::store::init_bare(&bare).expect("init_bare");
+        let on_disk_sha = seed_ref_on_bare(&bare, "refs/heads/main");
+
+        let repo_id = seed_repo_row(&state, bare.to_str().unwrap()).await;
+        let request_id = "req-no-report-tail";
+        seed_parent_request(&state.db, request_id, &repo_id, vec![0xb7; 32]).await;
+        // Indeterminate no-report marker reason: the live path spawned no
+        // tail for this aggregate.
+        sqlx::query("UPDATE receive_pack_requests SET last_error = $1 WHERE id = $2")
+            .bind(crate::durable_outbox::NO_REPORT_AWAITING_EVIDENCE)
+            .bind(request_id)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        let mut row = make_row(&repo_id, "refs/heads/main", &"0".repeat(40), &on_disk_sha);
+        row.request_id = request_id.to_string();
+        row.state = pending_state::PREPARED.to_string();
+        row.applied_at = None;
+        state
+            .db
+            .insert_pending_ref_transition_for_test(&row)
+            .await
+            .unwrap();
+        stage_marker(&bare, request_id, &[0xb7; 32]).await;
+
+        // Startup recovery proves the landing and promotes the aggregate.
+        let n = reconcile_prepared_from_disk(state.clone(), 100)
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "reconcile promotes the disk-proved child");
+
+        // Subscribe before the drain completes: the deferred tail
+        // broadcasts the proved ref exactly like the live tail would.
+        let mut rx = state.ref_update_tx.subscribe();
+        let (processed, _) = drain_receive_pack_requests(state.clone(), 100)
+            .await
+            .unwrap();
+        assert_eq!(processed, 1, "drain completes the repaired request");
+        let evt = tokio::time::timeout(std::time::Duration::from_secs(20), rx.recv())
+            .await
+            .expect("deferred tail must broadcast the proved ref")
+            .expect("broadcast channel live");
+        assert_eq!(
+            evt.ref_name, "refs/heads/main",
+            "broadcast names the proved ref"
+        );
+        assert_eq!(evt.new_sha, on_disk_sha, "broadcast carries the landed tip");
     }
 
     /// Proof is acked on success and blocks purge until acked. Removing
@@ -3535,6 +3775,75 @@ mod drain_tests {
         );
     }
 
+    /// A matching reflog entry stamped before the row (but inside the old
+    /// 60s tolerance) must NOT promote: it is a previous push's landing,
+    /// and crediting it would attribute a rejected stale command's tuple
+    /// to a pusher whose push git denied. A 30s-old entry exercises the
+    /// hole the 5s `REFLOG_CLOCK_SKEW` closes; widening the skew back
+    /// toward a minute turns this red while the hour-old sibling stays
+    /// green.
+    #[sqlx::test]
+    async fn reconcile_refuses_a_matching_entry_predating_the_row(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bare = tmp.path().join("repo.git");
+        crate::git::store::init_bare(&bare).expect("init_bare");
+        let on_disk_sha = seed_ref_on_bare(&bare, "refs/heads/main");
+
+        // Rewrite the entry's timestamp to 30s back: inside the old minute
+        // tolerance, outside the precision tolerance. Same rewrite shape as
+        // the hour-old sibling test.
+        let log_path = bare.join("logs/refs/heads/main");
+        let raw = std::fs::read_to_string(&log_path).expect("reflog exists");
+        let old_ts = (chrono::Utc::now() - chrono::Duration::seconds(30)).timestamp();
+        let rewritten: String = raw
+            .lines()
+            .map(|line| {
+                let (header, msg) = line.split_once('\t').unwrap_or((line, ""));
+                let mut tokens: Vec<String> =
+                    header.split_whitespace().map(|s| s.to_string()).collect();
+                let n = tokens.len();
+                tokens[n - 2] = old_ts.to_string();
+                format!("{}\t{}\n", tokens.join(" "), msg)
+            })
+            .collect();
+        std::fs::write(&log_path, rewritten).expect("rewrite reflog");
+
+        let repo_id = seed_repo_row(&state, bare.to_str().unwrap()).await;
+        // Parent + marker so timestamp floor is the ONLY gate refusing.
+        seed_parent_request(&state.db, "req-stale-entry", &repo_id, vec![0xb7; 32]).await;
+        stage_marker(&bare, "req-stale-entry", &[0xb7; 32]).await;
+        let mut row = make_row(&repo_id, "refs/heads/main", &"0".repeat(40), &on_disk_sha);
+        row.request_id = "req-stale-entry".to_string();
+        row.state = pending_state::PREPARED.to_string();
+        row.applied_at = None;
+        state
+            .db
+            .insert_pending_ref_transition_for_test(&row)
+            .await
+            .unwrap();
+
+        let n = reconcile_prepared_from_disk(state.clone(), 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            n, 0,
+            "a reflog entry predating the intent cannot prove this request caused \
+             the landing, even when tip and tuple match"
+        );
+        let still = state
+            .db
+            .list_pending_ref_transitions_for_request("req-stale-entry")
+            .await
+            .unwrap();
+        assert_eq!(
+            still[0].state,
+            pending_state::PREPARED,
+            "ambiguous history stays for attended recovery, never auto-promotes"
+        );
+    }
+
     /// Deletions are fail-closed with a terminating attended
     /// lifecycle: git removes the ref's reflog with the ref, so
     /// absence plus age cannot prove THIS request caused the deletion.
@@ -3596,7 +3905,9 @@ mod drain_tests {
             crate::db::request_state::QUARANTINED,
             "deletion is quarantined with a terminating attended lifecycle"
         );
-        // Operator can resolve the attended request terminally.
+        // Operator can resolve the attended request terminally (complete,
+        // recording the reject decision — never rejected_at_git, which the
+        // stuck-aggregate repair would resurrect).
         assert_eq!(
             state
                 .db
@@ -3605,6 +3916,17 @@ mod drain_tests {
                 .unwrap(),
             1,
             "operator reject transition terminates attended deletion"
+        );
+        let resolved = state
+            .db
+            .get_receive_pack_request(&row.request_id)
+            .await
+            .unwrap()
+            .expect("parent exists");
+        assert_eq!(
+            resolved.state,
+            request_state::COMPLETE,
+            "operator resolve lands complete"
         );
     }
 
@@ -4417,16 +4739,16 @@ mod drain_tests {
     //
     // The reviewer's invariant: a recovery replay of A's row after a
     // later live cert B has been written must NOT overwrite B's
-    // fields. Without `issued_at_override`, the recovery's
-    // `Utc::now()` is later than B's live `Utc::now()` (because the
-    // replay happens after B's live write), and the
+    // fields. The cert's `issued_at` is the row's `applied_at` — stamped
+    // once when the row is accepted (outcome commit or reconcile
+    // promotion, both after git serialized the landing), never rewritten
+    // — so a stale replay re-issues its original stamp and the
     // `EXCLUDED.issued_at > ref_certificates.issued_at` upsert guard
-    // would let A's stale transition clobber B's fresh cert.
+    // keeps B's fresh cert.
     //
-    // The fix stamps the recovery cert's `issued_at` with the row's
-    // `created_at`, which carries the original transition time and
-    // is earlier than B's `Utc::now()`. This test pins that the
-    // replay does not outrank B.
+    // The fix stamps with `applied_at`, not intent `created_at`: intents
+    // are written before the per-repo lease, so insert order is not
+    // landing order. This test pins that the replay does not outrank B.
     #[sqlx::test]
     async fn replay_of_stale_row_does_not_overwrite_live_cert_b(pool: sqlx::PgPool) {
         let state = crate::test_support::test_state(pool).await;
@@ -4463,9 +4785,12 @@ mod drain_tests {
             &a_row.old_sha,
             &a_row.new_sha,
         ]);
-        // Backdate A's created_at by 5 minutes so the replay's
-        // stamped `issued_at` is provably older than B's live one.
+        // Backdate A's acceptance by 5 minutes (both the intent and the
+        // `applied_at` stamp) so the replay's `issued_at` is provably older
+        // than B's live one. Backdating `created_at` alone is not enough:
+        // freshness is landing order (`applied_at`), not intent order.
         a_row.created_at = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+        a_row.applied_at = Some((chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339());
         let parsed_report = parsed_report_ok(&[("refs/heads/main", true)]);
         stage_request_with_pusher(
             &state.db,
@@ -4512,7 +4837,7 @@ mod drain_tests {
             .unwrap();
 
         // Drain A's replay. The upsert sees A's `issued_at` (A's
-        // created_at = now-5min) is OLDER than B's cert (now), so
+        // `applied_at` = now-5min) is OLDER than B's cert (now), so
         // the per-column CASE WHEN guards must NOT update B's
         // fields.
         let (processed, examined) = drain_receive_pack_requests(state.clone(), 100)
@@ -4526,7 +4851,7 @@ mod drain_tests {
         let cert = &certs[0];
         assert_eq!(
             cert.old_sha, b_old,
-            "old_sha stays at B's; A's replay (now-5min) must not outrank B's (now)"
+            "old_sha stays at B's; A's replay (applied now-5min) must not outrank B's (now)"
         );
         assert_eq!(
             cert.new_sha, b_new,
@@ -4539,6 +4864,102 @@ mod drain_tests {
         assert_eq!(
             cert.signature, "b-live-signature",
             "signature stays at B's live signature; A's replay must not outrank B's"
+        );
+    }
+
+    /// Certificates order by landing, not intent: intents A then B can
+    /// serialize through the write lock B-then-A. A landed later (greater
+    /// `applied_at`) so its certificate must win even though B's intent is
+    /// newer. Stamping `issued_at` from intent `created_at` gets this
+    /// backwards (B's newer intent outranks A's later landing) and turns
+    /// this red, leaving the signed certificate behind git's current ref.
+    #[sqlx::test]
+    async fn cert_orders_by_landing_not_intent_when_orders_diverge(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let owner_did = "did:key:z6Mklandorder";
+        let rec = crate::db::RepoRecord {
+            id: "repo-landorder".to_string(),
+            name: "landorder".to_string(),
+            owner_did: owner_did.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            disk_path: "/tmp/landorder".to_string(),
+            forked_from: None,
+            machine_id: None,
+        };
+        state.db.create_repo(&rec).await.unwrap();
+        let mk = |request_id: &str, new: &str, created_ago_min: i64, applied_ago_min: i64| {
+            let created_at =
+                (chrono::Utc::now() - chrono::Duration::minutes(created_ago_min)).to_rfc3339();
+            let applied_at =
+                (chrono::Utc::now() - chrono::Duration::minutes(applied_ago_min)).to_rfc3339();
+            PendingRefTransition {
+                id: crate::db::deterministic_id(&[
+                    "pending_ref_transition",
+                    request_id,
+                    &rec.id,
+                    "refs/heads/main",
+                    &"0".repeat(40),
+                    new,
+                ]),
+                request_id: request_id.to_string(),
+                repo_id: rec.id.clone(),
+                ref_name: "refs/heads/main".to_string(),
+                old_sha: "0".repeat(40),
+                new_sha: new.to_string(),
+                pusher_did: "did:key:z6pusher".to_string(),
+                node_did: "did:key:z6node".to_string(),
+                signature_header: "s".to_string(),
+                signature_input: "si".to_string(),
+                content_digest: "d".to_string(),
+                state: pending_state::APPLIED.to_string(),
+                created_at,
+                applied_at: Some(applied_at),
+                cancelled_at: None,
+                ordinal: 0,
+                git_target_kind: Some("update".to_string()),
+            }
+        };
+        // A intent first (created 5min ago) but landed later (applied now);
+        // B intent second (created 3min ago) but landed earlier (applied
+        // 2min ago). Landing order is B then A.
+        let a_row = mk("req-land-A", &"a".repeat(40), 5, 0);
+        let b_row = mk("req-land-B", &"b".repeat(40), 3, 2);
+        let parsed = parsed_report_ok(&[("refs/heads/main", true)]);
+        stage_request_with_children(
+            &state.db,
+            "req-land-A",
+            &rec.id,
+            Some(0),
+            std::slice::from_ref(&a_row),
+            parsed.clone(),
+        )
+        .await;
+        stage_request_with_children(
+            &state.db,
+            "req-land-B",
+            &rec.id,
+            Some(0),
+            std::slice::from_ref(&b_row),
+            parsed,
+        )
+        .await;
+
+        // Drain in intent order (A first): A completes with the later
+        // landing, then B's earlier landing must not regress it.
+        let (processed, _) = drain_receive_pack_requests(state.clone(), 100)
+            .await
+            .unwrap();
+        assert_eq!(processed, 2, "both requests drain");
+        let certs = state.db.list_ref_certificates(&rec.id, 10).await.unwrap();
+        assert_eq!(certs.len(), 1, "one cert row for the ref");
+        assert_eq!(
+            certs[0].new_sha,
+            "a".repeat(40),
+            "the later landing (A) wins over the earlier one (B) despite intent order"
         );
     }
 

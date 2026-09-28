@@ -323,7 +323,32 @@ pub fn parse_report_status(output: &[u8]) -> Option<(bool, Vec<(String, bool)>)>
     // prefix and a channel byte (1 = stdout, 2 = stderr). The actual
     // data starts after the first `0000` flush packet or after we
     // strip sideband bytes.
-    let stripped = strip_sideband(text, false)?;
+    //
+    // Framing completeness is part of authority, at whichever level the
+    // framing lives. A double-framed capture carries the report stream
+    // (itself pkt-line framed, flush-terminated) inside the sideband
+    // envelope — real git output has been observed with NO outer flush,
+    // so the outer level cannot require one; the inner frame's flush is
+    // authoritative there. A single-framed (or unframed) payload has no
+    // inner frame, so its only completion marker is the outer flush:
+    // output ending after a complete `unpack ok` / `ok <ref>` packet but
+    // before the outer `0000` is a truncated report and yields `None`
+    // (uncertain), not a successful report.
+    let (stripped, outer_flush) = strip_sideband(text, false)?;
+    // The report-status vocabulary (`unpack ...`, `ok ...`, `ng ...`)
+    // never opens with four hex digits, so a hex quartet here is inner
+    // pkt-line framing, not report text.
+    let stripped = if stripped.len() >= 4
+        && stripped.as_bytes()[..4]
+            .iter()
+            .all(|b| b.is_ascii_hexdigit())
+    {
+        strip_sideband(&stripped, true)?.0
+    } else if !outer_flush {
+        return None;
+    } else {
+        stripped
+    };
     // The report is framed TWICE when the client negotiated side-band-64k,
     // which `git push` over smart HTTP does — so this is the common case, not
     // an exotic one. The outer frame is the side-band envelope; band 1 carries
@@ -336,11 +361,10 @@ pub fn parse_report_status(output: &[u8]) -> Option<(bool, Vec<(String, bool)>)>
     // `unpack ok` check below and makes this return None — i.e. "no report",
     // which the caller treats as inconclusive and keeps every declared ref.
     // The per-ref gate would then be inert for exactly the pushes it exists to
-    // filter. A second pass removes the inner pkt-line framing; it is a no-op
+    // filter. The second pass above already removed the inner pkt-line
+    // framing where present (and required its flush); it is a no-op
     // on the single-framed shape, because plain report text does not begin
-    // with four hex digits. The inner stream is already the extracted payload,
-    // so clean EOF terminates it — only the outer envelope requires flush.
-    let stripped = strip_sideband(&stripped, false).unwrap_or(stripped);
+    // with four hex digits.
     let lines: Vec<&str> = stripped.lines().collect();
     if lines.is_empty() {
         return None;
@@ -376,10 +400,13 @@ pub fn parse_report_status(output: &[u8]) -> Option<(bool, Vec<(String, bool)>)>
 
 /// Strip git sideband framing from a pkt-line encoded output.
 /// Sideband-encoded lines start with a 4-hex-digit length, then a
-/// channel byte (0x01=stdout, 0x02=stderr), then payload. Returns
-/// the decoded payload lines concatenated, or `None` if the framing
-/// is malformed.
-fn strip_sideband(text: &str, require_flush: bool) -> Option<String> {
+/// channel byte (0x01=stdout, 0x02=stderr), then payload. Returns the
+/// decoded payload plus whether the stream saw its terminating flush
+/// packet, or `None` if the framing is malformed. With `require_flush`,
+/// a stream that never sees its flush is also `None` — the caller uses
+/// this for the level whose completion marker is authoritative (see
+/// [`parse_report_status`]).
+fn strip_sideband(text: &str, require_flush: bool) -> Option<(String, bool)> {
     let mut output = String::new();
     let mut pos = 0;
     let bytes = text.as_bytes();
@@ -418,11 +445,16 @@ fn strip_sideband(text: &str, require_flush: bool) -> Option<String> {
         }
     }
 
-    let _ = (require_flush, saw_flush);
+    if require_flush && !saw_flush {
+        // Truncated at a packet boundary: every packet parsed, but the
+        // stream never completed. Indistinguishable from a report git was
+        // killed mid-write, so no authority.
+        return None;
+    }
     if output.is_empty() {
         None
     } else {
-        Some(output)
+        Some((output, saw_flush))
     }
 }
 
@@ -1193,6 +1225,30 @@ mod tests {
         assert!(
             parse_report_status(truncated).is_none(),
             "mid-packet truncation must be indeterminate"
+        );
+    }
+
+    /// Truncation exactly at a packet boundary (every packet complete, but
+    /// the outer flush never arrived — e.g. git killed after the last `ok`
+    /// line) must also be indeterminate: the payload is complete but the
+    /// frame is not, and framing completeness is part of authority. The
+    /// mid-packet sibling above cannot catch this; only the flush gate can.
+    /// Removing the `require_flush` enforcement returns `Some` and turns
+    /// this red.
+    #[test]
+    fn truncated_at_packet_boundary_report_is_indeterminate_not_partial() {
+        let payload = "\x01unpack ok\nok refs/heads/x\n";
+        let single = format!("{:04x}{payload}0000", payload.len() + 4);
+        let no_flush = &single.as_bytes()[..single.len() - 4];
+        assert!(
+            parse_report_status(no_flush).is_none(),
+            "a report missing its outer flush must be indeterminate, \
+             even with every packet intact"
+        );
+        // Sanity: the untruncated fixture still parses (flush present).
+        assert!(
+            parse_report_status(single.as_bytes()).is_some(),
+            "the same bytes with the flush must parse"
         );
     }
 

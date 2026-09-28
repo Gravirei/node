@@ -891,6 +891,20 @@ impl std::error::Error for PruneFailed {}
 #[derive(Debug)]
 struct PruneInvalid(String);
 
+/// Preserve a deterministic prune refusal through the clone/fetch call
+/// sites: `prune_non_exempt_gitlawb_refs` already returns `PruneInvalid`
+/// for identity mismatches and malformed enumeration, and re-wrapping
+/// every error as `PruneFailed` would stringify that type away before
+/// `handle_sync_item_error` downcasts it — leaving a permanently invalid
+/// mirror deferred (fetch+prune every tick) instead of failed. Transient
+/// failures keep the `PruneFailed` deferral.
+fn wrap_prune_error(e: anyhow::Error) -> anyhow::Error {
+    match e.downcast::<PruneInvalid>() {
+        Ok(invalid) => anyhow::Error::new(invalid),
+        Err(other) => anyhow::anyhow!(PruneFailed(other.to_string())),
+    }
+}
+
 impl std::fmt::Display for PruneInvalid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "mirror prune refused: {}", self.0)
@@ -949,11 +963,11 @@ async fn clone_repo(remote_url: &str, local_path: &Path, mode: MirrorMode) -> an
     }
     // A fresh mirror imports everything the origin advertises, including any
     // planted non-exempt `refs/gitlawb/*` ref; prune before serving from it.
-    // A prune failure defers (stays pending) rather than failing the row —
-    // see `PruneFailed`.
+    // Prune outcome flows through `wrap_prune_error`: transient failures
+    // defer (stays pending), deterministic refusals fail terminally.
     prune_non_exempt_gitlawb_refs(local_path)
         .await
-        .map_err(|e| anyhow::anyhow!(PruneFailed(e.to_string())))?;
+        .map_err(wrap_prune_error)?;
     Ok(())
 }
 
@@ -1017,11 +1031,11 @@ async fn fetch_repo(local_path: &Path, remote_url: &str, mode: MirrorMode) -> an
         }
     };
     fetch_result?;
-    // Prune after every fetch (see above); a prune failure defers the row
-    // rather than failing it — see `PruneFailed`.
+    // Prune after every fetch (see above); outcome flows through
+    // `wrap_prune_error` like the clone path.
     prune_non_exempt_gitlawb_refs(local_path)
         .await
-        .map_err(|e| anyhow::anyhow!(PruneFailed(e.to_string())))
+        .map_err(wrap_prune_error)
 }
 
 #[cfg(test)]
@@ -2611,6 +2625,37 @@ mod tests {
     /// tick); deterministic prune refusals and any other sync error fail it
     /// terminally. Deleting the `downcast_ref::<PruneFailed>` arm restores
     /// terminal failure and turns the first assertion red.
+    /// Prune failures defer the queue row (stays `pending` for the next
+    /// tick); deterministic prune refusals and any other sync error fail it
+    /// terminally. Deleting the `downcast_ref::<PruneFailed>` arm restores
+    /// terminal failure and turns the first assertion red.
+    ///
+    /// The wrapper below is what the clone/fetch call sites run through:
+    /// a `PruneInvalid` from the helper must still downcast as
+    /// `PruneInvalid` afterwards (not stringified into `PruneFailed`),
+    /// and anything else must arrive as `PruneFailed`.
+    #[test]
+    fn wrap_prune_error_preserves_deterministic_type() {
+        let invalid = wrap_prune_error(anyhow::anyhow!(PruneInvalid("x".to_string())));
+        assert!(
+            invalid.downcast_ref::<PruneInvalid>().is_some(),
+            "deterministic refusal must survive the call-site wrap"
+        );
+        assert!(
+            invalid.downcast_ref::<PruneFailed>().is_none(),
+            "deterministic refusal must not also read as transient"
+        );
+        let transient = wrap_prune_error(anyhow::anyhow!("boom"));
+        assert!(
+            transient.downcast_ref::<PruneFailed>().is_some(),
+            "generic failure must arrive as transient"
+        );
+        assert!(
+            transient.downcast_ref::<PruneInvalid>().is_none(),
+            "generic failure must not read as deterministic"
+        );
+    }
+
     #[sqlx::test]
     async fn prune_failure_defers_row_other_failures_fail_it(pool: PgPool) {
         let state = crate::test_support::test_state(pool).await;

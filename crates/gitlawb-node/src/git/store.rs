@@ -326,6 +326,155 @@ pub async fn delete_marker_bounded(
     Ok(out.status.success())
 }
 
+/// Run one git child through the configured binary with a timeout, killing
+/// it on expiry. Shared by the bounded reconcile/marker readers below so a
+/// hung git child cannot pin startup (which awaits reconcile before
+/// serving) or a live push's admission permits, lease, and write lock.
+/// `kill_on_drop(true)` makes the timeout real for these plumbing commands
+/// (no helper processes to reparent, unlike receive-pack's pack-objects).
+async fn run_git_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    args: &[&str],
+    stdin_bytes: &[u8],
+    timeout: std::time::Duration,
+    label: &str,
+) -> Result<std::process::Output> {
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command as AsyncCommand;
+    let fut = async {
+        let mut cmd = AsyncCommand::new(git_bin);
+        cmd.kill_on_drop(true);
+        cmd.args(args).current_dir(repo_path);
+        // `wait_with_output` below does NOT capture stdio by itself (unlike
+        // `output()`, which pipes everything): without explicit pipes the
+        // child inherits our streams and the returned stdout/stderr are
+        // always empty even on success — a silent empty-reading bug.
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        if !stdin_bytes.is_empty() {
+            cmd.stdin(std::process::Stdio::piped());
+        } else {
+            cmd.stdin(std::process::Stdio::null());
+        }
+        let mut child = cmd.spawn().context(format!("{label} spawn failed"))?;
+        if !stdin_bytes.is_empty() {
+            child
+                .stdin
+                .as_mut()
+                .context(format!("{label} stdin pipe"))?
+                .write_all(stdin_bytes)
+                .await
+                .context(format!("{label} stdin write"))?;
+        }
+        child
+            .wait_with_output()
+            .await
+            .context(format!("{label} wait"))
+    };
+    tokio::time::timeout(timeout, fut)
+        .await
+        .map_err(|_| anyhow::anyhow!("{label} timed out"))?
+}
+
+/// Bounded [`list_refs`]: same listing through the configured git binary
+/// with a timeout. Used by startup reconcile, which awaits recovery before
+/// serving — an unbounded `for-each-ref` would hold startup forever past
+/// the logged nonfatal error arm.
+pub async fn list_refs_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    timeout: std::time::Duration,
+) -> Result<Vec<(String, String)>> {
+    let output = run_git_bounded(
+        git_bin,
+        repo_path,
+        &["for-each-ref", "--format=%(refname) %(objectname)"],
+        b"",
+        timeout,
+        "git for-each-ref",
+    )
+    .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git for-each-ref failed: {stderr}");
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(2, ' ');
+            let refname = parts.next()?.to_string();
+            let hash = parts.next()?.to_string();
+            Some((refname, hash))
+        })
+        .collect())
+}
+
+/// Bounded [`read_ref`]: same absent-vs-error contract (any non-zero exit
+/// reads as absent for the reconcile gate's quarantine signal), through the
+/// configured binary with a timeout.
+pub async fn read_ref_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    ref_name: &str,
+    timeout: std::time::Duration,
+) -> Result<Option<String>> {
+    let output = run_git_bounded(
+        git_bin,
+        repo_path,
+        &["show-ref", "--verify", "--hash", ref_name],
+        b"",
+        timeout,
+        "git show-ref",
+    )
+    .await?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let sha = String::from_utf8(output.stdout)
+        .context("git show-ref output is not utf-8")?
+        .trim()
+        .to_string();
+    if sha.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(sha))
+}
+
+/// Bounded [`marker_value_for`]: same blob-minting computation through the
+/// configured binary with a timeout. Used on the live path (bounded like
+/// the adjacent prereq check and marker write) and by startup reconcile.
+pub async fn marker_value_for_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    request_bytes_hash: &[u8],
+    timeout: std::time::Duration,
+) -> Result<String> {
+    let mut content = Vec::with_capacity(20);
+    let n = 20.min(request_bytes_hash.len());
+    content.extend_from_slice(&request_bytes_hash[..n]);
+    let output = run_git_bounded(
+        git_bin,
+        repo_path,
+        &["hash-object", "-w", "--stdin"],
+        &content,
+        timeout,
+        "git hash-object",
+    )
+    .await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git hash-object failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8(output.stdout)
+        .context("git hash-object output not utf-8")?
+        .trim()
+        .to_string())
+}
+
 /// One parsed reflog entry: the `<old> <new>` pair a single ref update recorded,
 /// plus the unix timestamp git stamped it with.
 ///
@@ -500,6 +649,10 @@ pub fn list_refs(repo_path: &Path) -> Result<Vec<(String, String)>> {
 /// the live handler (or a test) wrote via `update-ref`, which is
 /// a 40-char SHA-1 hex string. The reconcile compares two hex
 /// strings.
+///
+/// Production callers use [`read_ref_bounded`]; this unbounded form is kept
+/// for test harnesses that stage markers without a timeout budget.
+#[allow(dead_code)]
 pub fn read_ref(repo_path: &Path, ref_name: &str) -> Result<Option<String>> {
     let output = Command::new("git")
         .args(["show-ref", "--verify", "--hash", ref_name])
@@ -537,6 +690,11 @@ pub fn read_ref(repo_path: &Path, ref_name: &str) -> Result<Option<String>> {
 /// `repo_path` is the bare repo the marker ref lives in. The
 /// blob is stored in the repo's object database so a later
 /// `git show-ref --verify --hash` resolves cleanly.
+///
+/// Production callers use [`marker_value_for_bounded`]; this unbounded
+/// form is kept for test harnesses that stage markers without a timeout
+/// budget.
+#[allow(dead_code)]
 pub fn marker_value_for(repo_path: &Path, request_bytes_hash: &[u8]) -> Result<String> {
     let mut content = Vec::with_capacity(20);
     let n = 20.min(request_bytes_hash.len());
@@ -2758,6 +2916,65 @@ mod tests {
         assert!(
             matches!(res, Ok(None)),
             "a clean `missing` twice on a readable store is a genuine absence; got {res:?}"
+        );
+    }
+
+    /// Hung-child teardown for the bounded reconcile/marker readers: a fake
+    /// git that sleeps past the timeout must make each call return a timeout
+    /// error promptly (not hang for the child's lifetime), so neither
+    /// pre-serve startup (which awaits reconcile) nor a live push holding
+    /// admission permits, lease, and write lock can be pinned. Removing the
+    /// timeout (or `kill_on_drop`) hangs each assertion past its ceiling.
+    #[cfg(unix)]
+    fn write_hanging_fake_git(dir: &std::path::Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join("hanggit");
+        // `sleep 30` bounds the worst case if the teardown ever breaks, so a
+        // regression cannot wedge the suite.
+        std::fs::write(&p, "#!/bin/sh\nsleep 30\n").unwrap();
+        let mut perm = std::fs::metadata(&p).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&p, perm).unwrap();
+        p.to_str().unwrap().to_string()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_reconcile_readers_time_out_on_hung_git() {
+        let td = tempfile::TempDir::new().unwrap();
+        let bare = td.path().join("bare.git");
+        std::fs::create_dir_all(&bare).unwrap();
+        let fake = write_hanging_fake_git(td.path());
+        let budget = std::time::Duration::from_millis(500);
+        let ceiling = std::time::Duration::from_secs(10);
+
+        let started = std::time::Instant::now();
+        let err = super::list_refs_bounded(&fake, &bare, budget)
+            .await
+            .expect_err("hung for-each-ref must time out");
+        assert!(
+            err.to_string().contains("timed out"),
+            "list_refs_bounded must report a timeout, got: {err:#}"
+        );
+
+        let err = super::read_ref_bounded(&fake, &bare, "refs/heads/main", budget)
+            .await
+            .expect_err("hung show-ref must time out");
+        assert!(
+            err.to_string().contains("timed out"),
+            "read_ref_bounded must report a timeout, got: {err:#}"
+        );
+
+        let err = super::marker_value_for_bounded(&fake, &bare, &[7u8; 32], budget)
+            .await
+            .expect_err("hung hash-object must time out");
+        assert!(
+            err.to_string().contains("timed out"),
+            "marker_value_for_bounded must report a timeout, got: {err:#}"
+        );
+        assert!(
+            started.elapsed() < ceiling,
+            "three bounded reads must fail fast, not hang on stuck children"
         );
     }
 }
