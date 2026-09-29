@@ -1240,7 +1240,7 @@ async fn run_effect_bundle(
     let commit_hash = accepted_ref
         .map(|c| c.new_sha.clone())
         .unwrap_or_else(|| chrono::Utc::now().timestamp().to_string());
-    if let Err(e) = state
+    let push_event_created = match state
         .db
         .record_push_with_id(
             &push_event_id,
@@ -1251,26 +1251,41 @@ async fn run_effect_bundle(
         )
         .await
     {
-        tracing::warn!(
-            err = %e,
-            request_id = %request_id,
-            "apply_request_effects: push event insert failed; request left for drain retry"
-        );
-        return Ok(EffectsOutcome::Retry {
-            last_error: format!("push event: {e}"),
-        });
-    }
+        Ok(created) => created,
+        Err(e) => {
+            tracing::warn!(
+                err = %e,
+                request_id = %request_id,
+                "apply_request_effects: push event insert failed; request left for drain retry"
+            );
+            return Ok(EffectsOutcome::Retry {
+                last_error: format!("push event: {e}"),
+            });
+        }
+    };
 
-    // 7. Trust score bump — best-effort, like the inline handler. A
-    //    failure here does NOT retry the request; the bump is
-    //    informational and the next push will catch up.
-    if let Ok(push_count) = state.db.get_push_count(&req.pusher_did).await {
-        // 0.05 base (from registration) + 0.05 per push, capped at 1.0
-        let new_score = (push_count as f64 * 0.05 + 0.05).min(1.0);
-        let _ = state
-            .db
-            .update_trust_score(&req.pusher_did, new_score)
-            .await;
+    // 7. Trust score bump — best-effort (a failure here does NOT retry
+    //    the request), and ONLY when this pass actually created the push
+    //    event row. A drain retry after a cert/anchor failure re-enters
+    //    with the row already present (`record_push_with_id` → false);
+    //    bumping then would rewrite `agents.trust_score` with no new
+    //    push event, clobbering scores written by other owners
+    //    (registration, issues, bounties, PR merges). A crash between
+    //    insert and bump loses only this informational write — the next
+    //    push recomputes it.
+    //
+    //    MUTATION (RED): drop the `push_event_created` gate and
+    //    `trust_bump_gated_on_new_push_event_row` fails: the retry pass
+    //    overwrites 0.9 with the push-count-derived 0.10.
+    if push_event_created {
+        if let Ok(push_count) = state.db.get_push_count(&req.pusher_did).await {
+            // 0.05 base (from registration) + 0.05 per push, capped at 1.0
+            let new_score = (push_count as f64 * 0.05 + 0.05).min(1.0);
+            let _ = state
+                .db
+                .update_trust_score(&req.pusher_did, new_score)
+                .await;
+        }
     }
 
     // 8. Per-ref certs and anchor jobs. Each accepted child gets one
@@ -4526,6 +4541,123 @@ mod drain_tests {
             .await
             .unwrap();
         assert_eq!(certs.len(), 3, "one cert per ref transition");
+    }
+
+    // ----- P2 (review round 3): trust bump rides on a NEW push event -----
+    //
+    // `record_push_with_id` no-ops on `ON CONFLICT (id) DO NOTHING`, so a
+    // drain retry after a cert/anchor failure re-enters `run_effect_bundle`
+    // with the request's push event already recorded. The retry must not
+    // recompute `agents.trust_score` from a push count that did not change:
+    // other writers (registration, issues, bounties, PRs) own their own
+    // scores, and a recomputed clobber loses them without a new push.
+    //
+    // MUTATION (RED): drop the `push_event_created` gate around the bump
+    // and pass 2 overwrites 0.9 with 0.05 × 1 + 0.05 = 0.10.
+    #[sqlx::test]
+    async fn trust_bump_gated_on_new_push_event_row(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        // The bump only UPDATEs an existing agent row (never inserts), so
+        // seed the pusher behind the same registration gate production uses.
+        state
+            .db
+            .register_agent("did:key:z6pusher", &[])
+            .await
+            .unwrap();
+
+        let request_id = "req-trust-gate";
+        let repo_id = "repo-trust-gate";
+        let mut row = make_row(repo_id, "refs/heads/main", &"0".repeat(40), &"a".repeat(40));
+        row.request_id = request_id.to_string();
+        row.id = crate::db::deterministic_id(&[
+            "pending_ref_transition",
+            request_id,
+            repo_id,
+            "refs/heads/main",
+            &"0".repeat(40),
+            &"a".repeat(40),
+        ]);
+        stage_request_with_children(
+            &state.db,
+            request_id,
+            repo_id,
+            Some(0),
+            &[row],
+            parsed_report_ok(&[("refs/heads/main", true)]),
+        )
+        .await;
+
+        let req = state
+            .db
+            .get_receive_pack_request(request_id)
+            .await
+            .unwrap()
+            .expect("request row exists");
+        let children = state
+            .db
+            .list_pending_ref_transitions_for_request(request_id)
+            .await
+            .unwrap();
+        let accepted: Vec<&PendingRefTransition> = children.iter().collect();
+        let ok_ref_names: std::collections::HashSet<String> =
+            ["refs/heads/main".to_string()].into_iter().collect();
+
+        // Pass 1 records the push event (count 0 → 1) and lands the
+        // informational bump: 0.05 registration base + 0.05 × 1 push.
+        run_effect_bundle(
+            &state,
+            &req,
+            request_id,
+            &children,
+            &accepted,
+            &ok_ref_names,
+            0,
+        )
+        .await
+        .expect("first bundle");
+        assert_eq!(
+            state.db.get_push_count("did:key:z6pusher").await.unwrap(),
+            1,
+            "pass 1 recorded the push event"
+        );
+        let score = state.db.get_trust_score("did:key:z6pusher").await.unwrap();
+        assert!(
+            (score - 0.1).abs() < 1e-9,
+            "pass 1 bumped trust to the push-derived score, got {score}"
+        );
+
+        // Another writer raises the score the way issues, bounties, and
+        // PR merges do.
+        state
+            .db
+            .update_trust_score("did:key:z6pusher", 0.9)
+            .await
+            .unwrap();
+
+        // Pass 2 is the drain retry after a cert/anchor failure: the push
+        // event row already exists, so `record_push_with_id` no-ops.
+        // Nothing new was recorded — trust must not move.
+        run_effect_bundle(
+            &state,
+            &req,
+            request_id,
+            &children,
+            &accepted,
+            &ok_ref_names,
+            0,
+        )
+        .await
+        .expect("second bundle");
+        assert_eq!(
+            state.db.get_push_count("did:key:z6pusher").await.unwrap(),
+            1,
+            "pass 2 records no new push event"
+        );
+        assert_eq!(
+            state.db.get_trust_score("did:key:z6pusher").await.unwrap(),
+            0.9,
+            "a pass that recorded no push event must not rewrite trust"
+        );
     }
 
     // ----- P2-D (reviewer-2 round 2): all-fail batch does not early-exit -----
