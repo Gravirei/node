@@ -223,6 +223,11 @@ mod authz_guard {
             (events, "list_repo_events", "authorize_repo_read("),
             // Bucket C — signer-self: the acting DID is matched/bound to auth.0
             (tasks, "create_task", "did_matches("),
+            // #496: create_task is signer-self AND owner-when-repo-scoped — a
+            // repo_id naming a hosted repo admits tasks only from its owner.
+            // Both halves are pinned: the did_matches row guards the signer
+            // binding, this one the repo-ownership gate.
+            (tasks, "create_task", "require_repo_owner("),
             (tasks, "claim_task", "did_matches("),
             (tasks, "complete_task", "did_matches("),
             (tasks, "fail_task", "did_matches("),

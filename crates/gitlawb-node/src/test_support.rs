@@ -590,6 +590,112 @@ mod tests {
         );
     }
 
+    /// #496: create_task must not bind a caller-supplied repo_id verbatim. A
+    /// signed caller naming a hosted repo it does not own is rejected (403,
+    /// leaking nothing about the repo); the owner files (201); repo-less and
+    /// unknown-id tasks stay allowed (unknown ids are oracle-free opaque
+    /// labels, unscoped under the #268/#464 read contract); and a quarantined
+    /// repo id is treated as unknown (no 403 oracle on quarantined existence).
+    #[sqlx::test]
+    async fn create_task_rejects_foreign_repo_id(pool: PgPool) {
+        let owner = "did:key:zTASKREPOOWNERAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let stranger = "did:key:zTASKREPOSTRANGERBBBBBBBBBBBBBBBBBBBBBB";
+        let state = test_state(pool).await;
+        let repo = seed_repo(owner, "task-gate-repo");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/tasks",
+                    axum::routing::post(crate::api::tasks::create_task),
+                )
+                .with_state(state.clone())
+        };
+        let post_as = |signer: &str, body: String| {
+            router().oneshot(signed_request_as(
+                signer,
+                Method::POST,
+                "/api/v1/tasks",
+                Body::from(body),
+            ))
+        };
+        let body_with = |signer: &str, repo_id: Option<&str>| {
+            let repo_field = repo_id
+                .map(|id| format!(r#","repo_id":"{id}""#))
+                .unwrap_or_default();
+            format!(
+                r#"{{"kind":"build","capability":"repo:write","delegator_did":"{signer}"{repo_field}}}"#
+            )
+        };
+
+        // Stranger filing under the victim's repo id → exact 403.
+        let resp = post_as(stranger, body_with(stranger, Some(&repo.id)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a non-owner must not file tasks against a foreign repo id"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains(r#""error":"forbidden""#),
+            "denial must keep the forbidden envelope: {text}"
+        );
+        assert!(
+            !text.contains(&repo.id) && !text.contains(owner),
+            "denial must leak nothing about the repo: {text}"
+        );
+
+        // Owner filing under their own repo id → 201.
+        let resp = post_as(owner, body_with(owner, Some(&repo.id)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "the owner must be able to file tasks against their repo"
+        );
+
+        // Repo-less task → 201 (unaffected).
+        let resp = post_as(stranger, body_with(stranger, None)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "repo-less task creation must keep working"
+        );
+
+        // Unknown repo id → 201 as an opaque label.
+        let resp = post_as(stranger, body_with(stranger, Some("no-such-repo-id")))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "an id naming no hosted repo stays an opaque label"
+        );
+
+        // Quarantined repo id → treated as unknown (201), never a 403 that
+        // would confirm the id names a real repo.
+        state
+            .db
+            .set_repo_quarantine(&repo.id, true)
+            .await
+            .expect("quarantine");
+        let resp = post_as(stranger, body_with(stranger, Some(&repo.id)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "a quarantined repo id must not 403 (existence oracle)"
+        );
+    }
+
     /// N3: get_tree gates on the REQUESTED subtree, not the repo root. A caller
     /// denied a withheld subtree is rejected there (404) but passes the gate on a
     /// non-withheld path (so the rejection is path-scoped, not repo-wide).

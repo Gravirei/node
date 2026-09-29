@@ -36,6 +36,27 @@ impl MutationRoot {
         }
         let delegator_did = caller.to_string();
         let db = ctx.data_unchecked::<Arc<Db>>();
+        // #496: same repo-ownership gate as the REST handler — a repo_id
+        // naming a hosted, non-quarantined repo admits tasks only from its
+        // owner, so a stranger cannot file under a foreign repo id. Unknown
+        // or quarantined ids stay oracle-free opaque labels (unscoped under
+        // the #268/#464 read contract); repo-less tasks unaffected.
+        if let Some(repo_id) = input.repo_id.as_deref() {
+            let record = db
+                .get_repo_by_id(repo_id)
+                .await
+                .map_err(crate::graphql::graphql_db_err)?;
+            if let Some(record) = record {
+                let quarantined = db
+                    .is_repo_quarantined(&record.id)
+                    .await
+                    .map_err(crate::graphql::graphql_db_err)?;
+                if !quarantined {
+                    crate::api::require_repo_owner(&record, caller)
+                        .map_err(crate::graphql::graphql_app_err)?;
+                }
+            }
+        }
         let now = Utc::now().to_rfc3339();
         let task = AgentTask {
             id: Uuid::new_v4().to_string(),
@@ -329,6 +350,65 @@ mod tests {
         assert!(
             errors(&resp).is_empty(),
             "the assignee should complete the task: {}",
+            errors(&resp)
+        );
+    }
+
+    /// #496 (GraphQL): createTask applies the same repo-ownership gate as the
+    /// REST handler — a stranger naming a hosted repo is rejected, while the
+    /// owner files.
+    #[sqlx::test]
+    async fn create_task_rejects_foreign_repo_id(pool: PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let owner = "did:key:zGQLTASKOWNERAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let stranger = "did:key:zGQLTASKSTRANGERBBBBBBBBBBBBBBBBBBBBBB";
+        let now = chrono::Utc::now();
+        let repo = crate::db::RepoRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "gql-task-gate-repo".to_string(),
+            owner_did: owner.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: now,
+            updated_at: now,
+            disk_path: "/tmp/gql-task-gate-repo".to_string(),
+            forked_from: None,
+            machine_id: None,
+        };
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let schema = state.graphql_schema.as_ref();
+
+        let q = |actor: &str| {
+            format!(
+                r#"mutation {{ createTask(delegatorDid: "{actor}", input: {{ kind: "build", capability: "repo:write", repoId: "{}" }}) {{ id }} }}"#,
+                repo.id
+            )
+        };
+
+        // Stranger signs as themselves (so the signer binding passes) but
+        // names the victim's repo → rejected by the ownership gate, leaking
+        // nothing about the repo.
+        let resp = schema
+            .execute(Request::new(q(stranger)).data(AuthenticatedDid(stranger.into())))
+            .await;
+        let errs = errors(&resp);
+        assert!(
+            errs.contains("repo owner"),
+            "a non-owner must not file under a foreign repo id: {errs}"
+        );
+        assert!(
+            !errs.contains(&repo.id) && !errs.contains(owner),
+            "denial must leak nothing about the repo: {errs}"
+        );
+
+        // The owner files under their own repo id.
+        let resp = schema
+            .execute(Request::new(q(owner)).data(AuthenticatedDid(owner.into())))
+            .await;
+        assert!(
+            errors(&resp).is_empty(),
+            "the owner should file against their repo: {}",
             errors(&resp)
         );
     }

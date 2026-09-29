@@ -101,6 +101,40 @@ pub async fn create_task(
     if !crate::api::did_matches(&auth.0, &body.delegator_did) {
         return Err(forbidden("delegator_did must be the authenticated signer"));
     }
+    // #496: a caller-supplied repo_id must name a repo the caller owns. Without
+    // this, any signed caller can plant a task — payload and UCAN included —
+    // under a foreign repo id, where repo-gated task reads surface it exactly
+    // to that repo's readers and the named assignee can claim it. Resolve the
+    // id against hosted repos: a hosted, non-quarantined repo admits tasks
+    // only from its owner. An id naming no hosted repo (unknown, or
+    // quarantined — which is hidden as if it did not exist, so 403ing it
+    // would confirm a real id) is kept as an opaque label with no existence
+    // oracle either way; such ids resolve to no hosted repo, so repo-scoped
+    // task read gates treat them as unscoped (delegator/assignee-only under
+    // the #268/#464 visibility contract). Repo-less tasks are unaffected.
+    if let Some(repo_id) = body.repo_id.as_deref() {
+        let record = state.db.get_repo_by_id(repo_id).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            )
+        })?;
+        if let Some(record) = record {
+            let quarantined = state
+                .db
+                .is_repo_quarantined(&record.id)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": e.to_string() })),
+                    )
+                })?;
+            if !quarantined && crate::api::require_repo_owner(&record, &auth.0).is_err() {
+                return Err(forbidden("only the repo owner can file tasks against it"));
+            }
+        }
+    }
     let now = Utc::now().to_rfc3339();
     let task = AgentTask {
         id: Uuid::new_v4().to_string(),
