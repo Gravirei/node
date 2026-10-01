@@ -2086,6 +2086,29 @@ pub async fn git_receive_pack(
         "parsed ref updates from pack"
     );
 
+    // ── Ref-count cap (request shape, before ANY per-ref work) ───────────
+    // Checked right after the parse and before the owner-push and
+    // branch-protection gates: those gates are themselves per-ref work (one
+    // `is_branch_protected` SELECT each), and past them the intent insert
+    // writes one durable child row per ref. Refusing here bounds all of it to
+    // one comparison, leaves no rows behind, and holds no lease or permit —
+    // the intent-before-lease ordering below is unchanged. It precedes the
+    // owner gate on purpose: this bounds the REQUEST, not who may send it, so
+    // an oversized push from anyone is one cheap answer rather than a pile of
+    // per-ref lookups first.
+    if ref_updates.len() > MAX_REF_UPDATES {
+        tracing::warn!(
+            repo = %name,
+            pusher = %auth.0,
+            ref_count = ref_updates.len(),
+            "refusing push: ref-update count exceeds MAX_REF_UPDATES"
+        );
+        return Err(AppError::BadRequest(format!(
+            "too many ref updates in one push: {} > {MAX_REF_UPDATES}",
+            ref_updates.len()
+        )));
+    }
+
     // ── Owner-only push enforcement (on by default; GITLAWB_ENFORCE_OWNER_PUSH) ──
     // Runs before branch protection on purpose: when enabled, a non-owner is
     // rejected here regardless of whether the target branch is protected, so a
@@ -4204,6 +4227,21 @@ impl Drop for IntentDropGuard {
 fn ref_is_internal_namespace(ref_name: &str) -> bool {
     ref_name == "refs/gitlawb" || ref_name.starts_with("refs/gitlawb/")
 }
+
+/// Maximum ref commands accepted in one receive-pack body.
+///
+/// `parse_ref_updates` is unbounded, and every entry costs a per-ref
+/// branch-protection SELECT plus a durable child row that rides the aggregate
+/// into reconcile/quarantine scans until retention. One body (`max_pack_bytes`
+/// allows gigabytes) could otherwise turn a single request into tens of
+/// thousands of pre-lease DB operations and an unbounded durable row set for
+/// one signer. Sized well above a legitimate mirror push (branches + tags of
+/// any realistic repo) while keeping the worst-case pre-intent work at ~8k
+/// indexed SELECTs and ~8k child rows — comfortably inside the 30s
+/// intent-write guard. A repo needing to move more than this in one push
+/// pushes in batches. Pinned by
+/// `receive_pack_refuses_a_ref_update_count_over_the_cap`.
+const MAX_REF_UPDATES: usize = 8192;
 
 /// `Clone` so `git_receive_pack` can hand the parsed updates to the detached
 /// replication tail at the durability boundary while the certificate and webhook
@@ -8479,6 +8517,88 @@ mod tests {
     fn ref_update_body(new_sha: &str) -> axum::body::Bytes {
         let line = format!("{ZERO_SHA} {new_sha} refs/heads/main");
         axum::body::Bytes::from(format!("{:04x}{}0000", line.len() + 4, line))
+    }
+
+    /// Build a receive-pack body carrying `count` distinct ref-update commands,
+    /// framed like [`ref_update_body`] (one pkt-line each, then the flush).
+    fn ref_update_body_many(count: usize) -> axum::body::Bytes {
+        let mut s = String::new();
+        for i in 0..count {
+            let line = format!("{ZERO_SHA} {:040x} refs/heads/branch-{i}", i + 1);
+            s.push_str(&format!("{:04x}{}", line.len() + 4, line));
+        }
+        s.push_str("0000");
+        axum::body::Bytes::from(s)
+    }
+
+    // The ref-count cap refuses BEFORE the owner-push and branch-protection
+    // gates and BEFORE the durable intent insert: one oversized body cannot
+    // become thousands of per-ref `is_branch_protected` SELECTs or a durable
+    // row set that rides reconcile/quarantine scans until retention. The
+    // signer here is NOT the owner, so if the cap were removed — or moved
+    // below the owner gate — the answer would become Forbidden instead:
+    // pinning both the refusal and its placement. Goes RED without
+    // `MAX_REF_UPDATES`.
+    #[sqlx::test]
+    async fn receive_pack_refuses_a_ref_update_count_over_the_cap(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+
+        let owner = "z6refcapowner";
+        let name = "rc1";
+        let state =
+            crate::test_support::test_state_with(pool.clone(), |cfg| cfg.enforce_owner_push = true)
+                .await;
+        state
+            .db
+            .upsert_mirror_repo(owner, name, "/tmp/z6refcapowner-rc1", None, false)
+            .await
+            .unwrap();
+        let repo_id = state
+            .db
+            .get_repo(owner, name)
+            .await
+            .unwrap()
+            .expect("mirror row exists")
+            .id;
+
+        let pusher = "did:key:z6refcapother";
+        let peer: SocketAddr = "203.0.113.92:5000".parse().unwrap();
+        let result = git_receive_pack(
+            State(state.clone()),
+            Path((owner.to_string(), name.to_string())),
+            Extension(crate::auth::AuthenticatedDid(pusher.to_string())),
+            crate::rate_limit::PeerAddr(Some(peer)),
+            axum::http::HeaderMap::new(),
+            ref_update_body_many(MAX_REF_UPDATES + 1),
+        )
+        .await;
+        match result {
+            Err(AppError::BadRequest(msg)) => assert!(
+                msg.contains("too many ref updates"),
+                "the refusal names the cap; got: {msg}"
+            ),
+            Err(other) => panic!("over-cap push must refuse with BadRequest/400; got {other:?}"),
+            Ok(_) => panic!("over-cap push must refuse, not serve"),
+        }
+
+        // No rows at all: the refusal precedes the durable intent insert, so
+        // nothing rides retention, reconcile, or quarantine scans.
+        let (req_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM receive_pack_requests WHERE repo_id = $1")
+                .bind(&repo_id)
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(req_count, 0, "no intent aggregate for a refused push");
+        let (child_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM pending_ref_transitions WHERE repo_id = $1")
+                .bind(&repo_id)
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(child_count, 0, "no child rows for a refused push");
     }
 
     /// Absent report-status with exit zero is indeterminate, not proof.
