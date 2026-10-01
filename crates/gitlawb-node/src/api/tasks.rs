@@ -30,6 +30,20 @@ fn forbidden(msg: &str) -> (StatusCode, Json<Value>) {
     )
 }
 
+/// 500 in this module's error shape with an opaque body: the real error is
+/// logged server-side and never serialized (#250), matching the `db_error`
+/// envelope `AppError::Db` renders.
+fn db_error(e: anyhow::Error) -> (StatusCode, Json<Value>) {
+    tracing::error!(error = %format!("{e:#}"), "task repo gate database error");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "error": "db_error",
+            "message": crate::error::DB_ERROR_MESSAGE,
+        })),
+    )
+}
+
 // ── Request / response types ──────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -106,30 +120,24 @@ pub async fn create_task(
     // under a foreign repo id, where repo-gated task reads surface it exactly
     // to that repo's readers and the named assignee can claim it. Resolve the
     // id against hosted repos: a hosted, non-quarantined repo admits tasks
-    // only from its owner. An id naming no hosted repo (unknown, or
-    // quarantined — which is hidden as if it did not exist, so 403ing it
-    // would confirm a real id) is kept as an opaque label with no existence
-    // oracle either way; such ids resolve to no hosted repo, so repo-scoped
-    // task read gates treat them as unscoped (delegator/assignee-only under
-    // the #268/#464 visibility contract). Repo-less tasks are unaffected.
+    // only from its owner (403 otherwise). An id naming no hosted repo
+    // (unknown, or quarantined — which is hidden as if it did not exist, so
+    // 403ing it would confirm a real id) is kept as an opaque label; such ids
+    // resolve to no hosted repo, so repo-scoped task read gates treat them as
+    // unscoped (delegator/assignee-only under the #268/#464 visibility
+    // contract). The 403-vs-201 split between a hosted repo id and an unknown
+    // one is itself a one-bit oracle — a stranger holding a private repo's id
+    // learns it is hosted here — but denying foreign repos requires drawing
+    // exactly that line, and repo ids already surface via the task list on
+    // this base. Repo-less tasks are unaffected.
     if let Some(repo_id) = body.repo_id.as_deref() {
-        let record = state.db.get_repo_by_id(repo_id).await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": e.to_string() })),
-            )
-        })?;
+        let record = state.db.get_repo_by_id(repo_id).await.map_err(db_error)?;
         if let Some(record) = record {
             let quarantined = state
                 .db
                 .is_repo_quarantined(&record.id)
                 .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({ "error": e.to_string() })),
-                    )
-                })?;
+                .map_err(db_error)?;
             if !quarantined && crate::api::require_repo_owner(&record, &auth.0).is_err() {
                 return Err(forbidden("only the repo owner can file tasks against it"));
             }

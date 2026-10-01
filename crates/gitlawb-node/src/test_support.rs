@@ -651,6 +651,20 @@ mod tests {
             "denial must leak nothing about the repo: {text}"
         );
 
+        // The denial must not persist: no task row may carry the victim's
+        // repo id afterwards — a 403 that still writes is the injection.
+        let stored = state
+            .db
+            .list_tasks(None, None, 50)
+            .await
+            .expect("list tasks");
+        assert!(
+            stored
+                .iter()
+                .all(|t| t.repo_id.as_deref() != Some(repo.id.as_str())),
+            "a denied write must not leave a task under the foreign repo id"
+        );
+
         // Owner filing under their own repo id → 201.
         let resp = post_as(owner, body_with(owner, Some(&repo.id)))
             .await

@@ -355,8 +355,10 @@ mod tests {
     }
 
     /// #496 (GraphQL): createTask applies the same repo-ownership gate as the
-    /// REST handler — a stranger naming a hosted repo is rejected, while the
-    /// owner files.
+    /// REST handler — a stranger naming a hosted repo is rejected without
+    /// persisting anything, while the owner files. The quarantined and
+    /// unknown-id arms are pinned here too, so this copy of the gate cannot
+    /// regress silently.
     #[sqlx::test]
     async fn create_task_rejects_foreign_repo_id(pool: PgPool) {
         let state = crate::test_support::test_state(pool).await;
@@ -402,6 +404,20 @@ mod tests {
             "denial must leak nothing about the repo: {errs}"
         );
 
+        // The denial must not persist: no task row may carry the victim's
+        // repo id afterwards.
+        let stored = state
+            .db
+            .list_tasks(None, None, 50)
+            .await
+            .expect("list tasks");
+        assert!(
+            stored
+                .iter()
+                .all(|t| t.repo_id.as_deref() != Some(repo.id.as_str())),
+            "a denied write must not leave a task under the foreign repo id"
+        );
+
         // The owner files under their own repo id.
         let resp = schema
             .execute(Request::new(q(owner)).data(AuthenticatedDid(owner.into())))
@@ -409,6 +425,36 @@ mod tests {
         assert!(
             errors(&resp).is_empty(),
             "the owner should file against their repo: {}",
+            errors(&resp)
+        );
+
+        // Unknown repo ids stay accepted as opaque labels.
+        let q_unknown = format!(
+            r#"mutation {{ createTask(delegatorDid: "{stranger}", input: {{ kind: "build", capability: "repo:write", repoId: "no-such-repo-id" }}) {{ id }} }}"#
+        );
+        let resp = schema
+            .execute(Request::new(q_unknown).data(AuthenticatedDid(stranger.into())))
+            .await;
+        assert!(
+            errors(&resp).is_empty(),
+            "an id naming no hosted repo stays an opaque label: {}",
+            errors(&resp)
+        );
+
+        // A quarantined repo id is treated as unknown (accepted, never a 403
+        // that would confirm the id names a real repo). This pins the
+        // `!quarantined` arm on this copy of the gate.
+        state
+            .db
+            .set_repo_quarantine(&repo.id, true)
+            .await
+            .expect("quarantine");
+        let resp = schema
+            .execute(Request::new(q(stranger)).data(AuthenticatedDid(stranger.into())))
+            .await;
+        assert!(
+            errors(&resp).is_empty(),
+            "a quarantined repo id must not 403 (existence oracle): {}",
             errors(&resp)
         );
     }
