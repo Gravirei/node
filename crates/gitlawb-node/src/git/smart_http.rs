@@ -799,7 +799,7 @@ async fn drive_git_child_raw(
     mut command: Command,
     input: Bytes,
     timeout: Duration,
-    _what: &str,
+    what: &str,
     admission: Option<AdmissionGuard>,
 ) -> Result<(
     Vec<u8>,
@@ -879,7 +879,27 @@ async fn drive_git_child_raw(
         }
     };
 
-    write_result.context("failed to write to git stdin")?;
+    // Prefer the child's collected answer over a stdin-write error: an early
+    // rejection (unpack failure, command-level deny) makes git print a complete
+    // report-status and exit WITHOUT draining stdin, so a body larger than the
+    // pipe buffer EPIPEs the write while the answer is already on stdout. The
+    // child is reaped (the join above waited on it), so `out`/`err`/`status`
+    // are complete and authoritative — returning Err here would discard them:
+    // `receive_pack_raw_with_reflog` would propagate the write error, the
+    // handler would mark every prepared row `uncertain` instead of `cancelled`,
+    // and the client would get an HTTP error instead of git's report. The
+    // non-raw `drive_git_child` orders the same way (exit status and git's own
+    // failure first, stdin-write error last — pinned by
+    // `run_git_service_surfaces_git_stderr_over_a_stdin_epipe`), but it must
+    // fail on non-zero because its callers do not parse output from a failed
+    // child; the raw driver exists precisely to parse that output.
+    if let Err(e) = &write_result {
+        tracing::warn!(
+            err = %e,
+            what = %what,
+            "git stdin write failed after child exit; surfacing collected output"
+        );
+    }
 
     Ok((out, err, status, admission))
 }
@@ -3005,6 +3025,61 @@ mod tests {
             "run_git_service must surface git's stderr (a classifiable 400), not the \
              stdin-write EPIPE (a generic 500); got: {msg}"
         );
+    }
+
+    // The raw driver's counterpart: a rejection-shaped early exit where git
+    // prints a COMPLETE report-status and exits without draining stdin, so a
+    // body larger than the pipe buffer (~64 KiB) EPIPEs the write while the
+    // answer is already on stdout. `receive_pack_raw` must surface that report
+    // (Ok + stdout + exit status), not discard it as a stdin-write error — an
+    // Err here loses parseable output: `receive_pack_raw_with_reflog`
+    // propagates it, the handler marks every prepared row `uncertain` instead
+    // of `cancelled`, and the client gets an HTTP error instead of git's
+    // report. Goes RED if the stdin-write check returns Err after the join.
+    // Both exit codes are pinned: receive-pack rejections and successes both
+    // carry reports the handler must parse.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn receive_pack_raw_surfaces_report_status_over_a_stdin_epipe() {
+        for exit_code in [0, 1] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            std::fs::write(tmp.path().join("report.bin"), REAL_SIDEBAND_REPORT).unwrap();
+            // Never reads stdin: the pending body blocks the pipe, then EPIPEs
+            // once the fake exits. `cat` delivers the report first.
+            let git_bin = write_fake_git(
+                tmp.path(),
+                &format!("#!/bin/sh\ncat \"$(dirname \"$0\")/report.bin\"\nexit {exit_code}\n"),
+            );
+            let body = Bytes::from(vec![0u8; 256 * 1024]);
+            let (out, ok) = receive_pack_raw(
+                git_bin.to_str().unwrap(),
+                tmp.path(),
+                body,
+                Duration::from_secs(60),
+                None,
+            )
+            .await
+            .expect(
+                "a report-status printed before exit must not be discarded as a \
+                 stdin-write error",
+            );
+            assert_eq!(
+                ok,
+                exit_code == 0,
+                "the exit status rides the Ok return for both report shapes"
+            );
+            let (unpack_ok, results) = parse_report_status(&out)
+                .expect("git's report survives the EPIPE and stays parseable");
+            assert!(unpack_ok, "unpack ok parses");
+            assert_eq!(
+                results,
+                vec![
+                    ("refs/heads/main".to_string(), false),
+                    ("refs/heads/third".to_string(), true),
+                ],
+                "the per-ref report reaches the handler instead of an HTTP error"
+            );
+        }
     }
 
     // ── #192 F1: response_served_pack detector (real git output) ────────────
