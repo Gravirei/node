@@ -885,9 +885,12 @@ async fn drive_git_child_raw(
     // pipe buffer EPIPEs the write while the answer is already on stdout. The
     // child is reaped (the join above waited on it), so `out`/`err`/`status`
     // are complete and authoritative — returning Err here would discard them:
-    // `receive_pack_raw_with_reflog` would propagate the write error, the
-    // handler would mark every prepared row `uncertain` instead of `cancelled`,
-    // and the client would get an HTTP error instead of git's report. The
+    // `receive_pack_raw_with_reflog` would propagate the write error and the
+    // handler would mark every prepared row `uncertain` instead of driving
+    // `cancelled` per the report. That durable fate is the effect: on a
+    // non-zero exit the client still gets `Err(AppError::Git)` (the handler
+    // maps the failed run itself, not this write), while on exit 0 an error
+    // here would answer a push git actually landed with a server error. The
     // non-raw `drive_git_child` orders the same way (exit status and git's own
     // failure first, stdin-write error last — pinned by
     // `run_git_service_surfaces_git_stderr_over_a_stdin_epipe`), but it must
@@ -3033,11 +3036,12 @@ mod tests {
     // answer is already on stdout. `receive_pack_raw` must surface that report
     // (Ok + stdout + exit status), not discard it as a stdin-write error — an
     // Err here loses parseable output: `receive_pack_raw_with_reflog`
-    // propagates it, the handler marks every prepared row `uncertain` instead
-    // of `cancelled`, and the client gets an HTTP error instead of git's
-    // report. Goes RED if the stdin-write check returns Err after the join.
-    // Both exit codes are pinned: receive-pack rejections and successes both
-    // carry reports the handler must parse.
+    // propagates it and the handler marks every prepared row `uncertain`
+    // instead of driving `cancelled` from the report (the durable fate is the
+    // effect; the client-visible status on a failed run is `AppError::Git`
+    // either way). Goes RED if the stdin-write check returns Err after the
+    // join. Both exit codes are pinned: receive-pack rejections and successes
+    // both carry reports the handler must parse.
     #[cfg(unix)]
     #[tokio::test]
     async fn receive_pack_raw_surfaces_report_status_over_a_stdin_epipe() {
