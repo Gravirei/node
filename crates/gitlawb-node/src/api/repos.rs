@@ -3,6 +3,7 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use axum::Json;
 use bytes::Bytes;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::auth::{caller_authorized_to_push, AuthenticatedDid};
@@ -2079,35 +2080,14 @@ pub async fn git_receive_pack(
         return Err(AppError::RepoNotFound(format!("{owner}/{name}")));
     }
 
-    // Parse ref updates from pkt-line body before handing to git
+    // Parse ref updates from pkt-line body before handing to git. The count
+    // cap and duplicate-refusal live inside `parse_ref_updates`, so both fire
+    // before any per-request materialization, gate, or durable write below.
     let ref_updates = parse_ref_updates(&body)?;
     tracing::debug!(
         ref_count = ref_updates.len(),
         "parsed ref updates from pack"
     );
-
-    // ── Ref-count cap (request shape, before ANY per-ref work) ───────────
-    // Checked right after the parse and before the owner-push and
-    // branch-protection gates: those gates are themselves per-ref work (one
-    // `is_branch_protected` SELECT each), and past them the intent insert
-    // writes one durable child row per ref. Refusing here bounds all of it to
-    // one comparison, leaves no rows behind, and holds no lease or permit —
-    // the intent-before-lease ordering below is unchanged. It precedes the
-    // owner gate on purpose: this bounds the REQUEST, not who may send it, so
-    // an oversized push from anyone is one cheap answer rather than a pile of
-    // per-ref lookups first.
-    if ref_updates.len() > MAX_REF_UPDATES {
-        tracing::warn!(
-            repo = %name,
-            pusher = %auth.0,
-            ref_count = ref_updates.len(),
-            "refusing push: ref-update count exceeds MAX_REF_UPDATES"
-        );
-        return Err(AppError::BadRequest(format!(
-            "too many ref updates in one push: {} > {MAX_REF_UPDATES}",
-            ref_updates.len()
-        )));
-    }
 
     // ── Owner-only push enforcement (on by default; GITLAWB_ENFORCE_OWNER_PUSH) ──
     // Runs before branch protection on purpose: when enabled, a non-owner is
@@ -4230,17 +4210,21 @@ fn ref_is_internal_namespace(ref_name: &str) -> bool {
 
 /// Maximum ref commands accepted in one receive-pack body.
 ///
-/// `parse_ref_updates` is unbounded, and every entry costs a per-ref
-/// branch-protection SELECT plus a durable child row that rides the aggregate
-/// into reconcile/quarantine scans until retention. One body (`max_pack_bytes`
-/// allows gigabytes) could otherwise turn a single request into tens of
-/// thousands of pre-lease DB operations and an unbounded durable row set for
-/// one signer. Sized well above a legitimate mirror push (branches + tags of
-/// any realistic repo) while keeping the worst-case pre-intent work at ~8k
+/// Every accepted entry costs a per-ref branch-protection SELECT plus a
+/// durable child row that rides the aggregate into reconcile/quarantine scans
+/// until retention. One body (`max_pack_bytes` allows gigabytes, ~24M command
+/// lines) could otherwise turn a single request into tens of thousands of
+/// pre-lease DB operations, an unbounded durable row set for one signer, and
+/// an equally unbounded `Vec<RefUpdate>` of three-String entries — so the cap
+/// fires inside the parse loop, bounding the allocation too, not just the
+/// downstream work. Sized well above a legitimate mirror push (branches + tags
+/// of any realistic repo) while keeping the worst-case pre-intent work at ~8k
 /// indexed SELECTs and ~8k child rows — comfortably inside the 30s
 /// intent-write guard. A repo needing to move more than this in one push
-/// pushes in batches. Pinned by
-/// `receive_pack_refuses_a_ref_update_count_over_the_cap`.
+/// pushes in batches. Pinned from both sides by
+/// `receive_pack_refuses_a_ref_update_count_over_the_cap` (over the cap is
+/// refused) and `receive_pack_admits_a_ref_update_count_at_the_cap` (exactly
+/// at the cap is not).
 const MAX_REF_UPDATES: usize = 8192;
 
 /// `Clone` so `git_receive_pack` can hand the parsed updates to the detached
@@ -4261,8 +4245,26 @@ pub(crate) struct RefUpdate {
 /// refs/gitlawb/* refs (bytes ≥ 0x80 are accepted by git but invisible to
 /// the namespace gate and visibility_pack exemption), so the whole push must
 /// be refused instead.
+///
+/// Two more refusals/adjustments happen here so a hostile body is bounded
+/// before it is materialized, not after:
+/// - Past [`MAX_REF_UPDATES`] command lines the push is refused
+///   (`BadRequest`), counting every valid line — a body up to `max_pack_bytes`
+///   holds ~24M lines, and building three Strings per entry for all of them
+///   before checking would make the cap a post-parse bound only.
+/// - Identical commands in one push are dropped: they would derive the same
+///   deterministic intent child id, and `pending_ref_transitions` has no
+///   `ON CONFLICT`, so the duplicate would fail the whole intent transaction
+///   and answer a permanent shape as a retryable `Overloaded`. Git processes
+///   the second occurrence of a command as the same no-op anyway.
+///
+/// Pinned by `receive_pack_refuses_a_ref_update_count_over_the_cap`,
+/// `receive_pack_admits_a_ref_update_count_at_the_cap`, and
+/// `receive_pack_dedupes_identical_ref_commands_before_intent`.
 fn parse_ref_updates(body: &[u8]) -> Result<Vec<RefUpdate>> {
     let mut updates = Vec::new();
+    let mut commands = 0usize;
+    let mut seen: HashSet<(String, String, String)> = HashSet::new();
     let mut pos = 0;
 
     while pos + 4 <= body.len() {
@@ -4310,11 +4312,24 @@ fn parse_ref_updates(body: &[u8]) -> Result<Vec<RefUpdate>> {
 
         let parts: Vec<&str> = line.splitn(3, ' ').collect();
         if parts.len() == 3 && parts[0].len() == 40 && parts[1].len() == 40 {
-            updates.push(RefUpdate {
+            commands += 1;
+            if commands > MAX_REF_UPDATES {
+                return Err(AppError::BadRequest(format!(
+                    "too many ref updates in one push: more than {MAX_REF_UPDATES}"
+                )));
+            }
+            let candidate = RefUpdate {
                 old_sha: parts[0].to_string(),
                 new_sha: parts[1].to_string(),
                 ref_name: parts[2].to_string(),
-            });
+            };
+            if seen.insert((
+                candidate.ref_name.clone(),
+                candidate.old_sha.clone(),
+                candidate.new_sha.clone(),
+            )) {
+                updates.push(candidate);
+            }
         }
     }
 
@@ -8531,14 +8546,27 @@ mod tests {
         axum::body::Bytes::from(s)
     }
 
-    // The ref-count cap refuses BEFORE the owner-push and branch-protection
-    // gates and BEFORE the durable intent insert: one oversized body cannot
-    // become thousands of per-ref `is_branch_protected` SELECTs or a durable
-    // row set that rides reconcile/quarantine scans until retention. The
-    // signer here is NOT the owner, so if the cap were removed — or moved
-    // below the owner gate — the answer would become Forbidden instead:
-    // pinning both the refusal and its placement. Goes RED without
-    // `MAX_REF_UPDATES`.
+    /// Build a receive-pack body from explicit `(new_sha, refname)` commands
+    /// in the given order — duplicates allowed — one pkt-line each, then flush.
+    fn ref_update_body_cmds(cmds: &[(&str, &str)]) -> axum::body::Bytes {
+        let mut s = String::new();
+        for (new_sha, refname) in cmds {
+            let line = format!("{ZERO_SHA} {new_sha} {refname}");
+            s.push_str(&format!("{:04x}{}", line.len() + 4, line));
+        }
+        s.push_str("0000");
+        axum::body::Bytes::from(s)
+    }
+
+    // The ref-count cap refuses inside `parse_ref_updates`, so the refusal
+    // fires BEFORE the owner-push and branch-protection gates, BEFORE any
+    // entry beyond the cap is materialized, and BEFORE the durable intent
+    // insert: one oversized body cannot become thousands of per-ref
+    // `is_branch_protected` SELECTs or a durable row set that rides
+    // reconcile/quarantine scans until retention. The signer here is NOT the
+    // owner, so if the cap were removed — or moved below the owner gate — the
+    // answer would become Forbidden instead: pinning both the refusal and its
+    // placement. Goes RED without `MAX_REF_UPDATES`.
     #[sqlx::test]
     async fn receive_pack_refuses_a_ref_update_count_over_the_cap(pool: sqlx::PgPool) {
         use axum::extract::{Path, State};
@@ -8599,6 +8627,162 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(child_count, 0, "no child rows for a refused push");
+    }
+
+    // Boundary pin for the in-loop cap: EXACTLY MAX_REF_UPDATES commands is a
+    // legal push that must pass the cap and fall through to the next gate —
+    // here the owner gate (non-owner signer, enforcement on), which answers
+    // Forbidden. The over-cap test alone cannot catch an off-by-one: both `>`
+    // and `>=` refuse MAX+1, but only `>` lets MAX through, so this test goes
+    // RED the moment the boundary starts rejecting a legal at-cap push
+    // (e.g. a `>=` slip or counting the flush line as a command).
+    #[sqlx::test]
+    async fn receive_pack_admits_a_ref_update_count_at_the_cap(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+
+        let owner = "z6refcapowner";
+        let name = "rc-boundary";
+        let state =
+            crate::test_support::test_state_with(pool.clone(), |cfg| cfg.enforce_owner_push = true)
+                .await;
+        state
+            .db
+            .upsert_mirror_repo(owner, name, "/tmp/z6refcapowner-boundary", None, false)
+            .await
+            .unwrap();
+        let repo_id = state
+            .db
+            .get_repo(owner, name)
+            .await
+            .unwrap()
+            .expect("mirror row exists")
+            .id;
+
+        let pusher = "did:key:z6refcapother";
+        let peer: SocketAddr = "203.0.113.93:5000".parse().unwrap();
+        let result = git_receive_pack(
+            State(state.clone()),
+            Path((owner.to_string(), name.to_string())),
+            Extension(crate::auth::AuthenticatedDid(pusher.to_string())),
+            crate::rate_limit::PeerAddr(Some(peer)),
+            axum::http::HeaderMap::new(),
+            ref_update_body_many(MAX_REF_UPDATES),
+        )
+        .await;
+        match result {
+            Err(AppError::Forbidden(msg)) => assert!(
+                !msg.contains("too many ref updates"),
+                "an at-cap push must reach the owner gate, not the cap; got: {msg}"
+            ),
+            Err(other) => panic!(
+                "an at-cap push must pass the cap and refuse at the owner gate; got {other:?}"
+            ),
+            Ok(_) => panic!("a non-owner at-cap push must still refuse at the owner gate"),
+        }
+        let (req_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM receive_pack_requests WHERE repo_id = $1")
+                .bind(&repo_id)
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(req_count, 0, "the owner gate precedes the intent insert");
+    }
+
+    // Two identical command lines in one push derive the same deterministic
+    // intent child id (`pending_ref_transition` + request id + ref + old + new)
+    // and the `pending_ref_transitions` INSERT has no `ON CONFLICT`, so without
+    // dedupe the whole intent transaction dies on the duplicate: the handler
+    // answers `Overloaded` — a retryable status for a shape that can never
+    // succeed — and ZERO rows survive (nothing for reconcile). With the
+    // parse-level dedupe this A,B,A body inserts two children, stalls at the
+    // lease like the refusal harness, and terminalizes normally. Goes RED
+    // (`fetch_one` finds no aggregate) without the dedupe.
+    #[sqlx::test]
+    async fn receive_pack_dedupes_identical_ref_commands_before_intent(pool: sqlx::PgPool) {
+        use crate::git::repo_store::advisory_lock_key;
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+
+        let owner = "z6dupintent";
+        let name = "di1";
+        let owner_slug = owner.replace([':', '/'], "_");
+        let lock_key = advisory_lock_key(&owner_slug, name);
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let mut cfg = (*state.config).clone();
+        cfg.git_acquire_timeout_secs = 2;
+        cfg.git_service_timeout_secs = 600;
+        state.config = std::sync::Arc::new(cfg);
+        state
+            .db
+            .upsert_mirror_repo(owner, name, "/tmp/z6dupintent-di1", None, false)
+            .await
+            .unwrap();
+        let repo_id = state
+            .db
+            .get_repo(owner, name)
+            .await
+            .unwrap()
+            .expect("mirror row exists")
+            .id;
+
+        // Stall acquire_write on a second pooled connection so the push stops
+        // after the intent insert; the rows below are what the insert wrote.
+        let mut lock_conn = pool.acquire().await.expect("second connection");
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(lock_key)
+            .execute(&mut *lock_conn)
+            .await
+            .expect("hold the advisory lock");
+
+        let did = "did:key:z6dupintent";
+        let peer: SocketAddr = "203.0.113.94:5000".parse().unwrap();
+        let sha_a = "1111111111111111111111111111111111111111";
+        let sha_b = "2222222222222222222222222222222222222222";
+        let result = git_receive_pack(
+            State(state.clone()),
+            Path((owner.to_string(), name.to_string())),
+            Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            crate::rate_limit::PeerAddr(Some(peer)),
+            axum::http::HeaderMap::new(),
+            ref_update_body_cmds(&[
+                (sha_a, "refs/heads/main"),
+                (sha_b, "refs/heads/other"),
+                (sha_a, "refs/heads/main"), // identical to line 1, non-adjacent
+            ]),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(AppError::Overloaded(_))),
+            "stalled acquire_write must shed with Overloaded/503; got {result:?}"
+        );
+
+        let (req_id,): (String,) =
+            sqlx::query_as("SELECT id FROM receive_pack_requests WHERE repo_id = $1")
+                .bind(&repo_id)
+                .fetch_one(state.db.pool())
+                .await
+                .expect("the intent aggregate exists: the duplicate must not kill the insert txn");
+        let children = state
+            .db
+            .list_pending_ref_transitions_for_request(&req_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            children.len(),
+            2,
+            "three command lines dedupe to two children — the repeated main command \
+             is one child, not a PK collision"
+        );
+
+        sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(lock_key)
+            .execute(&mut *lock_conn)
+            .await
+            .expect("release the advisory lock");
     }
 
     /// Absent report-status with exit zero is indeterminate, not proof.
