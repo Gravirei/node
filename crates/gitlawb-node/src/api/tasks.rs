@@ -139,7 +139,10 @@ pub async fn create_task(
                 .await
                 .map_err(db_error)?;
             if !quarantined && crate::api::require_repo_owner(&record, &auth.0).is_err() {
-                return Err(forbidden("only the repo owner can file tasks against it"));
+                // Same denial text the GraphQL copy relays from
+                // `require_repo_owner`, so the two copies of this gate do not
+                // disagree in observable output.
+                return Err(forbidden(crate::api::REPO_OWNER_ONLY_MESSAGE));
             }
         }
     }

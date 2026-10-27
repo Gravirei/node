@@ -80,15 +80,20 @@ pub(crate) fn did_matches(a: &str, b: &str) -> bool {
     !ka.contains(':') && !kb.contains(':') && ka == kb
 }
 
+/// Client-facing denial shared by every repo-owner gate copy. `require_repo_owner`
+/// renders it as `AppError::Forbidden`; a handler that emits its own
+/// `(StatusCode, Json)` envelope instead of `AppError` (e.g.
+/// `api::tasks::create_task`) must use this constant too, so two copies of one
+/// gate cannot drift in observable output.
+pub(crate) const REPO_OWNER_ONLY_MESSAGE: &str = "only the repo owner can perform this action";
+
 /// 403 unless `caller` is the repo owner. Uses [`did_matches`] so the owner check
 /// and the author check (close policy) share one normalization.
 pub(crate) fn require_repo_owner(record: &RepoRecord, caller: &str) -> Result<()> {
     if did_matches(caller, &record.owner_did) {
         Ok(())
     } else {
-        Err(AppError::Forbidden(
-            "only the repo owner can perform this action".into(),
-        ))
+        Err(AppError::Forbidden(REPO_OWNER_ONLY_MESSAGE.into()))
     }
 }
 

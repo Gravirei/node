@@ -593,9 +593,11 @@ mod tests {
     /// #496: create_task must not bind a caller-supplied repo_id verbatim. A
     /// signed caller naming a hosted repo it does not own is rejected (403,
     /// leaking nothing about the repo); the owner files (201); repo-less and
-    /// unknown-id tasks stay allowed (unknown ids are oracle-free opaque
-    /// labels, unscoped under the #268/#464 read contract); and a quarantined
-    /// repo id is treated as unknown (no 403 oracle on quarantined existence).
+    /// unknown-id tasks stay allowed (unknown ids are opaque labels, unscoped
+    /// under the #268/#464 read contract); and a quarantined repo id is treated
+    /// as unknown (no 403 that would confirm it names a real repo). As the
+    /// handler comment records, the 403-vs-201 split between a hosted id and an
+    /// unknown one is itself a one-bit oracle.
     #[sqlx::test]
     async fn create_task_rejects_foreign_repo_id(pool: PgPool) {
         let owner = "did:key:zTASKREPOOWNERAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -645,6 +647,10 @@ mod tests {
         assert!(
             text.contains(r#""error":"forbidden""#),
             "denial must keep the forbidden envelope: {text}"
+        );
+        assert!(
+            text.contains(crate::api::REPO_OWNER_ONLY_MESSAGE),
+            "denial must carry the shared owner-denial text (same as GraphQL): {text}"
         );
         assert!(
             !text.contains(&repo.id) && !text.contains(owner),
@@ -707,6 +713,130 @@ mod tests {
             resp.status(),
             StatusCode::CREATED,
             "a quarantined repo id must not 403 (existence oracle)"
+        );
+    }
+
+    /// #496 (REST): a repo-lookup fault in the create_task gate must render the
+    /// module's opaque `db_error` envelope, not the raw sqlx text. Dropping a
+    /// column `get_repo_by_id` selects faults that first lookup; the 500 body
+    /// stays fixed and names no column (#250/#226).
+    #[sqlx::test]
+    async fn create_task_gate_repo_lookup_fault_is_opaque(pool: PgPool) {
+        let owner = "did:key:zTASKFAULTOWNERAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool.clone()).await;
+        let repo = seed_repo(owner, "task-gate-fault-repo");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/tasks",
+                    axum::routing::post(crate::api::tasks::create_task),
+                )
+                .with_state(state.clone())
+        };
+        let body = format!(
+            r#"{{"kind":"build","capability":"repo:write","delegator_did":"{owner}","repo_id":"{}"}}"#,
+            repo.id
+        );
+
+        // Drop a column the lookup's SELECT names so get_repo_by_id faults.
+        sqlx::query("ALTER TABLE repos DROP COLUMN machine_id")
+            .execute(&pool)
+            .await
+            .expect("drop machine_id");
+
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::POST,
+                "/api/v1/tasks",
+                Body::from(body),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a faulted repo lookup must be a 500"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains(r#""error":"db_error""#),
+            "gate DB fault must keep the opaque envelope: {text}"
+        );
+        assert!(
+            text.contains(crate::error::DB_ERROR_MESSAGE),
+            "gate DB fault must carry the fixed message: {text}"
+        );
+        assert!(
+            !text.contains("machine_id") && !text.contains("column"),
+            "schema text leaked through the gate: {text}"
+        );
+    }
+
+    /// #496 (REST): the gate's second lookup (`is_repo_quarantined`) runs through
+    /// the same opaque helper. Dropping the column only it selects leaves
+    /// `get_repo_by_id` succeeding, so this pins that second call site too.
+    #[sqlx::test]
+    async fn create_task_gate_quarantine_lookup_fault_is_opaque(pool: PgPool) {
+        let owner = "did:key:zTASKFAULT2OWNERAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool.clone()).await;
+        let repo = seed_repo(owner, "task-gate-fault2-repo");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/tasks",
+                    axum::routing::post(crate::api::tasks::create_task),
+                )
+                .with_state(state.clone())
+        };
+        let body = format!(
+            r#"{{"kind":"build","capability":"repo:write","delegator_did":"{owner}","repo_id":"{}"}}"#,
+            repo.id
+        );
+
+        // `quarantined` is not in get_repo_by_id's SELECT, so that lookup still
+        // succeeds and the fault lands on is_repo_quarantined.
+        sqlx::query("ALTER TABLE repos DROP COLUMN quarantined")
+            .execute(&pool)
+            .await
+            .expect("drop quarantined");
+
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::POST,
+                "/api/v1/tasks",
+                Body::from(body),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a faulted quarantine lookup must be a 500"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains(r#""error":"db_error""#),
+            "quarantine DB fault must keep the opaque envelope: {text}"
+        );
+        assert!(
+            text.contains(crate::error::DB_ERROR_MESSAGE),
+            "quarantine DB fault must carry the fixed message: {text}"
+        );
+        assert!(
+            !text.contains("quarantined") && !text.contains("column"),
+            "schema text leaked through the gate: {text}"
         );
     }
 

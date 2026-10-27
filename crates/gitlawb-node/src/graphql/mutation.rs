@@ -38,9 +38,14 @@ impl MutationRoot {
         let db = ctx.data_unchecked::<Arc<Db>>();
         // #496: same repo-ownership gate as the REST handler — a repo_id
         // naming a hosted, non-quarantined repo admits tasks only from its
-        // owner, so a stranger cannot file under a foreign repo id. Unknown
-        // or quarantined ids stay oracle-free opaque labels (unscoped under
-        // the #268/#464 read contract); repo-less tasks unaffected.
+        // owner, so a stranger cannot file under a foreign repo id. An id
+        // naming no hosted repo (unknown, or quarantined — hidden as if it
+        // did not exist) stays an opaque label, resolving to no hosted repo
+        // and thus unscoped under the #268/#464 read contract; repo-less
+        // tasks unaffected. As in tasks.rs, the success-vs-denial split
+        // between a hosted repo id and an unknown one is itself a one-bit
+        // oracle — a stranger holding a private repo's id learns it is hosted
+        // here — but denying foreign repos requires drawing exactly that line.
         if let Some(repo_id) = input.repo_id.as_deref() {
             let record = db
                 .get_repo_by_id(repo_id)
@@ -396,8 +401,8 @@ mod tests {
             .await;
         let errs = errors(&resp);
         assert!(
-            errs.contains("repo owner"),
-            "a non-owner must not file under a foreign repo id: {errs}"
+            errs.contains(crate::api::REPO_OWNER_ONLY_MESSAGE),
+            "a non-owner must not file under a foreign repo id (shared denial text): {errs}"
         );
         assert!(
             !errs.contains(&repo.id) && !errs.contains(owner),
@@ -456,6 +461,55 @@ mod tests {
             errors(&resp).is_empty(),
             "a quarantined repo id must not 403 (existence oracle): {}",
             errors(&resp)
+        );
+    }
+
+    /// #496 (GraphQL): a repo-lookup fault in createTask's gate must stay
+    /// opaque. Dropping a column `get_repo_by_id` selects faults that lookup;
+    /// the resolver must return the fixed DB message and leak no schema text
+    /// (#250), as `create_task_db_error_message_is_opaque` pins for the
+    /// agent_tasks fault.
+    #[sqlx::test]
+    async fn create_task_gate_repo_lookup_fault_is_opaque(pool: PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let owner = "did:key:zGQLTASKFAULTOWNERAAAAAAAAAAAAAAAAAAAAAAAA";
+        let now = chrono::Utc::now();
+        let repo = crate::db::RepoRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "gql-task-gate-fault-repo".to_string(),
+            owner_did: owner.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: now,
+            updated_at: now,
+            disk_path: "/tmp/gql-task-gate-fault-repo".to_string(),
+            forked_from: None,
+            machine_id: None,
+        };
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        sqlx::query("ALTER TABLE repos DROP COLUMN machine_id")
+            .execute(&pool)
+            .await
+            .expect("drop machine_id");
+
+        let q = format!(
+            r#"mutation {{ createTask(delegatorDid: "{owner}", input: {{ kind: "build", capability: "repo:write", repoId: "{}" }}) {{ id }} }}"#,
+            repo.id
+        );
+        let resp = state
+            .graphql_schema
+            .execute(Request::new(&q).data(AuthenticatedDid(owner.into())))
+            .await;
+        let errs = errors(&resp);
+        assert!(
+            errs.contains(crate::graphql::GRAPHQL_DB_ERROR_MESSAGE),
+            "gate sqlx fault must be opaque: {errs}"
+        );
+        assert!(
+            !errs.contains("machine_id") && !errs.contains("column"),
+            "schema text leaked through the gate: {errs}"
         );
     }
 }
