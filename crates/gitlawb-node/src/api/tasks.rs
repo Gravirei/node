@@ -117,19 +117,19 @@ pub async fn create_task(
     }
     // #496: a caller-supplied repo_id must name a repo the caller owns. Without
     // this, any signed caller can plant a task — payload and UCAN included —
-    // under a foreign repo id, where repo-gated task reads surface it exactly
-    // to that repo's readers and the named assignee can claim it. Resolve the
-    // id against hosted repos: a hosted, non-quarantined repo admits tasks
+    // under a foreign repo id, where the named assignee can claim it. Resolve
+    // the id against hosted repos: a hosted, non-quarantined repo admits tasks
     // only from its owner (403 otherwise). An id naming no hosted repo
     // (unknown, or quarantined — which is hidden as if it did not exist, so
-    // 403ing it would confirm a real id) is kept as an opaque label; such ids
-    // resolve to no hosted repo, so repo-scoped task read gates treat them as
-    // unscoped (delegator/assignee-only under the #268/#464 visibility
-    // contract). The 403-vs-201 split between a hosted repo id and an unknown
-    // one is itself a one-bit oracle — a stranger holding a private repo's id
-    // learns it is hosted here — but denying foreign repos requires drawing
-    // exactly that line, and repo ids already surface via the task list on
-    // this base. Repo-less tasks are unaffected.
+    // 403ing it would confirm a real id) is stored verbatim as an opaque
+    // label: this is a write gate and does not bind an unresolved id to a
+    // repo. Task reads are caller-independent on this base (the list endpoints
+    // are not repo-scoped), before and after this change. The 403-vs-201 split
+    // between a hosted repo id and an unknown one is itself a one-bit oracle —
+    // a stranger holding a private repo's id learns it is hosted here — but
+    // denying foreign repos requires drawing exactly that line, and repo ids
+    // already surface via the task list on this base. Repo-less tasks are
+    // unaffected.
     if let Some(repo_id) = body.repo_id.as_deref() {
         let record = state.db.get_repo_by_id(repo_id).await.map_err(db_error)?;
         if let Some(record) = record {

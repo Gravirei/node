@@ -590,14 +590,14 @@ mod tests {
         );
     }
 
-    /// #496: create_task must not bind a caller-supplied repo_id verbatim. A
-    /// signed caller naming a hosted repo it does not own is rejected (403,
-    /// leaking nothing about the repo); the owner files (201); repo-less and
-    /// unknown-id tasks stay allowed (unknown ids are opaque labels, unscoped
-    /// under the #268/#464 read contract); and a quarantined repo id is treated
-    /// as unknown (no 403 that would confirm it names a real repo). As the
-    /// handler comment records, the 403-vs-201 split between a hosted id and an
-    /// unknown one is itself a one-bit oracle.
+    /// #496: create_task must reject a caller-supplied repo_id that names a
+    /// hosted repo the caller does not own. A stranger naming the victim's repo
+    /// gets 403, leaking nothing about the repo and persisting nothing; the
+    /// owner files (201). Repo-less tasks stay allowed; an id naming no hosted
+    /// repo (unknown, or quarantined, hidden as if it did not exist) is stored
+    /// verbatim as an opaque label, and the 403-vs-201 split between a hosted
+    /// id and an unknown one is itself a one-bit oracle. This is a write gate:
+    /// task reads are caller-independent and not repo-scoped on this base.
     #[sqlx::test]
     async fn create_task_rejects_foreign_repo_id(pool: PgPool) {
         let owner = "did:key:zTASKREPOOWNERAAAAAAAAAAAAAAAAAAAAAAAAAA";

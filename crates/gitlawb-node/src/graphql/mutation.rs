@@ -36,16 +36,17 @@ impl MutationRoot {
         }
         let delegator_did = caller.to_string();
         let db = ctx.data_unchecked::<Arc<Db>>();
-        // #496: same repo-ownership gate as the REST handler — a repo_id
-        // naming a hosted, non-quarantined repo admits tasks only from its
-        // owner, so a stranger cannot file under a foreign repo id. An id
-        // naming no hosted repo (unknown, or quarantined — hidden as if it
-        // did not exist) stays an opaque label, resolving to no hosted repo
-        // and thus unscoped under the #268/#464 read contract; repo-less
-        // tasks unaffected. As in tasks.rs, the success-vs-denial split
-        // between a hosted repo id and an unknown one is itself a one-bit
-        // oracle — a stranger holding a private repo's id learns it is hosted
-        // here — but denying foreign repos requires drawing exactly that line.
+        // #496: same write gate as the REST handler — a repo_id naming a
+        // hosted, non-quarantined repo admits tasks only from its owner, so a
+        // stranger cannot file under a foreign repo id. An id naming no hosted
+        // repo (unknown, or quarantined — hidden as if it did not exist) is
+        // stored verbatim as an opaque label; the gate does not bind an
+        // unresolved id to a repo. Task reads are caller-independent on this
+        // base (the tasks resolver is not repo-scoped), before and after this
+        // change. As in tasks.rs, the success-vs-denial split between a hosted
+        // repo id and an unknown one is itself a one-bit oracle — a stranger
+        // holding a private repo's id learns it is hosted here — but denying
+        // foreign repos requires drawing exactly that line.
         if let Some(repo_id) = input.repo_id.as_deref() {
             let record = db
                 .get_repo_by_id(repo_id)
