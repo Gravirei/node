@@ -30,11 +30,24 @@ fn forbidden(msg: &str) -> (StatusCode, Json<Value>) {
     )
 }
 
-/// 500 in this module's error shape with an opaque body: the real error is
-/// logged server-side and never serialized (#250), matching the `db_error`
-/// envelope `AppError::Db` renders.
+/// This module's error shape with an opaque body: the real error is logged
+/// server-side and never serialized (#250), matching the envelope
+/// `AppError::Db` renders. Also mirrors its status split: pool-class failures
+/// are a retryable 503 `db_unavailable`, everything else the opaque 500
+/// `db_error`, so a transient outage is not reported as permanent.
 fn db_error(e: anyhow::Error) -> (StatusCode, Json<Value>) {
-    tracing::error!(error = %format!("{e:#}"), "task repo gate database error");
+    tracing::error!(error = %format!("{e:#}"), "task database error");
+    if let Some(sql) = e.chain().find_map(|c| c.downcast_ref::<sqlx::Error>()) {
+        if crate::error::db_unavailable(sql) {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": crate::error::DB_UNAVAILABLE_CODE,
+                    "message": crate::error::DB_UNAVAILABLE_MESSAGE,
+                })),
+            );
+        }
+    }
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({
@@ -162,12 +175,7 @@ pub async fn create_task(
         updated_at: now,
         deadline: body.deadline,
     };
-    state.db.create_task(&task).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-    })?;
+    state.db.create_task(&task).await.map_err(db_error)?;
     Ok((StatusCode::CREATED, Json(task_to_json(&task))))
 }
 
@@ -341,4 +349,37 @@ pub async fn fail_task(
         at: Utc::now().to_rfc3339(),
     });
     Ok(Json(task_to_json(&task)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The gate's DB helper must mirror `AppError::Db`: a pool-level failure is
+    /// the retryable 503 `db_unavailable`, a query fault the opaque 500.
+    #[test]
+    fn db_error_matches_app_error_status_split() {
+        let unavailable = db_error(anyhow::Error::from(sqlx::Error::PoolTimedOut));
+        assert_eq!(unavailable.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable.1 .0["error"], crate::error::DB_UNAVAILABLE_CODE);
+        assert_eq!(
+            unavailable.1 .0["message"],
+            crate::error::DB_UNAVAILABLE_MESSAGE
+        );
+
+        let query = db_error(anyhow::Error::from(sqlx::Error::Protocol(
+            "column \"machine_id\" does not exist".into(),
+        )));
+        assert_eq!(query.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(query.1 .0["error"], "db_error");
+        assert_eq!(query.1 .0["message"], crate::error::DB_ERROR_MESSAGE);
+        assert!(!query.1 .0.to_string().contains("machine_id"));
+    }
+
+    /// `.context()` layers must not hide the sqlx error from the status split.
+    #[test]
+    fn db_error_sees_sqlx_through_context() {
+        let wrapped = anyhow::Error::from(sqlx::Error::PoolClosed).context("repo lookup failed");
+        assert_eq!(db_error(wrapped).0, StatusCode::SERVICE_UNAVAILABLE);
+    }
 }

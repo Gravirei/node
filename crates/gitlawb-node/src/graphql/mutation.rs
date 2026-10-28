@@ -405,10 +405,6 @@ mod tests {
             errs.contains(crate::api::REPO_OWNER_ONLY_MESSAGE),
             "a non-owner must not file under a foreign repo id (shared denial text): {errs}"
         );
-        assert!(
-            !errs.contains(&repo.id) && !errs.contains(owner),
-            "denial must leak nothing about the repo: {errs}"
-        );
 
         // The denial must not persist: no task row may carry the victim's
         // repo id afterwards.

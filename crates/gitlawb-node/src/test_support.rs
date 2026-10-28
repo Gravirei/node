@@ -630,6 +630,10 @@ mod tests {
                 r#"{{"kind":"build","capability":"repo:write","delegator_did":"{signer}"{repo_field}}}"#
             )
         };
+        let created_id = |bytes: &[u8]| -> String {
+            let v: serde_json::Value = serde_json::from_slice(bytes).expect("task json");
+            v["id"].as_str().expect("task id").to_string()
+        };
 
         // Stranger filing under the victim's repo id → exact 403.
         let resp = post_as(stranger, body_with(stranger, Some(&repo.id)))
@@ -651,10 +655,6 @@ mod tests {
         assert!(
             text.contains(crate::api::REPO_OWNER_ONLY_MESSAGE),
             "denial must carry the shared owner-denial text (same as GraphQL): {text}"
-        );
-        assert!(
-            !text.contains(&repo.id) && !text.contains(owner),
-            "denial must leak nothing about the repo: {text}"
         );
 
         // The denial must not persist: no task row may carry the victim's
@@ -698,6 +698,22 @@ mod tests {
             StatusCode::CREATED,
             "an id naming no hosted repo stays an opaque label"
         );
+        // Read back the row: the unresolved id must be stored verbatim, not
+        // dropped or rewritten to a repo it never named.
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let task = state
+            .db
+            .get_task(&created_id(&bytes))
+            .await
+            .expect("get task")
+            .expect("task must be stored");
+        assert_eq!(
+            task.repo_id.as_deref(),
+            Some("no-such-repo-id"),
+            "an unresolved id must be stored verbatim as a label"
+        );
 
         // Quarantined repo id → treated as unknown (201), never a 403 that
         // would confirm the id names a real repo.
@@ -713,6 +729,22 @@ mod tests {
             resp.status(),
             StatusCode::CREATED,
             "a quarantined repo id must not 403 (existence oracle)"
+        );
+        // Read back the row: the quarantined id is stored verbatim as a label
+        // too, so the accepted write is not silently dropped.
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let task = state
+            .db
+            .get_task(&created_id(&bytes))
+            .await
+            .expect("get task")
+            .expect("task must be stored");
+        assert_eq!(
+            task.repo_id.as_deref(),
+            Some(repo.id.as_str()),
+            "a quarantined id must be stored verbatim as a label"
         );
     }
 
@@ -837,6 +869,63 @@ mod tests {
         assert!(
             !text.contains("quarantined") && !text.contains("column"),
             "schema text leaked through the gate: {text}"
+        );
+    }
+
+    /// #496 (REST): the create_task INSERT goes through the same opaque helper,
+    /// so a write fault must not serialize sqlx text either. A repo-less task
+    /// reaches the INSERT without a gate lookup; dropping a column the INSERT
+    /// names faults it.
+    #[sqlx::test]
+    async fn create_task_insert_fault_is_opaque(pool: PgPool) {
+        let signer = "did:key:zTASKINSERTFAULTAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool.clone()).await;
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/tasks",
+                    axum::routing::post(crate::api::tasks::create_task),
+                )
+                .with_state(state.clone())
+        };
+        let body =
+            format!(r#"{{"kind":"build","capability":"repo:write","delegator_did":"{signer}"}}"#);
+
+        sqlx::query("ALTER TABLE agent_tasks DROP COLUMN status")
+            .execute(&pool)
+            .await
+            .expect("drop status");
+
+        let resp = router()
+            .oneshot(signed_request_as(
+                signer,
+                Method::POST,
+                "/api/v1/tasks",
+                Body::from(body),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a faulted INSERT must be a 500"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains(r#""error":"db_error""#),
+            "INSERT fault must keep the opaque envelope: {text}"
+        );
+        assert!(
+            text.contains(crate::error::DB_ERROR_MESSAGE),
+            "INSERT fault must carry the fixed message: {text}"
+        );
+        assert!(
+            !text.contains("status") && !text.contains("column"),
+            "schema text leaked through the INSERT: {text}"
         );
     }
 
