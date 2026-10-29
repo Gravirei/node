@@ -213,6 +213,22 @@ mod tests {
             .join("; ")
     }
 
+    /// The `id` scalar returned by a successful `createTask` mutation.
+    fn created_id(resp: &Response) -> String {
+        assert!(resp.errors.is_empty(), "graphql errors: {:?}", resp.errors);
+        let async_graphql::Value::Object(obj) = &resp.data else {
+            panic!("data not an object: {:?}", resp.data);
+        };
+        let async_graphql::Value::Object(task) = obj.get("createTask").expect("createTask key")
+        else {
+            panic!("createTask not an object");
+        };
+        let async_graphql::Value::String(id) = task.get("id").expect("id key") else {
+            panic!("id not a string");
+        };
+        id.clone()
+    }
+
     /// N2: GraphQL mutations require a verified signer and bind the acting DID to
     /// it. Unsigned is rejected; a signer other than the claimed actor is
     /// rejected; the matching signer passes the auth gate.
@@ -363,8 +379,9 @@ mod tests {
     /// #496 (GraphQL): createTask applies the same repo-ownership gate as the
     /// REST handler — a stranger naming a hosted repo is rejected without
     /// persisting anything, while the owner files. The quarantined and
-    /// unknown-id arms are pinned here too, so this copy of the gate cannot
-    /// regress silently.
+    /// unknown-id arms are pinned too, including that each accepted write
+    /// stores the supplied id verbatim, so this copy of the gate cannot regress
+    /// silently.
     #[sqlx::test]
     async fn create_task_rejects_foreign_repo_id(pool: PgPool) {
         let state = crate::test_support::test_state(pool).await;
@@ -442,6 +459,19 @@ mod tests {
             "an id naming no hosted repo stays an opaque label: {}",
             errors(&resp)
         );
+        // Read back the row: the unresolved id must be stored verbatim, not
+        // dropped or rewritten to a repo it never named.
+        let stored = state
+            .db
+            .get_task(&created_id(&resp))
+            .await
+            .expect("get task")
+            .expect("task must be stored");
+        assert_eq!(
+            stored.repo_id.as_deref(),
+            Some("no-such-repo-id"),
+            "an unresolved id must be stored verbatim as a label"
+        );
 
         // A quarantined repo id is treated as unknown (accepted, never a 403
         // that would confirm the id names a real repo). This pins the
@@ -458,6 +488,19 @@ mod tests {
             errors(&resp).is_empty(),
             "a quarantined repo id must not 403 (existence oracle): {}",
             errors(&resp)
+        );
+        // Read back the row: the quarantined id is stored verbatim as a label
+        // too, so the accepted write is not silently dropped.
+        let stored = state
+            .db
+            .get_task(&created_id(&resp))
+            .await
+            .expect("get task")
+            .expect("task must be stored");
+        assert_eq!(
+            stored.repo_id.as_deref(),
+            Some(repo.id.as_str()),
+            "a quarantined id must be stored verbatim as a label"
         );
     }
 
